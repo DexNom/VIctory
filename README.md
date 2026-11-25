@@ -19,6 +19,8 @@ To warm the shader cache, open `victory-warm.exe` in the installed runtime direc
 
 For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
 
+On Windows 10 (build 19041+), the in-box `d3d12.dll` stops at Shader Model 6.5. To enable Shader Model 6.6 and directly indexed descriptor heaps without modifying the binaries, place `D3D12Core.dll` from Microsoft's DirectX 12 Agility SDK (`Microsoft.Direct3D.D3D12`) at `D3D12\D3D12Core.dll` beside the executable, or point `VICTORY_D3D12_AGILITY` to the DLL, its directory, or an unpacked NuGet package root. On Windows 11 or when neither is present, the system Direct3D 12 runtime is used unchanged.
+
 ## Try experimental ray tracing on Radeon
 
 After running **Setup.cmd**, open **DexNom Runtime (Experimental RT)** from the Windows Start menu. This starts the game with the acceleration-structure builder, ray traversal and lighting resolve enabled. The shortcut uses your existing saves. Open **DexNom Runtime** for the usual renderer.
