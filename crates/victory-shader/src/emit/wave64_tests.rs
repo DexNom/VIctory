@@ -572,3 +572,162 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// A wave64 program of 64 threads with a spilled user-data table (a constant at user-data
+/// index 16, a table with a raw UAV at 17, the group's number in s4). Thread t holds
+/// (t >> 1) + 1. The console compiler's wave total and exclusive prefix sum, both of which
+/// turn every lane on (`s_or_saveexec_b64 -1`) and mask the values by the saved EXEC; each
+/// thread stores its prefix sum to dword n and the total to dword 128 + n, n its number
+/// over the dispatch.
+fn scanning_program() -> NativeProgram {
+    let mut words = vec![
+        0x8703_FF01, 0x0000_00FF, // s_and_b32 s3, s1, 0xff
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0x3D << 26 | 12 << 6 | 1, 125 << 25 | 4, // s_load_dword s12, s[2:3], 4
+        0xBE8D_0380, // s_mov_b32 s13, 0
+        0x3D << 26 | 0x02 << 18 | 8 << 6 | 6, 125 << 25, // s_load_dwordx4 s[8:11], s[12:13], 0
+        0x2C14_0081, // v_lshrrev_b32 v10, 1, v0
+        0x4A14_1481, // v_add_nc_u32 v10, 1, v10
+    ];
+    words.extend_from_slice(&[
+        // the total
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0001, 0x0032_1480, // v_cndmask_b32 v1, 0, v10, s[12:13]
+        0x4A02_02E9, 0xDE54_C101, // v_add_nc_u32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+        0x4A02_02E9, 0x9360_1201, // v_add_nc_u32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+        0x4A02_02E9, 0x0009_2401, // v_add_nc_u32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+        0x4A02_02FA, 0xFF09_4001, // v_add_nc_u32 v1, v1, v1 row_mirror bound_ctrl:1
+        0xD778_0002, 0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x4A02_0302, // v_add_nc_u32 v1, v2, v1
+        0xD760_000E, 0x0001_4101, // v_readlane_b32 s14, v1, 32
+        0x4A02_020E, // v_add_nc_u32 v1, s14, v1
+        0xD760_001B, 0x0001_0101, // v_readlane_b32 s27, v1, 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        // the exclusive prefix sum
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0001, 0x0032_1480, // v_cndmask_b32 v1, 0, v10, s[12:13]
+        0x7E04_0301, // v_mov_b32 v2, v1
+        0x4A04_04FA, 0xFF09_1102, // v_add_nc_u32 v2, v2, v2 row_shr:1 bound_ctrl:1
+        0x4A04_04FA, 0xFF01_1202, // v_add_nc_u32 v2, v2, v2 row_shr:2
+        0x4A04_04FA, 0xFF01_1402, // v_add_nc_u32 v2, v2, v2 row_shr:4
+        0x4A04_04FA, 0xFF01_1802, // v_add_nc_u32 v2, v2, v2 row_shr:8
+        0xBEFE_03FF, 0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+        0xBEFF_03FF, 0xFFFF_0000, // s_mov_b32 exec_hi, 0xffff0000
+        0xD778_4803, 0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi:1
+        0x4A04_0503, // v_add_nc_u32 v2, v3, v2
+        0xD760_000E, 0x0001_3F02, // v_readlane_b32 s14, v2, 31
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        0x4A04_040E, // v_add_nc_u32 v2, s14, v2
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+        0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        0x4C04_0302, // v_sub_nc_u32 v2, v2, v1
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    words.extend_from_slice(&[
+        0xD746_0006, 4 | 0x86 << 9 | 0x100 << 18, // v_lshl_add_u32 v6, s4, 6, v0
+        0x340C_0C82, // v_lshlrev_b32 v6, 2, v6
+        0xE070_1000, 0x8002_0206, // buffer_store_dword v2, v6, s[8:11], 0 offen
+        0x7E06_021B, // v_mov_b32 v3, s27
+        0xE070_1200, 0x8002_0306, // buffer_store_dword v3, v6, s[8:11], 0 offen offset:512
+        S_ENDPGM,
+    ]);
+    NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![
+            RootParam { root: RootType::Constants, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 16, slot: 0 },
+            RootParam { root: RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 17, slot: 1 },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 17,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1 | 1 << 7, // 4 user SGPRs, then the group's number along x in s4
+            threads: [64, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// A dispatch of threads whose last group is partly launched, with scans that turn every
+/// lane on: the lanes past the limit count as zero in the total and the prefix sums, and
+/// store nothing, with the count applied as `spill::thread_limited` does for a host of 32-lane
+/// waves (the console wave runs as two host waves that exchange their halves). Two groups of
+/// 64; counts 70, 100, 33, 1 and none.
+#[test]
+fn scans_in_a_partly_launched_group_count_the_launched_lanes_only() {
+    let native = crate::spill::thread_limited(scanning_program());
+    assert_ne!(native.code.len(), scanning_program().code.len(), "the count's entry code is there");
+    let p = crate::spill::build(&native).expect("spill::build");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).ok();
+    for host_wave in [32u32] {
+        let shader = match lowered_for_width(&native, &p, &HashSet::new(), host_wave) {
+            Ok(s) => s,
+            Err(e) => panic!("lower (host waves of {host_wave}): {e}"),
+        };
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let Some(host) = host.as_ref() else { continue };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            eprintln!("the hardware device does not take the program for host waves of {host_wave}; not run");
+            continue;
+        };
+        for limit in [70u32, 100, 33, 1, 0] {
+            let launched = |n: u32| limit == 0 || n < limit;
+            let mut want = vec![0u32; 256];
+            for g in 0..2u32 {
+                let total: u32 = (0..64).filter(|&t| launched(64 * g + t)).map(|t| (t >> 1) + 1).sum();
+                let mut sum = 0;
+                for t in 0..64u32 {
+                    let n = 64 * g + t;
+                    if launched(n) {
+                        want[n as usize] = sum;
+                        want[128 + n as usize] = total;
+                    }
+                    sum += (t >> 1) + 1;
+                }
+            }
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if u.root == RootType::Other(super::USER_DISPATCH_THREADS_X) {
+                    ud[u.index as usize] = limit;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(256)],
+                        samplers: &[],
+                        groups: [2, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            let wrong: Vec<String> = (0..256)
+                .filter(|&i| out[0][i] != want[i])
+                .map(|i| format!("dword {i}: {} want {}", out[0][i], want[i]))
+                .collect();
+            assert!(
+                wrong.is_empty(),
+                "host waves of {host_wave}, limit {limit}: {} of 256 dwords wrong: {}",
+                wrong.len(),
+                wrong.iter().take(12).cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+        eprintln!("ran on the hardware device (host waves of {host_wave}): limits 70, 100, 33, 1 and none over two groups");
+    }
+}
