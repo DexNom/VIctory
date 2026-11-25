@@ -27,6 +27,8 @@ pub(super) mod intersect;
 
 #[path = "guest_address.rs"]
 mod guest_address;
+#[path = "half_sum.rs"]
+mod half_sum;
 #[path = "packed_mask.rs"]
 mod packed_mask;
 #[path = "typed_views.rs"]
@@ -2083,91 +2085,6 @@ impl<'a> Lower<'a> {
         let (fa, fb) = (wide(self, a), wide(self, b));
         let f = self.s.m.bin(c, Bin::Add, fa, fb);
         self.f16_nearest(f)
-    }
-
-    /// The sum of the low halves of `x` over the lanes that run here, in
-    /// single precision, as a half.
-    fn half_sum_here(&mut self, x: V) -> V {
-        let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
-        self.s.flags |= flags::WAVE_OPS;
-        let low = self.s.m.i32(0xFFFF);
-        let h = self.s.m.bin(c, Bin::And, x, low);
-        let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-        let k = self.s.m.i8(0);
-        let sum = self.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[f, k, k]);
-        self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[sum])
-    }
-
-    /// `WaveActiveSum` of 16-bit floats (`x`: each lane's term in its low half, +0 in the
-    /// lanes outside the mask), bit for bit as the console adds it: every addition rounds to
-    /// 16 bits, so the order counts, and the compiler's is the balanced tree over the lanes
-    /// in their order (lanes 2k and 2k+1, then pairs, ... then the wave's two halves;
-    /// [`super::wave::buddies`]). Each lane adds its partner's partial sum, read from the
-    /// lane whose number differs in one bit, step by step; two host waves of 32 then exchange
-    /// their halves' sums for the last addition. The high half of the result is lane 0's,
-    /// which no `v_add_f16` writes.
-    /// That needs every lane of a full wave there to be read: refused where not every lane
-    /// runs, in a thread group that does not fill its waves, and for each half-wave on its
-    /// own (half a sum is no sum).
-    fn half_sum(&mut self, x: V) -> Result<V, Why> {
-        const WHERE: Why = "a wave sum of 16-bit floats where not every lane runs";
-        let threads = self.s.threads.ok_or("a wave sum of 16-bit floats outside compute")?;
-        if threads.iter().product::<u32>() % 64 != 0 {
-            return Err("a wave sum of 16-bit floats in a wave that is not full");
-        }
-        if self.local {
-            return Err("a wave sum of 16-bit floats in a half-wave");
-        }
-        // two host waves of 32 that exchange, or one host wave of 64 lanes
-        let halves = match (&self.exchange, self.s.wave_size) {
-            (Some((_, false, _)), _) => true,
-            (None, Some(64)) if self.x.p.wave64 => false,
-            _ => return Err("a wave sum of 16-bit floats on these waves"),
-        };
-        let every = if halves {
-            self.all_lanes(self.cur_ir)
-        } else {
-            all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
-        };
-        if !every {
-            if halves {
-                need(self.cur_ir);
-                return Err(WHERE);
-            }
-            // One host wave of 64, some of its lanes elsewhere: their terms
-            // are +0 on the console, so the sum of the lanes here is the
-            // sum.
-            // shortcut: in single precision, rounded once; the console
-            // rounds every addition to 16 bits. (the title's
-            // neural networks, CS_TransposeVecMatMulAlignedOperation, in a
-            // block only the lanes inside the matrix reach.)
-            return Ok(self.half_sum_here(x));
-        }
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        let mut sum = x;
-        for step in 0..if halves { 5 } else { 6 } {
-            let bit = self.s.m.i32(1 << step);
-            let partner = self.s.m.bin(c, Bin::Xor, lane, bit);
-            let theirs = self.read_lane(sum, partner);
-            sum = self.add_halves(sum, theirs);
-        }
-        let (high, low, zero) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF), self.s.m.i32(0));
-        let first = self.read_lane(x, zero);
-        let first = self.s.m.bin(c, Bin::And, first, high);
-        let sum = self.s.m.bin(c, Bin::And, sum, low);
-        let mine = self.s.m.bin(c, Bin::Or, first, sum);
-        if !halves {
-            return Ok(mine);
-        }
-        let (lo, hi) = self.exchange_halves(c, mine);
-        let c = self.cur;
-        let total = self.add_halves(lo, hi);
-        let total = self.s.m.bin(c, Bin::And, total, low);
-        let first = self.s.m.bin(c, Bin::And, lo, high);
-        Ok(self.s.m.bin(c, Bin::Or, first, total))
     }
 
     fn run(mut self, partial: bool) -> Result<Lowered, Stop> {
@@ -5590,16 +5507,24 @@ impl<'a> Lower<'a> {
         // BatchCullPreSkinnedMeshlets, BatchCullBatchCSMeshlets) reads its
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
-        // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // The host's table of strides by heap slot tells a buffer view (a
+        // stride), a constant buffer (`SLOT_CONSTANT_BUFFER`) and anything
+        // else (0) apart; only the load that fits the slot runs, and a slot
+        // that is neither reads zeros, as the console's hardware gives for
+        // a descriptor with no buffer behind it. (Read as a constant buffer,
+        // a texture's or an empty slot faulted the card at address 0 on the
+        // host's D3D12 on Linux: fork issue #698, item 4.)
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
         };
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let constant = self.s.m.i32(super::shader::SLOT_CONSTANT_BUFFER);
+            let c = self.cur;
+            let some = self.s.m.cmp(c, pred::NE, stride, zero);
+            let not_cb = self.s.m.cmp(c, pred::NE, stride, constant);
+            let is_buffer = self.s.m.bin(c, Bin::And, some, not_cb);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -5622,7 +5547,7 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            let other = self.s.m.cmp(self.cur, pred::EQ, stride, constant);
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
@@ -11762,6 +11687,34 @@ mod tests {
         let mut unused = words;
         unused[4] = 0xBF06_8008; // compare the view address instead
         assert!(!requested(compile(&unused, ResourceType::Srv, 16).unwrap()));
+    }
+
+    /// A scalar buffer load through a descriptor the program picks from the
+    /// view heap at an index it computes (heap base at s0, byte offset from a
+    /// root constant at s1): no used-resource entry, so the host's strides
+    /// table says what the slot holds and the load reads it as raw bytes, as
+    /// a constant buffer or as zeros.
+    #[test]
+    fn a_scalar_load_through_a_heap_picked_descriptor_lowers() {
+        let words = [
+            0x8F02_8501, // s_lshl_b32 s2, s1, 5 (slot index * 32 bytes)
+            0x8004_0200, // s_add_u32 s4, s0, s2
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::ResourceHeap, 0, 0), root(RootType::Constants, 1, 1)];
+        let lowered = lower_with(&words, layout, Vec::new()).unwrap();
+        assert!(
+            lowered.root_srvs.contains(&super::super::shader::SLOT_STRIDES),
+            "it reads the host's strides table"
+        );
     }
 
     #[test]
