@@ -25,12 +25,57 @@ $transaction = Join-Path $InstallDir '.dexnom-setup-transaction'
 $backup = Join-Path $transaction 'backup'
 $pending = Join-Path $transaction 'pending'
 
+function Remove-TransactionFile([string] $Path) {
+    try {
+        $attributes = [IO.File]::GetAttributes($Path)
+    } catch [IO.FileNotFoundException] {
+        return
+    }
+    if ($attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint)) {
+        throw "Expected an ordinary transaction file at '$Path'."
+    }
+    if (!($attributes -band [IO.FileAttributes]::ReadOnly)) {
+        [IO.File]::Delete($Path)
+        return
+    }
+
+    # Windows can delete a read-only file without changing its attributes,
+    # which would also change the attributes seen through any other hard link.
+    if (!('DexNomRuntime.TransactionFiles' -as [type])) {
+        Add-Type -Namespace DexNomRuntime -Name TransactionFiles -MemberDefinition @'
+    [DllImport("kernel32.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(
+        string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+    private static extern bool SetFileInformationByHandle(
+        Microsoft.Win32.SafeHandles.SafeFileHandle file, int infoClass, ref uint flags, uint size);
+
+    public static void DeleteReadOnly(string path) {
+        const uint deleteAccess = 0x00010000, writeAttributesAccess = 0x00000100;
+        const uint openExisting = 3, openReparsePoint = 0x00200000;
+        const int fileDispositionInfoEx = 21;
+        const uint delete = 1, ignoreReadOnly = 16;
+        using (var file = CreateFileW(path, deleteAccess | writeAttributesAccess, 0, IntPtr.Zero,
+                                     openExisting, openReparsePoint, IntPtr.Zero)) {
+            uint disposition = delete | ignoreReadOnly;
+            if (file.IsInvalid || !SetFileInformationByHandle(file, fileDispositionInfoEx, ref disposition, sizeof(uint))) {
+                var error = new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                throw new System.IO.IOException("Could not delete '" + path + "': " + error.Message, error);
+            }
+        }
+    }
+'@
+    }
+    [DexNomRuntime.TransactionFiles]::DeleteReadOnly($Path)
+}
+
 function Clear-InstallTransaction {
     # Clear the marker before removing files used to distinguish commit from rollback.
     if ([IO.Directory]::Exists($pending)) { [IO.Directory]::Delete($pending) }
     foreach ($directory in $backup, $transaction) {
         if ([IO.Directory]::Exists($directory)) {
-            foreach ($name in $publishOrder) { [IO.File]::Delete((Join-Path $directory $name)) }
+            foreach ($name in $publishOrder) { Remove-TransactionFile (Join-Path $directory $name) }
             [IO.Directory]::Delete($directory)
         }
     }

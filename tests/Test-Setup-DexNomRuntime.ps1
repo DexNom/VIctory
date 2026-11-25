@@ -221,8 +221,69 @@ public static class Inspector
     }
     Assert-TransactionRemoved $install
 
+    $install = New-InstallFixture 'Read-only saved path'
+    $config = Join-Path $install 'game-path.txt'
+    $configAttributes = [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Hidden
+    [IO.File]::SetAttributes($config, $configAttributes)
+    $oldWarmer = Join-Path $install 'victory-warm.exe'
+    [IO.File]::SetAttributes($oldWarmer, [IO.FileAttributes]::ReadOnly)
+    $before = (Get-Fingerprints $install ($userFiles + 'game-path.txt')) -join ','
+    foreach ($attempt in 1, 2) {
+        Invoke-Setup $install
+        Assert-TransactionRemoved $install
+        Assert-Equal ((Get-Fingerprints $install ($userFiles + 'game-path.txt')) -join ',') $before "Update $attempt changed saved data."
+        $updatedAttributes = [IO.File]::GetAttributes($config) -band $configAttributes
+        Assert-Equal $updatedAttributes $configAttributes "Update $attempt lost read-only or hidden config attributes."
+        Assert-Equal ((Get-Fingerprints $install $binaries) -join ',') $newBinaries "Update $attempt wrote the wrong binaries."
+    }
+
+    $install = New-InstallFixture 'Read-only rollback'
+    $config = Join-Path $install 'game-path.txt'
+    [IO.File]::SetAttributes($config, $configAttributes)
+    $oldWarmer = Join-Path $install 'victory-warm.exe'
+    [IO.File]::SetAttributes($oldWarmer, [IO.FileAttributes]::ReadOnly)
+    $runtimeConflict = Join-Path $install 'victory.exe'
+    [IO.File]::Delete($runtimeConflict)
+    [IO.Directory]::CreateDirectory($runtimeConflict) | Out-Null
+    $before = (Get-Fingerprints $install ($files + $userFiles)) -join ','
+    $newWarmer = Join-Path $release 'victory-warm.exe'
+    $newWarmerAttributes = [IO.File]::GetAttributes($newWarmer)
+    [IO.File]::SetAttributes($newWarmer, ($newWarmerAttributes -bor [IO.FileAttributes]::ReadOnly))
+    try {
+        Assert-Fails { Invoke-Setup $install $newGame } 'Move'
+    } finally { [IO.File]::SetAttributes($newWarmer, $newWarmerAttributes) }
+    Assert-TransactionRemoved $install
+    Assert-Equal ((Get-Fingerprints $install ($files + $userFiles)) -join ',') $before 'Rollback changed files.'
+    # Windows can set Archive when a file is renamed. The protection flags must survive.
+    $excludeArchive = -bnot [IO.FileAttributes]::Archive
+    Assert-Equal ([IO.File]::GetAttributes($config) -band $excludeArchive) $configAttributes 'Rollback changed the config protection flags.'
+    Assert-Equal ([IO.File]::GetAttributes($oldWarmer) -band $excludeArchive) ([IO.FileAttributes]::ReadOnly) 'Rollback changed the warmer protection flags.'
+    [IO.Directory]::Delete($runtimeConflict)
+    Invoke-Setup $install
+    Assert-TransactionRemoved $install
+
+    $backup = Join-Path $install '.dexnom-setup-transaction/backup'
+    [IO.Directory]::CreateDirectory($backup) | Out-Null
+    $savedBackup = Join-Path $backup 'game-path.txt'
+    [IO.File]::Copy($config, $savedBackup)
+    $backupAttributes = [IO.File]::GetAttributes($savedBackup)
+    $held = [IO.File]::Open($savedBackup, 'Open', 'Read', 'Read')
+    try {
+        Assert-Fails { Invoke-Setup $install } 'Could not recover the previous setup.*game-path\.txt'
+        Assert-Equal ([IO.File]::GetAttributes($savedBackup)) $backupAttributes 'Blocked cleanup changed backup attributes.'
+    } finally { $held.Dispose() }
+    Invoke-Setup $install
+    Assert-TransactionRemoved $install
+
     Write-Output "Installer regression tests passed on PowerShell $($PSVersionTable.PSVersion)."
 } finally {
     $env:PATH = $originalPath
+    # Only the synthetic fixtures in this test tree may have been marked read-only.
+    foreach ($path in [IO.Directory]::GetFiles($root, '*', [IO.SearchOption]::AllDirectories)) {
+        $attributes = [IO.File]::GetAttributes($path)
+        if ($attributes -band [IO.FileAttributes]::ReadOnly) {
+            [IO.File]::SetAttributes($path, ($attributes -band (-bnot [IO.FileAttributes]::ReadOnly)))
+        }
+    }
     [IO.Directory]::Delete($root, $true)
 }
