@@ -1,6 +1,6 @@
 # DexNom Runtime
 
-DexNom Runtime is a community fork of Marvisak's VIctory for Windows x64. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. It builds on the Radeon runtime tested at `e061c69032b84ec6e2ec17340469cd689500dafd` and adds fixes for static sampler selection, wave64 lane masks and integer render targets. Game files, executables, saves and generated shader caches stay on your own computer.
+DexNom Runtime is a community fork of Marvisak's VIctory for Windows x64. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. It builds on the Radeon runtime tested at `e061c69032b84ec6e2ec17340469cd689500dafd` and adds fixes for static sampler selection, wave64 lane masks and integer render targets. Game files, executables, saves and generated shader caches stay on your own computer. Linux use is a Windows compatibility path through Proton, not a native Linux port; the runtime and its D3D12 APIs remain Windows-targeted.
 
 ## Run it on your PC
 
@@ -18,6 +18,48 @@ To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** 
 To warm the shader cache, open `victory-warm.exe` in the installed runtime directory. The log lists translated and refused shaders. Graphics pipelines also depend on draw state encountered during play. If you see a missing `VCRUNTIME140.dll` error, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 
 For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
+
+## Linux compatibility setup (not a native port)
+
+Linux does not have a native VIctory runtime build: the runtime still uses Windows APIs, including Direct3D 12. The Linux path runs the Windows `victory.exe` under GE-Proton via [umu-run](https://github.com/Open-Wine-Components/umu-launcher). Install the `scripts/victory-linux.sh` launcher beside `victory.exe` as described below and start it from a Linux terminal; it invokes the Windows console runtime through `umu-run`, keeping output in the calling terminal instead of opening a Wine GUI console. Linux gameplay has not been tested, and this is not a claim of working gameplay.
+
+You need Nix with flakes enabled, `umu-run`, your own extracted game installation, and a Vulkan-capable GPU driver with the features needed to expose the game's Direct3D 12 requirements through Proton's Vulkan translation. The launcher selects the latest GE-Proton through umu; umu-run can download it on first use. A current driver with D3D12-capable Vulkan support is required; the `--warp` option is not a substitute for that driver.
+
+From the repository root, enter the Nix development shell and build the Windows MSVC target; do not use a GNU target or a native Linux build. First fetch and verify the separately supplied BCPack format table:
+
+```sh
+nix develop
+bash scripts/initialize-format-tables.sh
+cargo xwin build --target x86_64-pc-windows-msvc --locked --release -p victory --bin victory --features diagnostics
+```
+
+The helper downloads the pinned BCPack table over HTTPS and verifies its SHA-256. The table is separately supplied, stays in the repository's ignored asset location, and must not be committed or placed with the Linux runtime install or game data. On its first build, `cargo xwin` provisions and caches the Microsoft C runtime and Windows SDK; this requires network access. The executable is `target/x86_64-pc-windows-msvc/release/victory.exe`. The launcher source is `scripts/victory-linux.sh`; install it beside the executable and game-path file (renaming it to `victory-linux` is optional), for example:
+
+```text
+~/Games/VIctory-runtime/
+├── victory.exe
+├── victory-linux
+├── game-path.txt
+```
+
+For example, copy the build and launcher into that runtime directory with:
+
+```sh
+install -Dm755 target/x86_64-pc-windows-msvc/release/victory.exe "$HOME/Games/VIctory-runtime/victory.exe"
+install -Dm755 scripts/victory-linux.sh "$HOME/Games/VIctory-runtime/victory-linux"
+```
+
+Put the Linux path to your game's executable on one line in `game-path.txt` (for example, `/mnt/games/title/game_scarlett_master.exe`; do not use a Windows drive path). A game executable supplied as an argument overrides that file; relative paths in the file are resolved from the runtime directory. The launcher selects [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom) with `PROTONPATH=GE-Proton`. The Nix development shell provides `umu-run` and util-linux's `script`; outside the shell, install `umu-launcher` and `util-linux` using your distribution's package instructions. Proton's Unix-path helper detaches console programs, so the launcher routes `victory.exe` through Wine's `start.exe /b /wait /unix` to keep it attached to the invoking terminal. A pseudo-terminal mirrors and logs the output. Run it from the runtime directory:
+
+```sh
+./victory-linux
+./victory-linux /mnt/games/title/game_scarlett_master.exe
+./victory-linux --rt
+./victory-linux --warp
+./victory-linux --warm
+```
+
+`--rt` requests experimental ray tracing, `--warp` requests the D3D12 WARP software adapter (the diagnostics build above enables this option), and `--warm` scans the game installation to populate shader and compute-pipeline caches without starting the game. Warming does not create every graphics pipeline; those also depend on draw state encountered during play. The runtime directory holds persistent `state`, generated `cache`, per-run `logs` (including `logs/latest.txt` and `logs/latest-warm.txt`), and the `wineprefix`; keep it outside the source checkout.
 
 ## Try experimental ray tracing on Radeon
 

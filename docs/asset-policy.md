@@ -26,9 +26,11 @@ In any form (files, string literals, fixtures, snapshots, docs):
 ## Local build dependency
 
 The BCPack decoder needs constant format tables supplied separately from the
-GPL-licensed source. Run `Initialize-FormatTables.ps1` before building to
-prepare a hash-verified local copy at
-`crates/victory-formats/src/bcpack-tables.bin`. Git ignores this file.
+GPL-licensed source. Before building, Windows users run
+`Initialize-FormatTables.ps1`; Linux users run
+`bash scripts/initialize-format-tables.sh`. Both prepare and hash-verify the
+same local copy at `crates/victory-formats/src/bcpack-tables.bin`. Git ignores
+this file.
 The same source-only check applies to this path as to every other path.
 The original upstream repository tracks the tables in its history.
 
