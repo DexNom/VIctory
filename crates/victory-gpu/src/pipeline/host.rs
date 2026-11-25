@@ -17,6 +17,12 @@ use windows::core::PCSTR;
 use super::{Shader, Translated};
 use crate::host::host;
 
+fn request_sweep_on_oom(error: &windows::core::Error) {
+    if error.code().0 == crate::object::E_OUTOFMEMORY {
+        crate::host::request_memory_sweep();
+    }
+}
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
@@ -550,6 +556,7 @@ impl HostPipeline {
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
+                request_sweep_on_oom(&e);
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
                 return None;
             }
@@ -581,6 +588,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
+                    request_sweep_on_oom(&e);
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
                     return None;
@@ -634,6 +642,7 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
+                    request_sweep_on_oom(&e);
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
@@ -730,6 +739,9 @@ impl HostPipeline {
         };
         let mut made = make(&desc, &name(rect_gs.as_ref()));
         if made.is_err() && rect_gs.is_some() {
+            if let Err(error) = &made {
+                request_sweep_on_oom(error);
+            }
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
             host.log_messages();
@@ -740,6 +752,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
+                request_sweep_on_oom(&e);
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
                 return None;

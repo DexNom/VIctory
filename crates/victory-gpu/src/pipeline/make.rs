@@ -25,7 +25,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -40,12 +40,18 @@ pub(crate) struct Pending {
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
+    /// Exact identity for sharing one in-flight host compilation among
+    /// title pipeline objects that describe the same shaders and state.
+    identity: [u8; 32],
     used: AtomicBool,
     /// Why it is not made, if it is not ([`left_out`]).
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
 }
+
+static SHARED: OnceLock<Mutex<std::collections::HashMap<[u8; 32], Weak<Pending>>>> =
+    OnceLock::new();
 
 /// Why a pipeline with these shaders is not made, if it is not.
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
@@ -104,16 +110,28 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        let graphics_description = graphics.as_ref().map(|g| g.describe());
+        let identity = Self::identity(&shaders, graphics_description.as_deref());
+        Self::with_identity(shaders, graphics, identity, graphics_description)
+    }
+
+    fn with_identity(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        identity: [u8; 32],
+        graphics_description: Option<String>,
+    ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.update(graphics_description.as_deref().unwrap_or_default().as_bytes());
         let left_out = left_out(&shaders);
         Pending {
             shaders,
             graphics,
+            identity,
             left_out,
             begun: OnceLock::new(),
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -121,6 +139,57 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
+    }
+
+    /// The full content and translated host state, without the short shader
+    /// hashes used in diagnostics and the on-disk pipeline-library names.
+    fn identity(shaders: &[Arc<Shader>], graphics: Option<&str>) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(&(shaders.len() as u64).to_le_bytes());
+        for shader in shaders {
+            hash.update(&(shader.stage.len() as u64).to_le_bytes());
+            hash.update(shader.stage.as_bytes());
+            hash.update(&(shader.container.len() as u64).to_le_bytes());
+            hash.update(&shader.container);
+        }
+        match graphics {
+            Some(description) => {
+                hash.update(&[1]);
+                hash.update(&(description.len() as u64).to_le_bytes());
+                hash.update(description.as_bytes());
+            }
+            None => {
+                hash.update(&[0]);
+            }
+        }
+        *hash.finalize().as_bytes()
+    }
+
+    /// Returns the live pending pipeline for this exact title descriptor, or
+    /// installs one. Weak entries disappear when no title pipeline or worker
+    /// still needs the host pipeline, so the intern table does not retain the
+    /// title's shaders for the whole run.
+    pub(crate) fn shared(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+    ) -> Arc<Pending> {
+        let graphics_description = graphics.as_ref().map(|g| g.describe());
+        let identity = Self::identity(&shaders, graphics_description.as_deref());
+        let mut shared = SHARED
+            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = shared.get(&identity).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let pending = Arc::new(Self::with_identity(
+            shaders,
+            graphics,
+            identity,
+            graphics_description,
+        ));
+        shared.insert(identity, Arc::downgrade(&pending));
+        pending
     }
 
     /// Whether it is a compute pipeline.
@@ -141,6 +210,20 @@ impl Pending {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        // The registry itself is initialized by `shared`; avoid creating it
+        // from a pipeline that was constructed directly (for example warmup).
+        let Some(shared) = SHARED.get() else {
+            return;
+        };
+        let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.get(&self.identity).is_some_and(|pending| pending.upgrade().is_none()) {
+            shared.remove(&self.identity);
+        }
     }
 }
 
@@ -687,6 +770,41 @@ mod loading_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_compute_pipelines_share_one_pending_compile_across_threads() {
+        let shader = super::super::shader("compute", &[0x44, 0x58, 0x49, 0x4c, 1, 2, 3]);
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let shader = shader.clone();
+                std::thread::spawn(move || Pending::shared(vec![shader], None))
+            })
+            .collect();
+        let pending: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        assert!(pending
+            .iter()
+            .skip(1)
+            .all(|candidate| Arc::ptr_eq(&pending[0], candidate)));
+
+        let different_shader = super::super::shader("compute", &[0x44, 0x58, 0x49, 0x4c, 9]);
+        let different = Pending::shared(vec![different_shader], None);
+        assert!(!Arc::ptr_eq(&pending[0], &different));
+    }
+
+    #[test]
+    fn pending_pipeline_identity_includes_graphics_state() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+
+        let shader = super::super::shader("vertex", &[0x44, 0x58, 0x49, 0x4c, 5]);
+        let first = Pending::shared(
+            vec![shader.clone()],
+            Some(Box::new(GraphicsState::default())),
+        );
+        let mut changed = GraphicsState::default();
+        changed.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        let second = Pending::shared(vec![shader], Some(Box::new(changed)));
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
