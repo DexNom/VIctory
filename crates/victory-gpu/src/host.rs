@@ -1689,18 +1689,6 @@ void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
 }
 "#;
 
-/// Whether the pieces hashed again after ranges were sent up to a copy in
-/// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
-///
-/// Each upload refreshes the fingerprints before any title lists execute.
-/// Joining adjacent ranges reduces the number of dispatches for the same pieces.
-fn rehash_runs() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
-}
-
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
@@ -2078,8 +2066,8 @@ fn flagged_pieces(flags: impl Iterator<Item = (usize, u32, u16)>) -> std::collec
     masks
 }
 
-/// The byte ranges in the packed readback buffer follow the merge order.
-/// Record one copy command for neighboring ranges of the same GPU buffer.
+/// Record one copy command for neighboring ranges of the same GPU buffer
+/// whose destinations are also adjacent in the packed readback buffer.
 pub(crate) fn copy_fetch_runs<'a>(
     list: &ID3D12GraphicsCommandList, destination: &ID3D12Resource,
     pieces: impl Iterator<Item = (&'a ID3D12Resource, usize, usize, u64)>,
@@ -3663,8 +3651,7 @@ impl Host {
                         } else {
                             ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        let runs = crate::shadow::joined_piece_runs(runs);
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
@@ -3836,12 +3823,13 @@ impl Host {
         fetch: &mut Option<RelayFetch>,
         owners: &crate::writeback::Owners,
     ) {
+        use std::sync::Arc;
+
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
+        let mut pieces: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
@@ -3850,19 +3838,18 @@ impl Host {
             let mut seen = std::collections::HashSet::new();
             for plan in plans {
                 let fetched = flagged_pieces(plan.ranges.iter().flat_map(|r| {
-                    let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                    let copy = Arc::as_ptr(&r.shadow) as usize;
                     (0..r.span.pieces).map(move |p| (copy, r.span.first + p, r.changed_pages(p, differs)))
                 }));
                 for r in &plan.ranges {
-                    let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                    let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
                         let Some(&mask) = fetched.get(&(copy, r.span.first + p)) else {
                             continue;
                         };
                         for (lo, hi) in r.span.changed_ranges(p, mask) {
                             if seen.insert((copy, lo, hi)) {
-                                pieces.push((r.shadow.clone(), lo, hi, total));
-                                total += (hi - lo) as u64;
+                                pieces.push((r.shadow.clone(), lo, hi, 0));
                             }
                         }
                     }
@@ -3874,6 +3861,26 @@ impl Host {
             // Nothing to fetch: every send so far is older than the next fetch.
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
             return;
+        }
+        // Fetch overlapping bytes once, but keep each original merge span and
+        // its order: a larger CPU merge could cross an unreadable guest page.
+        let mut order: Vec<_> = (0..pieces.len()).collect();
+        order.sort_unstable_by_key(|&i| (Arc::as_ptr(&pieces[i].0) as usize, pieces[i].1, pieces[i].2));
+        let mut fetches: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        let mut total = 0u64;
+        for i in order {
+            let (shadow, lo, hi, at) = &mut pieces[i];
+            if let Some((last, from, to, out)) = fetches.last_mut()
+                && Arc::ptr_eq(last, shadow) && *lo <= *to
+            {
+                *at = *out + (*lo - *from) as u64;
+                total += hi.saturating_sub(*to) as u64;
+                *to = (*to).max(*hi);
+            } else {
+                *at = total;
+                total += (*hi - *lo) as u64;
+                fetches.push((shadow.clone(), *lo, *hi, *at));
+            }
         }
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
@@ -3898,7 +3905,7 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                copy_fetch_runs(&list, &buffer, pieces.iter().map(|(shadow, lo, hi, at)| (&shadow.buffer, *lo, *hi, *at)));
+                copy_fetch_runs(&list, &buffer, fetches.iter().map(|(shadow, lo, hi, at)| (&shadow.buffer, *lo, *hi, *at)));
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 // In the order of the queue: the sends of title bytes so
@@ -3924,7 +3931,7 @@ impl Host {
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
             use crate::shadow::CARD_STATS;
-            CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+            CARD_STATS[3].fetch_add(fetches.len() as u64, Ordering::Relaxed);
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
@@ -6775,8 +6782,7 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
+                     ranges were sent up, {compares:.0} compare passes"
                 );
             }
         }
