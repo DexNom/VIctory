@@ -110,7 +110,8 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
-        let left_out = left_out(&shaders);
+        let key = key.finalize().to_hex()[..32].to_owned();
+        let left_out = left_out(&shaders).or_else(|| faulted_before(&key));
         Pending {
             shaders,
             graphics,
@@ -118,7 +119,7 @@ impl Pending {
             begun: OnceLock::new(),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key,
             used: AtomicBool::new(false),
         }
     }
@@ -134,10 +135,9 @@ impl Pending {
         self.begun.get().is_some_and(|at| held_too_long(at.elapsed(), self.computes(), wait_budget()))
     }
 
-    fn make(&self) {
+    fn make(self: &Arc<Self>) {
         let _ = self.begun.set(Instant::now());
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| create(self));
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -294,11 +294,36 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// Translates the containers of compute programs and makes their host
 /// pipelines, for the caches on disk; whether it has one (`None`: left out).
 pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
-    let p = Pending::new(shaders, None);
+    let p = Arc::new(Pending::new(shaders, None));
     if p.left_out.is_some() {
         return None;
     }
-    Some(HostPipeline::new(&p.shaders, None).is_some())
+    let made = create(&p).is_some();
+    // Kept as it goes (at most every 20 s): a warm cut short keeps what it made.
+    super::library::save(false);
+    Some(made)
+}
+
+/// Why a pipeline an earlier run's driver faulted on is left out.
+fn faulted_before(key: &str) -> Option<&'static str> {
+    #[cfg(windows)]
+    if super::guard::faulted_before(key) {
+        return Some("faulted the host driver's compiler before, left out");
+    }
+    let _ = key;
+    None
+}
+
+/// The host pipeline, made under the driver guard (`guard`) where it is on.
+fn create(p: &Arc<Pending>) -> Option<HostPipeline> {
+    #[cfg(windows)]
+    if super::guard::enabled() {
+        let what = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect::<Vec<_>>().join(", ");
+        let p2 = p.clone();
+        return super::guard::run(&p.key, &what, move || HostPipeline::new(&p2.shaders, p2.graphics.as_deref()))
+            .flatten();
+    }
+    HostPipeline::new(&p.shaders, p.graphics.as_deref())
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier

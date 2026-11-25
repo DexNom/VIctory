@@ -773,6 +773,8 @@ pub(crate) mod host;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
+#[cfg(windows)]
+mod guard;
 mod make;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
