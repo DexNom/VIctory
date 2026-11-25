@@ -58,6 +58,7 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    gpu_upload_supported: OnceLock<bool>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -674,6 +675,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            gpu_upload_supported: OnceLock::new(),
         })
     }
 }
@@ -774,6 +776,31 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn descriptor_stride_upload_maps_and_keeps_the_standard_fallback() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; descriptor upload check skipped");
+            return;
+        };
+        for prefer_local in [false, true] {
+            let (buffer, data) = host.upload_descriptor_strides(64, prefer_local).unwrap();
+            let mut heap = D3D12_HEAP_PROPERTIES::default();
+            assert!(!data.is_null());
+            // SAFETY: the resource is live and the mapped buffer is writable.
+            unsafe {
+                buffer.GetHeapProperties(Some(&mut heap), None).unwrap();
+                data.cast::<u32>().write_volatile(16);
+            }
+            if !prefer_local || !host.supports_discrete_gpu_upload() {
+                assert_eq!(heap.Type, D3D12_HEAP_TYPE_UPLOAD);
+            } else {
+                assert!([D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_TYPE_GPU_UPLOAD].contains(&heap.Type));
+            }
+            eprintln!("descriptor stride upload heap type: {}", heap.Type.0);
+        }
+    }
+
 
     #[test]
     fn the_caption_ends_with_how_long_the_process_has_run() {
@@ -888,6 +915,7 @@ fn record_transitions(list: &ID3D12GraphicsCommandList, transitions: &[PreludeTr
 }
 
 struct PlannedPrelude {
+    gpu_detiles: Vec<std::sync::Arc<crate::texture::Staging>>,
     commands: Prelude,
     to_copy: Vec<PreludeTransition>,
     syncs: Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>, bool)>,
@@ -907,6 +935,9 @@ impl PlannedPrelude {
                     record_twin_copy(&list, &depth.texture, twin, *colour);
                 }
                 record_transitions(&list, &self.barriers);
+                for staging in &self.gpu_detiles {
+                    staging.record_gpu_detile(&list);
+                }
                 list.Close()
             })
         };
@@ -1783,6 +1814,7 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    gpu_detiles: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     /// First of the contiguous fills at the end of `copies`.
@@ -5500,12 +5532,13 @@ impl HostList {
             (real != *first)
                 .then(|| PreludeTransition(copy.texture.clone(), real, *first))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        let gpu_detiles = self.deferred().gpu_detiles.clone();
+        if barriers.is_empty() && syncs.is_empty() && gpu_detiles.is_empty() {
             return None;
         }
         let commands = self.prelude.get_or_init(|| host().and_then(|h| h.make_prelude()))
             .as_ref().unwrap_or_else(|| fail(format_args!("no host list for a state prelude")));
-        Some(PlannedPrelude { commands: commands.clone(), to_copy, syncs, barriers })
+        Some(PlannedPrelude { commands: commands.clone(), to_copy, syncs, barriers, gpu_detiles })
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -5826,6 +5859,10 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
+    pub(crate) fn defer_gpu_detile(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().gpu_detiles.push(staging);
+    }
+
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
     }
@@ -6498,11 +6535,72 @@ impl Host {
         }
     }
 
+    /// The descriptor-stride table lives as long as its view heap. The CPU
+    /// writes it and shaders read it, so it can use CPU-visible VRAM.
+    pub(crate) fn upload_descriptor_strides(
+        &self,
+        size: u64,
+        prefer_local: bool,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
+        if prefer_local
+            && self.supports_discrete_gpu_upload()
+            && self.video_memory().is_some_and(|[budget, used, ..]| {
+                used.saturating_add(size) <= budget.saturating_sub(budget / 10)
+            })
+        {
+            match self.map_upload(size, D3D12_HEAP_TYPE_GPU_UPLOAD) {
+                Ok(buffer) => {
+                    tracing::info!(size, "descriptor stride table in CPU-visible video memory");
+                    return Some(buffer);
+                }
+                Err(error) => tracing::debug!(%error, size, "using system memory for descriptor strides"),
+            }
+        }
+        self.upload_buffer(size)
+    }
+
+    fn supports_discrete_gpu_upload(&self) -> bool {
+        *self.gpu_upload_supported.get_or_init(|| {
+            let mut architecture = D3D12_FEATURE_DATA_ARCHITECTURE1::default();
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: each query writes its own structure of the given size.
+            unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_ARCHITECTURE1,
+                        (&raw mut architecture).cast(),
+                        size_of_val(&architecture) as u32,
+                    )
+                    .is_ok()
+                    && !architecture.UMA.as_bool()
+                    && self
+                        .device
+                        .CheckFeatureSupport(
+                            D3D12_FEATURE_D3D12_OPTIONS16,
+                            (&raw mut options).cast(),
+                            size_of_val(&options) as u32,
+                        )
+                        .is_ok()
+                    && options.GPUUploadHeapSupported.as_bool()
+            }
+        })
+    }
+
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.map_upload(size, D3D12_HEAP_TYPE_UPLOAD)
+            .inspect_err(|error| tracing::warn!(%error, size, "no upload buffer"))
+            .ok()
+    }
+
+    fn map_upload(
+        &self,
+        size: u64,
+        heap_type: D3D12_HEAP_TYPE,
+    ) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
+            Type: heap_type,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
@@ -6520,8 +6618,10 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
+        let no_cpu_reads = D3D12_RANGE { Begin: 0, End: 0 };
+        let read_range = (heap_type == D3D12_HEAP_TYPE_GPU_UPLOAD).then_some(&raw const no_cpu_reads);
         // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
+        unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
@@ -6530,18 +6630,10 @@ impl Host {
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
                     &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
-                None
-            }
+                )?;
+            let buffer = buffer.ok_or_else(windows::core::Error::empty)?;
+            buffer.Map(0, read_range, Some(&mut data))?;
+            Ok((buffer, data.cast()))
         }
     }
 }

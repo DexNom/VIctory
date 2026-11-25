@@ -537,14 +537,33 @@ impl TextureQueue {
     /// backlog of unmapped or partial textures cannot use the whole pass.
     /// Among first looks, take the newest and oldest writes in turns.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64, bool)> {
+        if max == 0 {
+            return Vec::new();
+        }
         let mut again = Vec::new();
         let mut fresh = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((index, w.write, w.recovered));
         }
-        again.sort_unstable_by_key(|&(_, write, _)| write);
-        fresh.sort_unstable_by_key(|&(_, write, _)| write);
+        let older_first = |a: &(u32, u64, bool), b: &(u32, u64, bool)| a.1.cmp(&b.1);
+        // Preserve the rotating retry/new/old policy with only the candidates
+        // that can be visited in a pass. Retain both ends of fresh writes.
+        if again.len() > max {
+            let keep = again.len() - max;
+            again.select_nth_unstable_by(keep, older_first);
+            again.drain(..keep);
+        }
+        let fresh_limit = max.saturating_mul(2);
+        if fresh.len() > fresh_limit {
+            fresh.select_nth_unstable_by(max, older_first);
+            let (_, rest) = fresh.split_at_mut(max);
+            let keep = rest.len() - max;
+            rest.select_nth_unstable_by(keep, older_first);
+            fresh.drain(max..max + keep);
+        }
+        again.sort_unstable_by(older_first);
+        fresh.sort_unstable_by(older_first);
         let count = max.min(again.len() + fresh.len());
         let mut fresh = fresh.into_iter();
         // A time-limited pass may stop after one slot. Rotate its first
@@ -867,7 +886,11 @@ impl HostHeap {
         let strides = (!sampler)
             .then(|| {
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
-                let (buffer, data) = host.upload_buffer(bytes)?;
+                static GPU_UPLOAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let prefer_local = *GPU_UPLOAD.get_or_init(|| {
+                    std::env::var_os("VICTORY_GPU_UPLOAD_STRIDES").is_some_and(|v| v == "1")
+                });
+                let (buffer, data) = host.upload_descriptor_strides(bytes, prefer_local)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);

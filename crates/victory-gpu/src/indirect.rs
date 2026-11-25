@@ -52,7 +52,11 @@ static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
 static const uint SPLIT = 2;
 [RootSignature(RS)]
+#ifdef SINGLE_RECORD
+[numthreads(1, 1, 1)]
+#else
 [numthreads(64, 1, 1)]
+#endif
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
@@ -179,13 +183,43 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_from(device, SOURCE)
+}
+
+fn make_single(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_from(device, &format!("#define SINGLE_RECORD\n{SOURCE}"))
+}
+
+/// Opt-in specialization for the indirect calls that still clamp by themselves.
+fn clamp_for(records: u32) -> Option<&'static Clamp> {
+    static SINGLE: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    if records == 1
+        && let Some(single) = SINGLE.get_or_init(|| {
+            if std::env::var_os("VICTORY_INDIRECT_SINGLE").is_none_or(|v| v != "1") {
+                return None;
+            }
+            match make_single(&host()?.device) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "single-record argument clamp unavailable");
+                    None
+                }
+            }
+        })
+    {
+        return Some(single);
+    }
+    clamp()
+}
+
+fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -268,7 +302,7 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget, dst) = (clamp_for(spec.2)?, list.budget()?, list.indirect_scratch(bytes)?);
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
 }
 
@@ -288,7 +322,7 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget, dst) = (clamp_for(spec.2)?, list.budget()?, list.indirect_scratch(bytes)?);
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, AHEAD).then_some(dst)
 }
 
