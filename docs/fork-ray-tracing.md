@@ -5,7 +5,7 @@ A GPU counter on one of the game's traversal shaders recorded finite triangle
 intersections inside the rays' requested distances. This verifies traversal
 against in-game geometry. The lighting result of each pass and the total
 number of bounces still need validation. The normal launcher leaves the
-dynamic structure builder off. [Setup and launch instructions](../README.md)
+dynamic structure builder off. [Graphics modes](graphics.md)
 
 ## What the title does
 

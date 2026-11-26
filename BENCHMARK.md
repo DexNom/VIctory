@@ -1,4 +1,27 @@
-# Radeon runtime testing, 25 November 2026
+# Radeon runtime benchmarks
+
+## Radeon FSR Quality 4K baseline
+
+On 25 November 2026, a clean source download reached the Chapter 1 City
+waterfront on the system below. Warm gameplay samples ran at about
+1.1–1.3 FPS with zero dropped draws. Initial frames took longer while
+pipelines compiled, some waterfront materials rendered black, and
+indoor lighting is still incomplete.
+
+| Component | Test system |
+| --- | --- |
+| GPU | AMD Radeon RX 7900 XTX, 24 GB GDDR6 |
+| CPU | Intel Core Ultra 9 285K, 24 cores |
+| System memory | 64 GB DDR5 |
+| OS | Windows 11 Pro x64, build 26200 |
+| Profile | Series X, ray tracing on, 2560 × 1440 render, FSR 4.1.2 Quality, 3840 × 2160 output |
+
+See [Graphics modes](docs/graphics.md#radeon-fsr-quality-4k) for the launch
+profile and [Contributing](docs/CONTRIBUTING.md#report-a-bug-or-benchmark)
+for the settings and measurements to include in a comparison.
+
+> [!NOTE]
+> The earlier experiments below used their own settings and sample windows.
 
 ## Experimental RT in Chapter 1 City
 
@@ -29,8 +52,9 @@ after the first heavy scene frame in each run.
 
 The updated run passed five million cumulative in-range triangle candidates
 by frame 1,265. This is one before-and-after measurement on one system.
-City can still exhaust the page directory's 1,023 backing-copy slots. A
-missing mapping can return zero or lose a write.
+That revision could exhaust the page directory's 1,023 backing-copy
+slots. The current directory can grow beyond that limit. A missing
+mapping can still return zero or lose a write.
 
 ## Previous Radeon test results
 
@@ -75,3 +99,41 @@ A second test ran a translated Xbox 64-bit ray-node instruction on the RX 7900 X
 The shader cache now fingerprints 30 translation source files. A controlled change to the host test harness or the standalone intersection tests preserved that fingerprint. Changing either the lowering code or the intersection translator changed it. The revised key requires a fresh translation on first use.
 
 One City texture staging sample spent 846 ms waiting on the global memory mapping lock. The updated staging path takes a lock over the source address range. In a test with a one-second remap, staging an unrelated texture took 77 microseconds. A texture inside the affected range waited for the remap and retained the expected texels.
+
+## Rendering changes in this snapshot
+
+- On an RX 7900 XTX, preserving pixel values at triangle edges in 2 × 2
+  shader groups cut incorrect edge pixels from 32 to zero in each of two
+  adjoining-triangle tests. Cube-map sampling also honors explicit gradient
+  mip selection and the shader's minimum mip level.
+- The ray-tracing page directory can grow beyond 1,023 backing buffers.
+  Draws and dispatches keep the views available when they are recorded.
+  The builder honors the game's thread count and masks excess lanes in
+  the final group. Readback combines adjacent changed-page ranges.
+- Streamed textures can upload when only their middle pages are resident.
+  The runtime merges overlapping memory notifications and rescans tracked
+  textures if the notification queue fills. Descriptor allocation looks
+  for contiguous slots and can admit already-resident textures under
+  memory pressure.
+- The runtime prioritizes previously used depth-only pipelines over
+  speculative material pipelines to reduce missing shadows during loading.
+  Distant dock fixtures also appeared dark with the ray-structure builder
+  disabled. Their cause and the gameplay impact of these changes remain open.
+- Save handling flushes copied blobs before publication and can recover
+  a complete checkpoint.
+
+### CPU submission workers
+
+To test four CPU workers for eligible upload batches and parallel
+recording of independent transition command lists, launch from PowerShell.
+The final GPU queue keeps the original submission order.
+
+~~~powershell
+$env:VICTORY_FILL_WORKERS = '4'
+$env:VICTORY_PARALLEL_PRELUDES = '1'
+$launcher = Join-Path $env:LOCALAPPDATA 'DexNom Runtime\victory-play.exe'
+& $launcher
+~~~
+
+Compare against the same save and camera after the initial streaming
+period. The default shortcuts do not set these variables.
