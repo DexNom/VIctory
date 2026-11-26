@@ -62,7 +62,8 @@ const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
+/// Sticks: W/A/S/D left, I/J/K/L right, the mouse the right one; triggers Z
+/// and C, and the mouse buttons.
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
@@ -105,17 +106,30 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+/// Mouse movement since the last poll, in pixels, and its buttons.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Pointer {
+    dx: f32,
+    dy: f32,
+    left: bool,
+    right: bool,
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
+    /// Mouse movement and buttons; none while the title's window lacks focus.
+    fn pointer(&mut self) -> Pointer {
+        Pointer::default()
+    }
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
+fn fallback(keys: &[KeyState], pointer: Pointer) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -123,18 +137,40 @@ fn fallback(keys: &[KeyState]) -> PadState {
             0.0
         }
     };
+    // Mouse look feeds the right stick. A flick is a deflection for the
+    // frames it spans, so the title's own acceleration does the rest.
+    let mut right_x = on(b'L') - on(b'J');
+    let mut right_y = on(b'I') - on(b'K');
+    if pointer.dx != 0.0 || pointer.dy != 0.0 {
+        let scale = mouse_sensitivity();
+        right_x = (right_x + pointer.dx * scale).clamp(-1.0, 1.0);
+        // Screen Y grows down; the stick's grows up.
+        right_y = (right_y - pointer.dy * scale).clamp(-1.0, 1.0);
+    }
     PadState {
         buttons: FALLBACK_BUTTONS
             .iter()
             .filter(|(vk, _)| on(*vk) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
+        left_trigger: on(b'Z').max(if pointer.right { 1.0 } else { 0.0 }),
+        right_trigger: on(b'C').max(if pointer.left { 1.0 } else { 0.0 }),
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        right_x,
+        right_y,
     }
+}
+
+/// Pixels of mouse travel per unit of right-stick deflection.
+fn mouse_sensitivity() -> f32 {
+    static SENSITIVITY: LazyLock<f32> = LazyLock::new(|| {
+        std::env::var("VICTORY_MOUSE_SENSITIVITY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v: &f32| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.05)
+    });
+    *SENSITIVITY
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
@@ -430,12 +466,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, pointer) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.pointer())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self
+            .state()
+            .poll(&self.devices, self.one_pad, pads, keys, pointer);
         self.deliver(events);
     }
 
@@ -481,11 +519,15 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        pointer: Pointer,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads
+                .into_iter()
+                .flatten()
+                .fold(fallback(&keys, pointer), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -494,7 +536,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys, pointer)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1119,9 +1161,11 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_LBUTTON, VK_RBUTTON,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1132,7 +1176,7 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, SetCursorPos,
     };
 
     use super::*;
@@ -1177,6 +1221,7 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        mouse: Mouse,
     }
 
     impl Source for Host {
@@ -1206,6 +1251,10 @@ mod host {
                 }
             }
             Some(pad)
+        }
+
+        fn pointer(&mut self) -> Pointer {
+            self.mouse.poll()
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1295,6 +1344,84 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    /// Mouse look: the cursor is kept at the game window's center while the
+    /// window has focus, so its travel never leaves the client area.
+    #[derive(Default)]
+    struct Mouse {
+        last: Option<(i32, i32)>,
+        center: Option<(i32, i32)>,
+    }
+
+    impl Mouse {
+        fn poll(&mut self) -> Pointer {
+            let mut pointer = Pointer::default();
+            if !focused() {
+                self.last = None;
+                self.center = None;
+                return pointer;
+            }
+            // SAFETY: plain queries.
+            pointer.left = unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON)) } < 0;
+            // SAFETY: plain queries.
+            pointer.right = unsafe { GetAsyncKeyState(i32::from(VK_RBUTTON)) } < 0;
+            if !look_enabled() {
+                self.last = None;
+                self.center = None;
+                return pointer;
+            }
+            let mut at = POINT::default();
+            // SAFETY: room for the point.
+            if unsafe { GetCursorPos(&mut at) } == 0 {
+                return pointer;
+            }
+            let center = client_center();
+            if self.center != Some(center) {
+                self.center = Some(center);
+                self.last = None;
+            }
+            if let Some((x, y)) = self.last.replace((at.x, at.y)) {
+                pointer.dx = (at.x - x) as f32;
+                pointer.dy = (at.y - y) as f32;
+                // A jump the size of a warp (focus gained, window moved) is
+                // not a look.
+                if pointer.dx.abs() > 400.0 || pointer.dy.abs() > 400.0 {
+                    pointer.dx = 0.0;
+                    pointer.dy = 0.0;
+                }
+            }
+            // SAFETY: a plain call; a window that went away leaves the cursor.
+            unsafe { SetCursorPos(center.0, center.1) };
+            pointer
+        }
+    }
+
+    /// `VICTORY_MOUSE_LOOK=0` releases the cursor.
+    fn look_enabled() -> bool {
+        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            !std::env::var("VICTORY_MOUSE_LOOK").is_ok_and(|v| v.trim() == "0")
+        });
+        *ENABLED
+    }
+
+    /// Center of the foreground window's client area, in screen coordinates.
+    fn client_center() -> (i32, i32) {
+        let mut rect = RECT::default();
+        // SAFETY: plain queries; a null window fails and the screen center stands.
+        unsafe {
+            let window = GetForegroundWindow();
+            if !window.is_null() && GetClientRect(window, &mut rect) != 0 {
+                let mut point = POINT {
+                    x: rect.right / 2,
+                    y: rect.bottom / 2,
+                };
+                if ClientToScreen(window, &mut point) != 0 {
+                    return (point.x, point.y);
+                }
+            }
+        }
+        (960, 540)
     }
 
     #[test]
