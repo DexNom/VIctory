@@ -696,8 +696,6 @@ fn spawn_worker(screens_only: bool) -> bool {
                 }
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
-                } else {
-                    super::library::save(false);
                 }
             }
         });

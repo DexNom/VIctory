@@ -57,9 +57,23 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Keeps the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
+}
+
+/// Whether the library's file is read and written. Off by default:
+/// `VICTORY_PIPELINE_CACHE=1` turns it on.
+///
+/// The library is 80 to 110 MB of PC memory mapped, and every save makes a
+/// buffer of that size, fills it and writes it again, in the middle of the
+/// world load's burst of pipelines: on a machine whose memory is already
+/// spent on the title that is the difference between loading and thrashing.
+/// What it saves across runs is the compile of the host pipelines, which the
+/// workers do anyway while the world loads.
+fn cache() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_CACHE").is_some_and(|v| v == "1"))
 }
 
 /// The folder the library is kept in.
@@ -444,6 +458,9 @@ const EARLY_MAX: usize = 100_000;
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
+    if !cache() {
+        return None;
+    }
     LIBRARY
         .get_or_init(|| {
             let _opening = crate::timeline::span("pipeline: open the host pipeline library");
@@ -583,7 +600,8 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
+    let library = library();
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -601,7 +619,7 @@ pub(crate) fn save(now: bool) {
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let bytes = {
+    let bytes = if let Some(library) = library {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
@@ -625,6 +643,13 @@ pub(crate) fn save(now: bool) {
             SAVED.store(size as u64, Ordering::Relaxed);
             size
         }
+    } else {
+        // No library kept: only the early list is written, and only when it
+        // changed since the last save.
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        0
     };
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
