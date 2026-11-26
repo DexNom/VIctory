@@ -194,7 +194,19 @@ enum Console {
 }
 
 fn main() -> Result<()> {
-    victory_core::logging::init("info");
+    #[cfg(windows)]
+    let errors = std::env::var_os("VICTORY_TELEMETRY_ERRORS")
+        .map(|path| -> Result<_> {
+            let path = PathBuf::from(path);
+            victory_core::policy::ensure_log_path(&path)?;
+            let file = std::fs::OpenOptions::new().append(true).open(&path)?;
+            victory_loader::log_crashes_to(path);
+            Ok(file)
+        })
+        .transpose()?;
+    #[cfg(not(windows))]
+    let errors = None;
+    victory_core::logging::init_with_error_file("info", errors);
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {

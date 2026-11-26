@@ -28,6 +28,9 @@ use crate::object::This;
 pub(crate) mod ahead;
 mod upload;
 
+pub(crate) static UPLOADED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -119,6 +122,7 @@ impl StagedCopy {
     }
 
     pub(crate) fn submitted(&self, fence: u64) {
+        self.count_transfer();
         if let Some(sparse) = &self.texture.sparse {
             sparse.submitted(fence, self.first);
             let mut last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -129,6 +133,10 @@ impl StagedCopy {
                 }
             }
         }
+    }
+
+    fn count_transfer(&self) {
+        self.staging.count_upload(self.first);
     }
 
     pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList) {
@@ -839,6 +847,19 @@ fn upload_texture(list: &HostList, resource: This, texture: &ID3D12Resource, fir
 }
 
 impl Staging {
+    fn count_upload(&self, first: u32) {
+        if crate::host::telemetry_enabled() {
+            let bytes = self.footprints.iter().zip(&self.rows).enumerate()
+                .filter(|(i, _)| self.part(*i).0 >= first)
+                .map(|(_, (footprint, &rows))| {
+                    let f = footprint.Footprint;
+                    u64::from(f.RowPitch) * u64::from(rows) * u64::from(f.Depth)
+                })
+                .sum();
+            UPLOADED_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn inline_upload(&self) -> Option<&upload::Upload> {
         if self.inline.get().is_none() {
             let _ = self.inline.set(upload::Upload::new(host()?, self.bytes)?);
@@ -853,6 +874,7 @@ impl Staging {
     }
 
     pub(crate) fn finish_inline_upload(&self) {
+        self.count_upload(self.first);
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         if !last.has_data {
             return;

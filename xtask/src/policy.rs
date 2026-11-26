@@ -118,10 +118,14 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         tracked.dedup();
         return Ok(tracked);
     }
-    // Not a git repository: walk everything except build output.
+    // Not a git repository: skip build output and local runtime logs.
     Ok(walkdir::WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| !matches!(e.file_name().to_str(), Some("target" | ".git")))
+        .filter_entry(|e| match e.file_name().to_str() {
+            Some("target" | ".git") => false,
+            Some("logs") => e.depth() != 1,
+            _ => true,
+        })
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
         .filter_map(|e| {
@@ -135,6 +139,9 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
 
 /// All problems with one file. Pure, for testing.
 pub fn check(path: &str, content: &[u8]) -> Vec<String> {
+    if path.starts_with("logs/") {
+        return vec!["local runtime logs must not be committed".to_owned()];
+    }
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());

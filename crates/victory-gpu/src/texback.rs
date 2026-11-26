@@ -168,10 +168,12 @@ pub(crate) static COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// Once the list that recorded `back` has run: its texels, tiled into the
 /// title's layout, into the texture's title memory.
 pub(crate) fn land(back: &Back) {
+    crate::host::count_readback(back.buffer_bytes, 0, 0);
     let Some(_mapping) = back.mapping.for_write() else { return };
     let mut tiled = vec![0u8; back.size];
     // Bytes of title memory the subresources do not cover stay as they are.
     crate::host::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
+    crate::host::count_readback(0, back.size, 0);
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
@@ -212,6 +214,7 @@ pub(crate) fn land(back: &Back) {
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
     crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
+    crate::host::count_readback(0, 0, back.size);
     #[cfg(feature = "diagnostics")]
     verify_first_landing(back, &tiled);
 }

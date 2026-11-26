@@ -964,6 +964,20 @@ fn resource_attributes(info: AllocationInfo, heap_kind: u32) -> u64 {
 }
 
 impl Memory {
+    fn log_backing(&self, event: &'static str) {
+        // Keep the event stream focused on significant allocations.
+        if self.layout.size() >= 1 << 20 && crate::host::telemetry_enabled() {
+            tracing::info!(
+                target: "victory_telemetry::memory",
+                pid = std::process::id(),
+                event,
+                bytes = self.layout.size(),
+                title_allocator = self.attributes.is_some(),
+                "graphics RAM backing"
+            );
+        }
+    }
+
     /// A committed resource's memory: from the title's allocator if the
     /// runtime named one, else our own; zeroed either way.
     fn for_resource(info: AllocationInfo, heap_kind: u32) -> Result<Memory, HRESULT> {
@@ -977,11 +991,13 @@ impl Memory {
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
-        Ok(Memory {
+        let memory = Memory {
             ptr,
             layout,
             attributes: Some(attributes),
-        })
+        };
+        memory.log_backing("allocate");
+        Ok(memory)
     }
 
     /// `size` zeroed bytes aligned to `alignment` (a power of two).
@@ -1008,11 +1024,13 @@ impl Memory {
         if info.size >= 32 << 20 {
             tracing::info!(mb = info.size >> 20, at = ?ptr, "memory for the title from our allocator (a heap or a descriptor heap)");
         }
-        Ok(Memory {
+        let memory = Memory {
             ptr,
             layout,
             attributes: None,
-        })
+        };
+        memory.log_backing("allocate");
+        Ok(memory)
     }
 }
 
@@ -1023,6 +1041,7 @@ impl Drop for Memory {
             // SAFETY: allocated in `new` with this layout.
             _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
         }
+        self.log_backing("free");
     }
 }
 

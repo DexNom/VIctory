@@ -12,6 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod fsr_preset;
 use fsr_preset::FsrPreset;
 
+#[path = "telemetry.rs"]
+mod telemetry;
+
 struct LaunchOptions {
     warp: bool,
     ray_tracing: Option<bool>,
@@ -27,6 +30,8 @@ struct LaunchOptions {
     rt_write_stats: bool,
     rt_store_trace: bool,
     lighting_trace: bool,
+    telemetry: bool,
+    telemetry_full_log: bool,
 }
 
 fn launcher_options(
@@ -47,6 +52,8 @@ fn launcher_options(
         rt_write_stats: false,
         rt_store_trace: false,
         lighting_trace: false,
+        telemetry: false,
+        telemetry_full_log: false,
     };
     while let Some(option) = args.peek() {
         if option == "--warp" {
@@ -87,6 +94,10 @@ fn launcher_options(
             options.rt_store_trace = true;
         } else if option == "--lighting-trace" {
             options.lighting_trace = true;
+        } else if option == "--telemetry" {
+            options.telemetry = true;
+        } else if option == "--telemetry-full-log" {
+            options.telemetry_full_log = true;
         } else if option == "--console" {
             args.next();
             options.console = match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
@@ -109,18 +120,101 @@ fn launcher_options(
     if options.fsr.is_some() && options.console != "series-x" {
         bail!("FSR at 4K requires Series X mode");
     }
+    if options.telemetry_full_log && !options.telemetry {
+        bail!("--telemetry-full-log requires --telemetry");
+    }
     Ok(options)
 }
 
 pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let launcher = std::env::current_exe()?;
     let folder = launcher.parent().context("Launcher folder is missing")?;
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let telemetry_requested = !warm && args.iter().any(|arg| arg == "--telemetry");
+    let logs = if telemetry_requested || warm {
+        log_directory(folder)?
+    } else {
+        folder.join("logs")
+    };
+    let session_logs = SessionLogs::new(&logs);
+    let mut errors = if telemetry_requested {
+        let errors_path = session_logs.file("errors.txt");
+        victory_core::policy::ensure_log_path(&errors_path)?;
+        fs::create_dir_all(&logs)?;
+        Some(OpenOptions::new().create_new(true).append(true).open(&errors_path)?)
+    } else {
+        None
+    };
+    let result = (|| {
+        let mut args = args.into_iter().peekable();
+        let options = launcher_options(&mut args)?;
+        if options.telemetry && warm {
+            bail!("--telemetry is available in victory-play.exe");
+        }
+        launch(folder, &launcher, &session_logs, warm, options, args, &mut errors)
+    })();
+    if let (Err(error), Some(errors)) = (&result, &mut errors) {
+        let _ = writeln!(errors, "Launcher PID {}: {error:#}", std::process::id());
+    }
+    result
+}
+
+struct SessionLogs<'a> {
+    directory: &'a Path,
+    prefix: String,
+}
+
+impl<'a> SessionLogs<'a> {
+    fn new(directory: &'a Path) -> Self {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+        let mut time = SYSTEMTIME::default();
+        // SAFETY: Windows writes the local date and time into a writable SYSTEMTIME.
+        unsafe { GetLocalTime(&mut time) };
+        let prefix = format!(
+            "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}-{:03}_{}",
+            time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
+            time.wMilliseconds, std::process::id()
+        );
+        Self { directory, prefix }
+    }
+
+    fn file(&self, name: &str) -> PathBuf {
+        self.directory.join(format!("{}_{name}", self.prefix))
+    }
+}
+
+fn log_directory(folder: &Path) -> anyhow::Result<PathBuf> {
+    let config = folder.join("source-path.txt");
+    match fs::read_to_string(&config) {
+        Ok(value) => {
+            let checkout = Path::new(value.trim());
+            if checkout.is_absolute() && checkout.join(victory_core::policy::ROOT_MARKER).is_file() {
+                return Ok(checkout.join("logs"));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("Could not read {}", config.display())),
+    }
+    Ok(folder.join("logs"))
+}
+
+fn launch(
+    folder: &Path,
+    launcher: &Path,
+    session_logs: &SessionLogs<'_>,
+    warm: bool,
+    options: LaunchOptions,
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+    errors: &mut Option<File>,
+) -> anyhow::Result<()> {
     let runtime = folder.join("victory.exe");
-    let mut args = std::env::args_os().skip(1).peekable();
+    let logs = session_logs.directory;
     let LaunchOptions {
         warp, ray_tracing, static_bvh, console, local_gpu_memory, native_1440p, render_1080p, fsr,
         sparse_textures, upload_ahead, capture_readbacks, rt_write_stats, rt_store_trace, lighting_trace,
-    } = launcher_options(&mut args)?;
+        telemetry, telemetry_full_log,
+    } = options;
     let game = match args.next() {
         Some(path) => PathBuf::from(path),
         None => {
@@ -132,7 +226,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     };
     if args.next().is_some() {
         bail!(
-            "Usage\n{} [--rt | --no-rt | --rt-static-bvh] [--warp] [--console series-x|series-s] [--local-gpu-memory] [--native-1440p | --1080p-to-1440p | --fsr-quality | --fsr-balanced | --fsr-performance] [--sparse-textures] [--upload-ahead | --no-upload-ahead] [--capture-readbacks] [--rt-write-stats] [--rt-store-trace] [--lighting-trace] [game executable]",
+            "Usage\n{} [--rt | --no-rt | --rt-static-bvh] [--warp] [--console series-x|series-s] [--local-gpu-memory] [--native-1440p | --1080p-to-1440p | --fsr-quality | --fsr-balanced | --fsr-performance] [--sparse-textures] [--upload-ahead | --no-upload-ahead] [--capture-readbacks] [--rt-write-stats] [--rt-store-trace] [--lighting-trace] [--telemetry [--telemetry-full-log]] [game executable]",
             launcher.display()
         );
     }
@@ -144,12 +238,10 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         );
     }
     let game = std::path::absolute(game)?;
-    let logs = folder.join("logs");
     let state = folder.join("state");
     let cache = std::env::var_os("VICTORY_CACHE_DIR")
         .filter(|v| !v.is_empty())
         .map_or_else(|| folder.join("cache"), |value| folder.join(value));
-    fs::create_dir_all(&logs)?;
     fs::create_dir_all(&state)?;
     fs::create_dir_all(&cache)?;
     let _session = OpenOptions::new()
@@ -160,24 +252,32 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         .open(state.join("launcher.lock"))
         .context("Could not lock the launcher state. Check for another DexNom RayTime session.")?;
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-    let action = if warm { "warm" } else { "run" };
-    let path = logs.join(format!("{action}-{started}-{}.log", std::process::id()));
-    let mut log = OpenOptions::new()
-        .append(true)
-        .create_new(true)
-        .open(&path)?;
-    writeln!(
-        log,
-        "Runtime {}\nGame {}",
-        runtime.display(),
-        game.display()
-    )?;
-    let latest = if warm {
-        "latest-warm.txt"
+    let path = session_logs.file(if warm { "warm.log" } else { "run.log" });
+    let _telemetry_lock = if telemetry {
+        let lock_path = logs.join(".telemetry.lock");
+        victory_core::policy::ensure_log_path(&lock_path)?;
+        Some(OpenOptions::new().write(true).create(true).truncate(false).share_mode(0)
+            .open(lock_path).context("Another session is using this telemetry directory")?)
     } else {
-        "latest.txt"
+        None
     };
-    fs::write(logs.join(latest), path.display().to_string())?;
+    let mut session_log = if telemetry || warm {
+        victory_core::policy::ensure_log_path(&path)?;
+        fs::create_dir_all(logs)?;
+        let latest = logs.join(if warm { "latest-warm.txt" } else { "latest.txt" });
+        victory_core::policy::ensure_log_path(&latest)?;
+        let mut log = OpenOptions::new().append(true).create_new(true).open(&path)?;
+        writeln!(log, "Runtime {}\nGame {}", runtime.display(), game.display())?;
+        fs::write(latest, path.display().to_string())?;
+        Some(log)
+    } else {
+        None
+    };
+    let mut sink = std::io::sink();
+    let log: &mut dyn Write = match &mut session_log {
+        Some(log) => log,
+        None => &mut sink,
+    };
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut child = Command::new(&runtime);
     if let Some(on) = ray_tracing {
@@ -213,10 +313,31 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         writeln!(log, "FSR {} (SDK mode {}) requested at {width}x{height} scene, 3840x2160 output", preset.name(), preset.mode())?;
     }
     if (fsr.is_some() || upload_ahead == Some(true)) && std::env::var_os("VICTORY_LOG").is_none() {
-        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into());
+        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+            if telemetry_full_log { "info".into() } else { "warn".into() }
+        });
         child.env("VICTORY_LOG", format!(
             "{filter},victory::run::native_1440p=info,victory_hle::modules::fidelityfx=info,victory_gpu::host=info,victory_gpu::texture::ahead=info"
         ));
+    }
+    if telemetry {
+        let filter = child
+            .get_envs()
+            .find_map(|(key, value)| (key == "VICTORY_LOG").then_some(value).flatten())
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_owned)
+            .or_else(|| std::env::var("VICTORY_LOG").ok())
+            .or_else(|| std::env::var("RUST_LOG").ok())
+            .unwrap_or_else(|| if telemetry_full_log { "info".into() } else { "warn".into() });
+        child
+            .env("VICTORY_LOG", format!("{filter},victory_telemetry=info"))
+            .env("VICTORY_TELEMETRY", "1")
+            .env("VICTORY_TELEMETRY_ERRORS", session_logs.file("errors.txt"));
+        if let Some(errors) = errors {
+            writeln!(errors, "\nSession {} (launcher PID {})", path.display(), std::process::id())?;
+        }
+    } else {
+        child.env_remove("VICTORY_TELEMETRY").env_remove("VICTORY_TELEMETRY_ERRORS");
     }
     if let Some(enabled) = upload_ahead {
         let value = if enabled { "1" } else { "0" };
@@ -257,12 +378,14 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         .env("VICTORY_DATA_DIR", &state)
         .env("VICTORY_CACHE_DIR", &cache)
         .stdin(Stdio::null())
-        .stderr(log.try_clone()?)
         .creation_flags(CREATE_NO_WINDOW);
     let status = if warm {
-        preload(&mut child, &game, &cache, &path, &mut log)?
+        let log = session_log.as_mut().context("Warmup log is missing")?;
+        child.stderr(log.try_clone()?);
+        preload(&mut child, &game, &cache, &path, log)?
     } else {
-        let status = child
+        child
+            .env("VICTORY_PLAY_LAUNCHER", "1")
             .arg("run")
             .arg(&game)
             .args([
@@ -271,18 +394,22 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
                 console,
                 "--unimplemented",
                 "trap",
-            ])
-            .stdout(log.try_clone()?)
-            .status()
-            .with_context(|| format!("Could not start {}", runtime.display()))?;
-        writeln!(log, "VIctory exited with {status}")?;
-        status
+            ]);
+        if let (Some(log), Some(errors)) = (&mut session_log, errors) {
+            telemetry::run(&mut child, log, &path, session_logs, errors, telemetry_full_log)?
+        } else {
+            child.stdout(Stdio::null()).stderr(Stdio::null()).status()
+                .with_context(|| format!("Could not start {}", runtime.display()))?
+        }
     };
     if !status.success() {
-        bail!(
-            "VIctory exited with {status}.\n\nLog file\n{}",
-            path.display()
-        );
+        if telemetry {
+            bail!("VIctory exited with {status}.\n\nErrors\n{}", session_logs.file("errors.txt").display());
+        }
+        if warm {
+            bail!("VIctory exited with {status}.\n\nLog file\n{}", path.display());
+        }
+        bail!("VIctory exited with {status}. Start with --telemetry to save diagnostics.");
     }
     Ok(())
 }
@@ -373,6 +500,17 @@ pub(super) fn show_error(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::{check_warm_summary, launcher_options};
+
+    #[test]
+    fn full_capture_requires_telemetry() {
+        let mut full_only = ["--telemetry-full-log"].map(std::ffi::OsString::from).into_iter().peekable();
+        assert!(launcher_options(&mut full_only).is_err());
+        let mut both = ["--telemetry-full-log", "--telemetry", "game.exe"]
+            .map(std::ffi::OsString::from).into_iter().peekable();
+        let options = launcher_options(&mut both).unwrap();
+        assert!(options.telemetry && options.telemetry_full_log);
+        assert_eq!(both.next().unwrap(), "game.exe");
+    }
 
     #[test]
     fn explicit_off_wins_in_either_order_and_keeps_the_game_path() {

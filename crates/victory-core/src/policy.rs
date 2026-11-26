@@ -1,10 +1,11 @@
-//! Rule #1, enforced at runtime: game-derived data never lands in the repo.
+//! Rule #1, enforced at runtime: game-derived assets stay outside the checkout.
 //!
 //! Everything VIctory produces from the user's files (converted assets,
 //! prepared images, shader caches, crash dumps) is as much "from the game"
 //! as the files themselves. Every tool that writes such output must call
 //! [`ensure_outside_repo`] on the destination first. The static half of the
-//! rule is `cargo xtask policy`, which checks what git tracks.
+//! rule is `cargo xtask policy`, which checks what git tracks. Local diagnostic
+//! text uses the separate `ensure_log_path` check.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -39,11 +40,25 @@ pub enum PolicyError {
 /// 2. none of its ancestors contains the [`ROOT_MARKER`] file (catches
 ///    other clones/copies of the repository).
 pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
+    check_destination(path, false)
+}
+
+/// Allows local runtime logs directly in a checkout's ignored `logs` directory.
+pub fn ensure_log_path(path: &Path) -> Result<(), PolicyError> {
+    check_destination(path, true)
+}
+
+fn check_destination(path: &Path, allow_logs: bool) -> Result<(), PolicyError> {
     let resolved = resolve(path)?;
+    let allowed_in = |root: &Path| {
+        let logs = root.join("logs");
+        allow_logs && (resolved == logs || resolved.parent() == Some(logs.as_path()))
+    };
 
     if let Ok(root) = std::fs::canonicalize(compiled_workspace_root())
         && root.join(ROOT_MARKER).is_file()
         && resolved.starts_with(&root)
+        && !allowed_in(&root)
     {
         return Err(PolicyError::InsideRepo {
             path: path.to_path_buf(),
@@ -52,7 +67,7 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
     }
 
     for ancestor in resolved.ancestors() {
-        if ancestor.join(ROOT_MARKER).is_file() {
+        if ancestor.join(ROOT_MARKER).is_file() && !allowed_in(ancestor) {
             return Err(PolicyError::InsideRepo {
                 path: path.to_path_buf(),
                 root: ancestor.to_path_buf(),
@@ -155,5 +170,17 @@ mod tests {
     fn accepts_unrelated_directories() {
         let tmp = tempfile::tempdir().unwrap();
         ensure_outside_repo(&tmp.path().join("does").join("not").join("exist")).unwrap();
+    }
+
+    #[test]
+    fn only_log_writers_can_use_the_checkout_logs_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(ROOT_MARKER), "").unwrap();
+        let logs = tmp.path().join("logs");
+        assert!(ensure_log_path(&logs).is_ok());
+        assert!(ensure_log_path(&logs.join("performance.txt")).is_ok());
+        assert!(ensure_outside_repo(&logs).is_err());
+        assert!(ensure_log_path(&logs.join("..").join("Cargo.toml")).is_err());
+        assert!(ensure_log_path(&logs.join("another").join("performance.txt")).is_err());
     }
 }
