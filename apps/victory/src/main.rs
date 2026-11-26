@@ -18,6 +18,19 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// The Agility SDK's version export. The system `d3d12.dll` reads this name
+/// and `D3D12SDKPath` out of the executable's export table and loads the
+/// core from that folder: 620 is Direct3D 12 1.620, which carries Shader
+/// Model 6.6 and the mesh shaders the title asks for. Windows 10's own
+/// `d3d12.dll` stops at 6.5, so without this the device fails to be made.
+/// The number must match the shipped core exactly: 620 for 1.620.x.
+#[unsafe(no_mangle)]
+pub static D3D12SDKVersion: u32 = 620;
+
+/// Where the core sits, relative to the executable: `.\D3D12\`.
+#[unsafe(no_mangle)]
+pub static D3D12SDKPath: &[u8; 9] = b".\\D3D12\\\0";
+
 #[derive(Parser)]
 #[command(
     name = "victory",
