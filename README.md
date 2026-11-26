@@ -20,7 +20,7 @@ The Radeon FSR Quality 4K build is our most stable tested baseline for shaders a
 
 ## Run it on your PC
 
-1. Use 64-bit Windows and a current Direct3D 12 driver. The game uses mesh shaders and Shader Model 6.6. The Radeon gameplay results and known issues are listed below.
+1. Use 64-bit Windows and a current Direct3D 12 driver. The game uses mesh shaders and Shader Model 6.6, and Setup warns before building if no GPU reports both (pass `-SkipGpuCheck` to skip the check). The Radeon gameplay results and known issues are listed below.
 2. Install Rust for Windows and Visual Studio Build Tools. In the Visual Studio installer, select **Desktop development with C++**, including the x64 MSVC toolset and a Windows 10 or 11 SDK. [Rust installer](https://rustup.rs/) · [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
 3. Download this repository using **Code → Download ZIP**, extract the ZIP to a writable folder, and double-click **Setup.cmd**. Select the Series X game executable inside your own extracted game installation. Keep its accompanying files together. Setup downloads the pinned build dependencies, verifies the BCPack format tables, and compiles the three Windows programs locally. [Download source ZIP](https://github.com/DexNom/VIctory/archive/refs/heads/main.zip)
 4. Open **DexNom RayTime** from the Windows Start menu. Use a controller for the game's first-time setup. The launcher and your local data are in `%LOCALAPPDATA%\DexNom Runtime`. Saves are in `state`, shader caches in `cache`, and per-run diagnostics in `logs`. The file `logs\latest.txt` points to the latest game log.
