@@ -723,7 +723,7 @@ pub(crate) extern "system" fn create_stream(
     #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
     let mut at = 0;
-    while at + 8 <= desc.size {
+    while desc.size - at >= 8 {
         // SAFETY: inside the stream the title passes.
         let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
         let Some((size, stage)) = subobject(kind) else {
@@ -734,6 +734,11 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        // Reject truncated subobjects before reading their contents.
+        if size > desc.size - at {
+            return E_INVALIDARG;
+        }
+
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8.
             let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
@@ -874,6 +879,38 @@ mod tests {
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
+
+    #[test]
+    fn truncated_shader_subobjects_are_rejected() {
+        for kind in [1u64, 2, 6, 24] {
+            let stream = [kind, 0, 0];
+
+            for size in [8usize, 16] {
+                let desc = StreamDesc {
+                    size,
+                    stream: stream.as_ptr().cast(),
+                };
+
+                let mut p = std::ptr::null();
+                let hr = create_stream(
+                    std::ptr::null(),
+                    &desc,
+                    &PIPELINE_IIDS[0],
+                    &mut p,
+                );
+
+                if !p.is_null() {
+                    release(p);
+                }
+
+                assert_eq!(
+                    hr, E_INVALIDARG,
+                    "accepted truncated subobject: kind={kind}, size={size}"
+                );
+            }
+        }
+    }
+
 
     /// The stream layout the title builds (title+0x86f090): root
     /// signature, five shader slots (the first a mesh shader), blend, sample
