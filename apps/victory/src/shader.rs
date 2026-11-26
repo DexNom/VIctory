@@ -42,12 +42,14 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let tail = &data[offset..];
+        let container = Container::parse(tail).ok()?;
+        Some(Source::Raw {
             offset,
-            data: &data[offset..],
-        });
+            data: &tail[..container.byte_len],
+        })
+    });
     out.extend(raw);
     out
 }
@@ -224,4 +226,30 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_raw_sources_end_at_the_declared_container_size() {
+        let mut container = [0u8; 32];
+        container[..4].copy_from_slice(b"DXBC");
+        container[24..28].copy_from_slice(&32u32.to_le_bytes());
+        let file = [
+            b"prefix".as_slice(),
+            &container,
+            b"gap",
+            &container,
+            b"suffix",
+        ]
+        .concat();
+        let sources = sources(&file);
+        assert_eq!(sources.len(), 2);
+        for (source, offset) in sources.iter().zip([6, 41]) {
+            assert_eq!(source.label(), format!("@{offset:#x}"));
+            assert_eq!(source.bytes().unwrap().as_ref(), &container);
+        }
+    }
 }

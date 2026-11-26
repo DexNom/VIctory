@@ -333,9 +333,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, rays: cra
                             let Some(bytes) = job.bytes() else { continue };
                             let Ok(container) = Container::parse(&bytes) else { continue };
                             // As the title passes it: no more than the container.
-                            let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { continue };
-                            let total = u32::from_le_bytes(total) as usize;
-                            let bytes = &bytes[..total.min(bytes.len())];
+                            let bytes = &bytes[..container.byte_len];
                             let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { continue };
                             if !lock(&seen).insert(blake3::hash(bytes)) {
                                 continue;
