@@ -394,7 +394,11 @@ fn translate(
     };
     // The hash a run's log names the shader by (`hash=` in "first bind",
     // "shader does not translate", "host pipeline refused").
-    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    let parsed = Container::parse(&bytes);
+    // Packed records can include padding after the container. Use the same
+    // bytes as warm-up, retaining the full payload for malformed-record diagnostics.
+    let bytes = parsed.as_ref().map_or(bytes.as_ref(), |c| &bytes[..c.byte_len]);
+    let hash = blake3::hash(bytes).to_hex()[..16].to_owned();
     // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates
     // those containers alone.
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -411,7 +415,7 @@ fn translate(
     }
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
-    let Ok(container) = Container::parse(&bytes) else {
+    let Ok(container) = parsed else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
@@ -437,7 +441,7 @@ fn translate(
                 .take(70)
                 .collect();
             let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), bytes);
         }
     }
     if !lock(seen).insert(code) {
@@ -462,7 +466,7 @@ fn translate(
             if *n > was && was < 3 {
                 let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), bytes);
             }
         }
     }
@@ -857,4 +861,41 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod packed_source_tests {
+    use super::*;
+
+    #[test]
+    fn packed_translation_hashes_the_container_and_preserves_invalid_payloads() {
+        let mut container = [0u8; 32];
+        container[..4].copy_from_slice(b"DXBC");
+        container[24..28].copy_from_slice(&32u32.to_le_bytes());
+        let padded = [&container[..], b"record padding"].concat();
+        for (payload, expected) in [
+            (padded.as_slice(), container.as_slice()),
+            (b"not a container".as_slice(), b"not a container".as_slice()),
+            (&container[..28], &container[..28]),
+        ] {
+            // An SGD5 record containing one uncompressed DEFLATE block.
+            let len = u16::try_from(payload.len()).unwrap();
+            let record_size = u32::from(len) + 17;
+            let mut file = vec![0, 0x32];
+            for word in [record_size, 0x000d_dce7, record_size, u32::from(len)] {
+                file.extend_from_slice(&word.to_le_bytes());
+            }
+            file.push(1);
+            file.extend_from_slice(&len.to_le_bytes());
+            file.extend_from_slice(&(!len).to_le_bytes());
+            file.extend_from_slice(payload);
+            let record = victory_game::sgd5::records(&file).next().unwrap();
+            let mut tally = Tally::default();
+            let mut checks = Checks { keep: None, validator: None, host: None };
+            translate(&Source::Packed(record), Path::new("test"), &Mutex::default(), &mut tally, &mut checks);
+            let (count, example) = &tally.failed["no DXIL part (SM5 or older)"];
+            assert_eq!(*count, 1);
+            assert!(example.ends_with(&format!("#{}", &blake3::hash(expected).to_hex()[..16])));
+        }
+    }
 }
