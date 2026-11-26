@@ -14,6 +14,11 @@ game_dir = 'D:\victory-data\game'
 # Default: %LOCALAPPDATA%\victory\data.   env: VICTORY_DATA_DIR
 # data_dir = 'D:\victory-data\data'
 
+# Folder holding an optional host FidelityFX upscaler
+# (amd_fidelityfx_upscaler_dx12.dll and its dependencies).
+# env: VICTORY_FIDELITYFX_DIR
+# fidelityfx_dir = 'D:\victory-data\fidelityfx'
+
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []

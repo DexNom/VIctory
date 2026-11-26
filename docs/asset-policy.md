@@ -35,8 +35,9 @@ The original upstream repository tracks the tables in its history.
 ## Where data lives
 
 Outside the repository, configured in `victory.toml`: `game_dir` (the
-user's dump), `test_titles`, and `cache_dir` for everything derived
-(default `%LOCALAPPDATA%\victory\cache`).
+user's dump), `test_titles`, `cache_dir` for everything derived
+(default `%LOCALAPPDATA%\victory\cache`), and `data_dir` for what titles
+save (default `%LOCALAPPDATA%\victory\data`), kept apart from the cache.
 
 ## Enforcement
 
