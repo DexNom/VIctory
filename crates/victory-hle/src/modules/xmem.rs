@@ -609,6 +609,31 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     true
 }
 
+/// The `len` bytes of physical pages from `offset` bytes into the first
+/// (what [`write_physical`] would write over). `None` if a page is unknown
+/// or the host fails.
+pub(crate) fn read_physical(pages: &[usize], offset: usize, len: usize) -> Option<Vec<u8>> {
+    let runs = runs(pages, offset, len)?;
+    let mut out = Vec::with_capacity(len);
+    let mut within = offset % PAGE;
+    for (slice, n) in &runs {
+        let mut view = View::map(slice, *n)?;
+        let k = (n * PAGE - within).min(len - out.len());
+        out.extend_from_slice(&view.bytes()[within..within + k]);
+        within = 0;
+    }
+    Some(out)
+}
+
+/// For a warning: where the title shows physical page `page` (the first
+/// address, and how many views), or `None` if the page is unknown.
+pub(crate) fn page_shown(page: usize) -> Option<(usize, usize)> {
+    let physical = physical();
+    let slice = physical.pages.get(&page)?;
+    let shown = physical.shown.get(&slice.key(0));
+    Some((shown.and_then(|s| s.first().copied()).unwrap_or(0), shown.map_or(0, Vec::len)))
+}
+
 /// After writes into `n` pages from `slice` on through a view of our own:
 /// where the title sees those pages, the GPU side has to copy them again (it
 /// does not see such writes).
