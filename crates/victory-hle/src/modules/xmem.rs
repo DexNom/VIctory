@@ -374,6 +374,8 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        // The handle's number may name another object from now on.
+        victory_gpu::title_memory_section_closed(self.0 as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -446,51 +448,108 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    // Under Wine a committed section is a sparse file, free until touched,
+    // and committing a reserved one page by page costs a wineserver
+    // request each that scans every range committed so far: commit it
+    // whole there. With title memory in place on the GPU side
+    // (`victory_gpu::title_memory_sections_committed`) it is committed
+    // whole too, since only such a section can be opened as a host heap:
+    // that charges the system's commit for all of it at once (physical
+    // memory only as pages are touched), and falls back to a reserved one
+    // if the system cannot.
+    let make = |kind, bytes: usize| {
+        // SAFETY: plain section creation.
+        unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | kind,
+                (bytes as u64 >> 32) as u32,
+                bytes as u32,
+                std::ptr::null(),
+            )
+        }
     };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    let in_place = !on_wine() && victory_gpu::title_memory_sections_committed();
+    // In place, the pages come from sections of at most `in_place_section`
+    // bytes each: the host refuses to open a section of 4 GiB or more as a
+    // heap (RX 7800 XT, Adrenalin 32.0.32029: 4095 MiB opens, 4096 MiB is
+    // E_INVALIDARG), and a heap is resident whole. Page numbers are opaque
+    // to the title, and a view is a run of consecutive pages of one
+    // section, so a run across two sections is two views.
+    let chunk = if in_place { in_place_section() } else { size };
+    let mut committed = on_wine() || in_place;
+    let mut sections: Vec<(Arc<Section>, usize)> = Vec::new();
+    let mut made = 0;
+    while made < size {
+        let bytes = chunk.min(size - made);
+        let mut handle = make(if committed { SEC_COMMIT } else { SEC_RESERVE }, bytes);
+        if handle.is_null() && in_place && committed {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, bytes, %error, "a committed section for physical pages could not be made: reserved ones instead (their views are not in place)");
+            committed = false;
+            handle = make(SEC_RESERVE, bytes);
+        }
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // Those made so far close as `sections` goes.
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        // For the GPU side's in-place census: only a committed section can
+        // be opened as a host heap.
+        victory_gpu::title_memory_section(handle as usize, bytes as u64, committed);
+        sections.push((Arc::new(Section(handle)), bytes / PAGE));
+        made += bytes;
     }
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
+        sections = sections.len(),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    let mut k = 0;
+    for (section, count) in &sections {
+        for index in 0..*count {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            let number = first + k * FRAMES;
+            physical.pages.insert(number, slice);
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(k).write(number) };
+            k += 1;
+        }
     }
     1
+}
+
+/// The most bytes of one section of physical pages while title memory is
+/// in place (`XMemAllocatePhysicalPages`): `VICTORY_INPLACE_SECTION_MB`,
+/// 64 MiB unless set (a power of two from 1 to 2048).
+///
+/// Under 4 GiB, which the host refuses to open as a heap; and small,
+/// since a heap is resident whole while the card may use it: with 2 GiB
+/// sections the card's share of the PC's memory went from some 10 to
+/// 15.4 GB within three minutes of the prologue and the device was lost
+/// for want of memory (run 5, RX 7800 XT, 32 GB). A window that straddles
+/// two sections is two views, turned down and copied as before.
+fn in_place_section() -> usize {
+    static BYTES: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("VICTORY_INPLACE_SECTION_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|mb| mb.is_power_of_two() && (1..=2048).contains(mb))
+            .unwrap_or(64)
+            << 20
+    });
+    *BYTES
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -891,6 +950,15 @@ fn join_placeholders(base: usize, len: usize) -> bool {
 fn commit(base: usize, len: usize) -> bool {
     if on_wine() {
         return true; // sections are committed whole there
+    }
+    // A view of a section made committed (for title memory in place).
+    // SAFETY: plain data filled in by the query, of a valid out pointer.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(base as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } != 0
+        && info.State == MEM_COMMIT
+        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= base.saturating_add(len)
+    {
+        return true;
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
