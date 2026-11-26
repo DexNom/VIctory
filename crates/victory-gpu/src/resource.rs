@@ -1128,6 +1128,9 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// The title's largest mips it goes without ([`over_cap`]): its mip 0
+    /// is the title's mip `skip`.
+    pub(crate) skip: u32,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1318,7 +1321,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let streamed = matches!(r.backing, Backing::Address(_) | Backing::ViewAddress(_));
+        let skip = if streamed { over_cap(&r.desc) } else { 0 };
+        let Some(texture) = host_texture(&r.desc, r.host.state, clear, skip) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1337,6 +1342,23 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = HostTexture::new(texture, state);
         host.filled = fills(&r.desc);
+        host.skip = skip;
+        if skip > 0 {
+            SKIPPED[0].fetch_add(1, Relaxed);
+            let n = SKIPPED[1].fetch_add(1, Relaxed) + 1;
+            if n == 1 || n.is_power_of_two() {
+                tracing::info!(
+                    resource = ?this,
+                    width = r.desc.width,
+                    height = r.desc.height,
+                    mips = r.desc.mip_levels,
+                    skip,
+                    host_bytes = host.bytes,
+                    so_far = n,
+                    "a streamed texture's host copy goes without its largest mips (VICTORY_TEXTURE_MAX)"
+                );
+            }
+        }
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
@@ -1415,6 +1437,165 @@ fn room_percent() -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(90, |percent| percent.clamp(50, 97))
     })
+}
+
+/// Host copies of streamed textures made without their largest mips
+/// ([`over_cap`]): alive is not tracked; made since the start, and the
+/// count the log line goes by.
+#[cfg(windows)]
+pub(crate) static SKIPPED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// How much of the card's memory budget the process uses, in percent, as
+/// last asked (at most every 50 ms: asked for every host copy made).
+#[cfg(windows)]
+fn video_memory_percent() -> u64 {
+    static LAST: std::sync::Mutex<(Option<std::time::Instant>, u64)> =
+        std::sync::Mutex::new((None, 0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.0.is_none_or(|at| at.elapsed() > std::time::Duration::from_millis(50)) {
+        last.0 = Some(std::time::Instant::now());
+        if let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) {
+            last.1 = used.saturating_mul(100) / budget.max(1);
+        }
+    }
+    last.1
+}
+
+/// The longest side a streamed texture's host copy may have, from
+/// `VICTORY_TEXTURE_MAX` (pixels; `0`: no limit) or else from how full the
+/// card is: 1024 under 70% of its budget, 512 under 85%, 256 above.
+/// (Ported from Belobug's AMD fork, where at 2048 a 16 GB card went 1 to 2
+/// GB over its budget.)
+#[cfg(windows)]
+fn texture_max() -> u64 {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_TEXTURE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        tracing::info!(
+            set = ?set,
+            "streamed textures' host copies: largest side capped (VICTORY_TEXTURE_MAX; by default 1024, 512, 256 as the card fills; 0: no cap)"
+        );
+        set
+    });
+    set.unwrap_or_else(|| cap_for_percent(video_memory_percent()))
+}
+
+/// [`texture_max`]'s default for a card `percent` full.
+#[cfg(windows)]
+fn cap_for_percent(percent: u64) -> u64 {
+    match percent {
+        0..70 => 1024,
+        70..85 => 512,
+        _ => 256,
+    }
+}
+
+/// How many of a streamed texture's largest mips its host copy goes
+/// without, for no side of it to pass [`texture_max`]. All the textures
+/// whole did not fit on the card: past its budget new host copies wait
+/// ([`room`]) and those textures show nothing.
+#[cfg(windows)]
+fn over_cap(d: &ResourceDesc) -> u32 {
+    if cfg!(test) {
+        return 0;
+    }
+    mips_over(d, texture_max())
+}
+
+/// How many of the largest mips a texture described by `d` loses for no
+/// side of it to pass `max` (0: none): only sampled 2-D textures of
+/// block-compressed formats (BC1 to BC7) with a mip chain, no render
+/// target, depth or unordered access; at least one mip stays, and the
+/// sides of the new largest mip stay multiples of 4 (the host's rule for
+/// block-compressed textures).
+#[cfg(windows)]
+fn mips_over(d: &ResourceDesc, max: u64) -> u32 {
+    const TEXTURE2D: u32 = 3;
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
+    if max == 0
+        || d.dimension != TEXTURE2D
+        || d.flags & TARGET_DEPTH_UNORDERED != 0
+        || !block
+        || d.mip_levels < 2
+        || d.sample_count > 1
+    {
+        return 0;
+    }
+    let (width, height) = (d.width, u64::from(d.height));
+    let mut skip = 0u32;
+    while (width.max(height) >> skip) > max
+        && skip + 1 < u32::from(d.mip_levels)
+        && (width >> (skip + 1)) > 0
+        && (height >> (skip + 1)) > 0
+        && (width >> (skip + 1)).is_multiple_of(4)
+        && (height >> (skip + 1)).is_multiple_of(4)
+    {
+        skip += 1;
+    }
+    skip
+}
+
+/// The title's largest mips the host copy of texture `this` goes without
+/// (0 without a host copy; not a use of it).
+#[cfg(windows)]
+pub(crate) fn skipped_mips(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return 0;
+    }
+    r.host
+        .made
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |(host, _)| host.skip)
+}
+
+/// The title's largest mips `host`, a host copy of texture `this`, goes
+/// without: told by its own count of mips, so that it is right for that
+/// very host copy even if another has replaced it since.
+#[cfg(windows)]
+pub(crate) fn skip_of(this: This, host: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return 0;
+    }
+    // SAFETY: a live resource.
+    let d = unsafe { host.GetDesc() };
+    mip_count(&r.desc).saturating_sub(u32::from(d.MipLevels))
+}
+
+/// The subresource of texture `this`'s host copy that is the title's
+/// subresource `index`; `None` for one of the mips the host copy goes
+/// without ([`skipped_mips`]).
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
+    let skip = skipped_mips(this);
+    if skip == 0 {
+        return Some(index);
+    }
+    subresource_without(index, mip_count(&resource(this).desc), skip)
+}
+
+/// Title subresource `index` of a texture of `mips` mips (mip first, then
+/// array slice, then plane) in a copy without the `skip` largest mips.
+#[cfg(windows)]
+fn subresource_without(index: u32, mips: u32, skip: u32) -> Option<u32> {
+    if mips == 0 || skip >= mips {
+        return None;
+    }
+    let (mip, rest) = (index % mips, index / mips);
+    (mip >= skip).then(|| rest * (mips - skip) + mip - skip)
 }
 
 /// Finds an existing placed texture using the same key as `texture_at`.
@@ -1805,6 +1986,7 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            skip: 0,
         }
     }
 }
@@ -1876,6 +2058,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    skip: u32,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -1886,6 +2069,11 @@ fn host_texture(
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
+    // Without the title's `skip` largest mips ([`over_cap`]).
+    let skip = skip.min(u32::from(d.mip_levels).saturating_sub(1));
+    d.width >>= skip;
+    d.height >>= skip;
+    d.mip_levels -= skip as u16;
     d.flags &= PC_FLAGS;
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; the title's shadow maps ask for it).
@@ -4242,5 +4430,55 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// A streamed BC texture larger than the cap loses the fewest largest
+    /// mips for both sides to fit; others are left whole.
+    #[cfg(windows)]
+    #[test]
+    fn a_large_streamed_texture_goes_without_its_largest_mips() {
+        const BC1: u32 = 71;
+        const BC7: u32 = 98;
+        assert_eq!(mips_over(&texture(4096, 4096, BC1, 13), 1024), 2);
+        assert_eq!(mips_over(&texture(4096, 1024, BC7, 13), 1024), 2, "the longer side");
+        assert_eq!(mips_over(&texture(2048, 2048, BC7, 12), 512), 2);
+        assert_eq!(mips_over(&texture(1024, 1024, BC1, 11), 1024), 0, "fits already");
+        assert_eq!(mips_over(&texture(4096, 4096, BC1, 13), 0), 0, "no cap");
+        assert_eq!(mips_over(&texture(4096, 4096, 28, 13), 1024), 0, "not block-compressed");
+        assert_eq!(mips_over(&texture(4096, 4096, BC1, 1), 1024), 0, "no mip chain");
+        assert_eq!(mips_over(&texture(4096, 4096, BC1, 2), 256), 1, "one mip stays");
+        // Sides stay multiples of 4: 2052 / 2 = 1026 is not.
+        assert_eq!(mips_over(&texture(2052, 2048, BC1, 12), 1024), 0);
+        let target = ResourceDesc { flags: 1, ..texture(4096, 4096, BC1, 13) };
+        assert_eq!(mips_over(&target, 1024), 0, "a render target");
+        let unordered = ResourceDesc { flags: 4, ..texture(4096, 4096, BC1, 13) };
+        assert_eq!(mips_over(&unordered, 1024), 0, "unordered access");
+        let volume = ResourceDesc { dimension: 4, ..texture(4096, 4096, BC1, 13) };
+        assert_eq!(mips_over(&volume, 1024), 0, "a volume");
+        let array = ResourceDesc { depth_or_array_size: 6, ..texture(4096, 4096, BC1, 13) };
+        assert_eq!(mips_over(&array, 1024), 2, "arrays and cubes too");
+        assert_eq!([cap_for_percent(10), cap_for_percent(69), cap_for_percent(70)], [1024, 1024, 512]);
+        assert_eq!([cap_for_percent(84), cap_for_percent(85), cap_for_percent(120)], [512, 256, 256]);
+    }
+
+    /// The title's subresources (mip, then slice) of a texture of 5 mips in
+    /// 3 slices, in a host copy without the 2 largest: mips 2 to 4 of each
+    /// slice are the host's 0 to 2, mips 0 and 1 have none.
+    #[cfg(windows)]
+    #[test]
+    fn subresources_map_past_the_skipped_mips() {
+        let host: Vec<Option<u32>> = (0..15).map(|i| subresource_without(i, 5, 2)).collect();
+        assert_eq!(
+            host,
+            [
+                None, None, Some(0), Some(1), Some(2),
+                None, None, Some(3), Some(4), Some(5),
+                None, None, Some(6), Some(7), Some(8),
+            ]
+        );
+        assert_eq!(subresource_without(7, 5, 0), Some(7), "nothing skipped");
+        assert_eq!(subresource_without(0, 2, 2), None, "all skipped");
+        // A second plane follows all slices of the first.
+        assert_eq!(subresource_without(5 * 3 + 4, 5, 2), Some(3 * 3 + 2));
     }
 }

@@ -830,6 +830,41 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Whether the host copies of two textures go without different numbers
+/// of the title's largest mips (`VICTORY_TEXTURE_MAX`): they are not alike,
+/// and a whole copy between them is left out (logged once).
+#[cfg(windows)]
+fn skipped_unlike(dst: This, src: This) -> bool {
+    let (a, b) = (crate::resource::skipped_mips(dst), crate::resource::skipped_mips(src));
+    if a != b {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(?dst, ?src, dst_skip = a, src_skip = b, "copy between textures without the same largest mips skipped")
+        });
+    }
+    a != b
+}
+
+/// A copy location naming a title texture's subresource (type 0), made to
+/// name the same subresource of its host copy, which may go without the
+/// title's largest mips; false for one of those (nothing to copy).
+#[cfg(windows)]
+fn to_host_subresource(location: &mut CopyLocation) -> bool {
+    const INDEX: u32 = 0;
+    if location.kind != INDEX {
+        return true;
+    }
+    // The index is the location's first four bytes.
+    let index = location.footprint.offset as u32;
+    match crate::resource::host_subresource(location.resource, index) {
+        Some(host) => {
+            location.footprint.offset = (location.footprint.offset & !0xffff_ffff) | u64::from(host);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Whether one of two resources is a target in a stand-in format and the
 /// other is not ([`crate::resource::target_format`]): their texels differ
 /// in size, so the host cannot copy between them (logged once).
@@ -855,7 +890,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) {
+            if unlike(dst, src) || skipped_unlike(dst, src) {
                 return;
             }
             // A source the title fills itself is uploaded first (upstream
@@ -958,6 +993,15 @@ extern "system" fn copy_texture_region(
             return;
         };
         if unlike(dst.resource, src.resource) {
+            return;
+        }
+        // Of host copies without the title's largest mips, the same
+        // subresource; none of those left out.
+        let (mut dst, mut src) = (dst, src);
+        if src.kind != FOOTPRINT && crate::resource::host_resource(src.resource).is_none() {
+            return;
+        }
+        if !to_host_subresource(&mut dst) || !to_host_subresource(&mut src) {
             return;
         }
         let mut from = src;
@@ -1077,6 +1121,10 @@ fn read_back(
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    let mut src = src;
+    if !to_host_subresource(&mut src) {
+        return Err("a mip the host copy goes without");
+    }
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.

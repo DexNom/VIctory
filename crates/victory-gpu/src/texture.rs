@@ -41,10 +41,14 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Mips per array slice (the title's).
     mips: u32,
-    /// The first of them that is uploaded, and the bytes of title memory
-    /// read for it and the smaller ones.
+    /// The title's largest mips the host copy goes without
+    /// (`crate::resource::skip_of`): its mip 0 is the title's `skip`.
+    skip: u32,
+    /// The first of the title's mips that is uploaded (never under
+    /// `skip`), and the bytes of title memory read for it and the smaller
+    /// ones.
     first: u32,
     size: usize,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
@@ -585,7 +589,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) && staged_from(resource) <= first {
+    if host_written || !list.first_use(resource as usize) && staged_covers(resource, first) {
         return;
     }
     let Some(staging) = staging(resource, texture, first) else {
@@ -676,16 +680,17 @@ impl Staging {
         (self.memory as usize, self.size)
     }
 
-    /// The mip and the array slice of the `i`th part of the staging buffer.
+    /// The title's mip and the array slice of the `i`th part of the
+    /// staging buffer.
     fn part(&self, i: usize) -> (u32, u32) {
-        let mips = self.mips - self.first;
-        (self.first + i as u32 % mips, i as u32 / mips)
+        part(self.mips, self.first, i)
     }
 
-    /// The texture's subresource the `i`th part of the staging buffer is.
+    /// The host texture's subresource the `i`th part of the staging buffer
+    /// is.
     fn subresource(&self, i: usize) -> u32 {
         let (mip, slice) = self.part(i);
-        slice * self.mips + mip
+        host_subresource(self.mips, self.skip, mip, slice)
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -1035,13 +1040,27 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
     Some((s.size as u64, committed(s.memory, s.size)))
 }
 
-/// The first mip a title texture's staging buffer holds; `u32::MAX` without
-/// one.
-fn staged_from(resource: This) -> u32 {
+/// Whether a title texture's staging buffer holds the mips from `first`
+/// on that its host copy has; false without one.
+fn staged_covers(resource: This, first: u32) -> bool {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
         .and_then(|map| map.get(&(resource as usize)))
-        .map_or(u32::MAX, |s| s.first)
+        .is_some_and(|s| s.first <= first.max(s.skip))
+}
+
+/// The title's mip and array slice of the `i`th part of a staging buffer
+/// of a texture of `mips` mips from mip `first` on (several slices only
+/// from the first mip the host copy has).
+fn part(mips: u32, first: u32, i: usize) -> (u32, u32) {
+    let per_slice = mips - first;
+    (first + i as u32 % per_slice, i as u32 / per_slice)
+}
+
+/// The host copy's subresource of the title's `mip` of `slice` of a texture
+/// of `mips` mips whose host copy goes without the `skip` largest.
+fn host_subresource(mips: u32, skip: u32, mip: u32, slice: u32) -> u32 {
+    slice * (mips - skip) + mip - skip
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1231,10 +1250,14 @@ fn staged_part(layout: &victory_formats::texture::Layout, mips: u32, first: u32)
 /// The staging state of a title texture from mip `first` on, made on first
 /// use (and made anew for larger mips than the one there holds).
 fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
+    // The host copy may go without the title's largest mips: they are
+    // neither read nor uploaded.
+    let skip = crate::resource::skip_of(resource, texture);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))
-        && s.first <= first
+        && s.skip == skip
+        && s.first <= first.max(skip)
     {
         return Some(s.clone());
     }
@@ -1256,11 +1279,16 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let (first, size) = staged_part(&layout, u32::from(d.MipLevels), first);
+    // In the title's mips: the host copy's plus those it goes without.
+    let mips = u32::from(d.MipLevels) + skip;
+    let (first, size) = staged_part(&layout, mips, first.max(skip));
+    // Several slices are staged from the host copy's first mip on.
+    let first = first.max(skip);
+    let host_first = first - skip;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
-        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - first
+        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - host_first
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
@@ -1269,7 +1297,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     unsafe {
         host.device.GetCopyableFootprints(
             &d,
-            first,
+            host_first,
             count,
             0,
             Some(footprints.as_mut_ptr()),
@@ -1296,7 +1324,8 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         footprints,
         rows,
         layout,
-        mips: u32::from(d.MipLevels),
+        mips,
+        skip,
         first,
         size,
         bytes: total,
@@ -1340,6 +1369,26 @@ mod first_mip_tests {
         assert_eq!(super::staged_part(&l, 9, 9), (0, l.size as usize), "past the chain");
         let array = layout(2);
         assert_eq!(super::staged_part(&array, 9, 4), (0, array.size as usize), "slices each hold their chain");
+    }
+
+    /// The parts of a staging buffer of a texture of 6 mips in 2 slices
+    /// whose host copy goes without the 2 largest: mips 2 to 5 of each
+    /// slice, each to the host's subresource of that mip and slice.
+    #[test]
+    fn staged_parts_go_to_the_host_copys_subresources() {
+        let (mips, skip) = (6, 2);
+        let parts: Vec<_> = (0..8).map(|i| super::part(mips, skip, i)).collect();
+        assert_eq!(parts, [(2, 0), (3, 0), (4, 0), (5, 0), (2, 1), (3, 1), (4, 1), (5, 1)]);
+        let host: Vec<_> = parts.iter().map(|&(m, s)| super::host_subresource(mips, skip, m, s)).collect();
+        assert_eq!(host, [0, 1, 2, 3, 4, 5, 6, 7]);
+        // One slice staged from mip 4 (a view of the smaller mips).
+        assert_eq!(super::part(mips, 4, 1), (5, 0));
+        assert_eq!(super::host_subresource(mips, skip, 5, 0), 3);
+        // Nothing skipped: as before.
+        assert_eq!(super::host_subresource(mips, 0, 3, 1), 9);
+        // Staging from the host copy's first mip: the layout from `skip` on.
+        let l = layout(1);
+        assert_eq!(super::staged_part(&l, 9, 2), (2, l.bytes_from(2) as usize));
     }
 
     /// A 2-D view's first mip is its fifth word; other views show all mips.

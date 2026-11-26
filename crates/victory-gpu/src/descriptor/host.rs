@@ -2948,6 +2948,52 @@ fn twin_uav(
     Some(desc)
 }
 
+/// `d` made a view of a texture without its `skip` largest mips: its first
+/// mip, its count of mips and its least level of detail move down by
+/// `skip`, a view of only skipped mips shows the largest there is (from
+/// Belobug's AMD fork).
+fn without_mips(d: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, skip: u32) {
+    let cut = |first: &mut u32, levels: &mut u32, clamp: &mut f32| {
+        let (from, count) = cut_mips(*first, *levels, skip);
+        (*first, *levels) = (from, count);
+        *clamp = (*clamp - skip as f32).max(0.0);
+    };
+    // SAFETY: the member the dimension names.
+    unsafe {
+        match d.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut d.Anonymous.Texture2D;
+                cut(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut d.Anonymous.Texture2DArray;
+                cut(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut d.Anonymous.TextureCube;
+                cut(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut d.Anonymous.TextureCubeArray;
+                cut(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A view's first mip and count of mips (`u32::MAX`: all from the first
+/// on) in a texture without its `skip` largest mips: the mips it shows
+/// that are there, or the largest there is if it shows none of them.
+fn cut_mips(first: u32, levels: u32, skip: u32) -> (u32, u32) {
+    if levels == u32::MAX {
+        return (first.saturating_sub(skip), levels);
+    }
+    let end = first.saturating_add(levels).saturating_sub(skip).max(1);
+    let from = first.saturating_sub(skip).min(end - 1);
+    (from, end - from)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -3002,6 +3048,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                // A host copy without the title's largest mips
+                // (`VICTORY_TEXTURE_MAX`): the view's mips are counted
+                // from the host copy's first.
+                let skip = crate::resource::skip_of(resource, texture);
+                if skip > 0
+                    && let Some(d) = &mut desc
+                {
+                    without_mips(d, skip);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -3453,6 +3508,36 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A view of a texture whose host copy goes without its 2 largest mips:
+    /// its mips are counted from the host's first; a view of skipped mips
+    /// alone shows the host's largest.
+    #[test]
+    fn a_view_moves_past_the_skipped_mips() {
+        assert_eq!(cut_mips(0, u32::MAX, 2), (0, u32::MAX), "all mips");
+        assert_eq!(cut_mips(3, u32::MAX, 2), (1, u32::MAX));
+        assert_eq!(cut_mips(0, 11, 2), (0, 9), "a whole chain of 11");
+        assert_eq!(cut_mips(4, 3, 2), (2, 3));
+        assert_eq!(cut_mips(0, 1, 2), (0, 1), "the largest only");
+        assert_eq!(cut_mips(1, 2, 2), (0, 1), "the two that are gone");
+        assert_eq!(cut_mips(1, 3, 2), (0, 2));
+        let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 3,
+                    MipLevels: 4,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 3.5,
+                },
+            },
+            ..Default::default()
+        };
+        without_mips(&mut d, 2);
+        // SAFETY: the member the dimension names.
+        let t = unsafe { d.Anonymous.Texture2D };
+        assert_eq!((t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp), (1, 4, 1.5));
+    }
 
     #[test]
     fn texture_remaps_visit_each_changed_region_once() {
