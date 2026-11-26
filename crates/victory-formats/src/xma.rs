@@ -204,15 +204,15 @@ impl Bits<'_> {
 
 /// A prefix code built like FFmpeg's `ff_vlc_init_from_lengths`: codes are
 /// handed out in table order, each the next free one of its length.
-struct Vlc {
+struct Vlc<const PREFIX_ENTRIES: usize = 257> {
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
     /// Index of the code at each eight-bit prefix boundary, plus the last code.
-    first: [u16; 257],
+    first: [u16; PREFIX_ENTRIES],
 }
 
-impl Vlc {
-    fn new(entries: impl Iterator<Item = (i32, u8)>) -> Vlc {
+impl<const PREFIX_ENTRIES: usize> Vlc<PREFIX_ENTRIES> {
+    fn new(entries: impl Iterator<Item = (i32, u8)>) -> Self {
         let mut code = 0u64;
         let mut codes = Vec::new();
         for (symbol, len) in entries {
@@ -229,22 +229,28 @@ impl Vlc {
 
     fn read(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
-        let prefix = (v >> 24) as usize;
-        let first = usize::from(self.first[prefix]);
-        let mut entry = self.codes[first];
-        if entry.1 > 8 {
-            let last = usize::from(self.first[prefix + 1]);
-            let more = &self.codes[first + 1..=last];
-            entry = self.codes[first + more.partition_point(|c| c.0 <= v)];
-        }
-        let (_, len, symbol) = entry;
+        let i = if PREFIX_ENTRIES == 0 {
+            self.codes.partition_point(|c| c.0 <= v) - 1
+        } else {
+            let prefix = (v >> 24) as usize;
+            let first = usize::from(self.first[prefix]);
+            if self.codes[first].1 <= 8 {
+                first
+            } else {
+                let last = usize::from(self.first[prefix + 1]);
+                let more = &self.codes[first + 1..=last];
+                first + more.partition_point(|c| c.0 <= v)
+            }
+        };
+        let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
         symbol
     }
 }
 
 struct Codes {
-    scale: Vlc,
+    // Most scale deltas share one long prefix; use the full codebook search.
+    scale: Vlc<0>,
     scale_rl: Vlc,
     coef: [Vlc; 2],
     vec4: Vlc,
@@ -259,7 +265,7 @@ fn codes() -> &'static Codes {
             Vlc::new(t.iter().map(move |&(s, l)| (s as i32 + offset, l)))
         };
         Codes {
-            scale: pairs(&SCALE, -60),
+            scale: Vlc::new(SCALE.iter().map(|&(s, l)| (i32::from(s) - 60, l))),
             scale_rl: pairs(&SCALE_RL, 0),
             coef: [
                 Vlc::new(COEF0_SYMS.iter().zip(COEF0_LENS).map(|(&s, l)| (s as i32, l))),
@@ -1040,7 +1046,7 @@ mod tests {
     #[test]
     fn prefix_lookup_reads_every_code_and_consumes_its_bits() {
         let c = codes();
-        for table in [&c.scale, &c.scale_rl, &c.coef[0], &c.coef[1], &c.vec4, &c.vec2, &c.vec1] {
+        for table in [&c.scale_rl, &c.coef[0], &c.coef[1], &c.vec4, &c.vec2, &c.vec1] {
             for (i, &(start, len, symbol)) in table.codes.iter().enumerate() {
                 let end = table.codes.get(i + 1).map_or(u32::MAX, |next| next.0 - 1);
                 for word in [start, end] {
