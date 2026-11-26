@@ -251,9 +251,10 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
-/// shortcut: copies between such a target and a texture the title fills
-/// itself in the 16-bit format are skipped ([`stands_in`]); convert them
-/// if a pass turns out to need one.
+/// Copies between such a target and a texture in the 16-bit format are
+/// converted on the GPU ([`crate::standin`]).
+/// shortcut: uploads from a buffer into such a target, read backs from
+/// one, and resolves between the two are still skipped.
 pub(crate) fn target_format(format: u32) -> u32 {
     const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
@@ -308,6 +309,13 @@ pub(crate) fn stands_in(this: This) -> bool {
         && host_resource(this)
             // SAFETY: a live resource.
             .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 as u32 == target_format(own))
+}
+
+/// The title's 16-bit format of `this` if its host copy has 8-bit RGBA
+/// standing in for it ([`stands_in`]).
+#[cfg(windows)]
+pub(crate) fn stood_in_for(this: This) -> Option<u32> {
+    stands_in(this).then(|| pc_format(resource(this).desc.format))
 }
 
 /// Depth textures the title also asks unordered access for (the console
