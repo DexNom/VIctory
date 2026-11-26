@@ -138,7 +138,12 @@ static class GTA6
             {
                 throw new InvalidOperationException("Pacote incompleto: " + name);
             }
-            if (File.Exists(target) && new FileInfo(target).Length == source.Length)
+            // O tamanho nao basta: duas builds podem sair do mesmo tamanho e
+            // uma delas estar velha (foi o que deixou o Agility SDK de fora).
+            // O assembly e sempre mais novo que o que ele extraiu.
+            if (File.Exists(target)
+                && new FileInfo(target).Length == source.Length
+                && File.GetLastWriteTimeUtc(target) >= File.GetLastWriteTimeUtc(assembly.Location))
             {
                 return;
             }
@@ -152,6 +157,7 @@ static class GTA6
                 File.Delete(target);
             }
             File.Move(temporary, target);
+            File.SetLastWriteTimeUtc(target, File.GetLastWriteTimeUtc(assembly.Location));
         }
     }
 

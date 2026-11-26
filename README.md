@@ -126,3 +126,55 @@ commits taken from elsewhere name the commit and its author.
 
 GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
 covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+
+---
+
+## Perfil de 16 GB (português)
+
+Esta base foi medida numa máquina de 16 GB (Ryzen 5 5600G, 16 GB DDR4, RTX 3060
+Ti 8 GB, Windows 10, 720p). O que está ligado, por quê, e os números:
+[OTIMIZACOES.md](OTIMIZACOES.md). Os controles: [CONTROLES.md](CONTROLES.md).
+
+**O caminho curto** — sem compilar nada:
+
+1. `tools\pack\build.ps1 -Out <pasta>` monta o `GTA6.exe` (runtime + Agility SDK
+   + docs embutidos). Abra o `GTA6.exe`, aponte a pasta do dump uma vez, e ele
+   guarda o caminho no `game-path.txt` ao lado.
+2. Na janela: **Jogar 720p**. Na primeira vez, antes, **Preparar (compilar)**
+   depois de uma sessão com `--book` (ou use `GTA6.exe --book` uma vez).
+3. Se for rodar o `victory.exe` direto, **a pasta `D3D12\` (com o
+   `D3D12Core.dll` 1.620.2) precisa ficar ao lado dele** — sem ela o Windows 10
+   recusa o root signature e nenhuma pipeline é criada.
+4. Pelo PowerShell: `scripts\play-16gb.ps1 -Exe <game_scarlett_master.exe>
+   -Build release`, e depois `scripts\prepare-16gb.ps1 -Exe <victory.exe>` para
+   as pipelines ficarem no cache do driver antes de o jogo pedir.
+
+O perfil inteiro mora em `scripts\profile-16gb.ps1`, um arquivo só: o
+`play-16gb.ps1` e o `prepare-16gb.ps1` leem dele, e é isso que garante que o
+cache foi aquecido com os mesmos ajustes que o jogo usa (a chave de uma host
+pipeline inclui os ajustes do host).
+
+**Launcher `GTA6.exe`.** `tools\pack\build.ps1` monta um executável único com o
+runtime, o Agility SDK e os docs embutidos. Ele acha o dump, escreve o
+`game-path.txt`, e abre uma janela com **Jogar 720p**, **Jogar 1080p**,
+**Jogar com painel** e **Preparar (compilar)**. Sem interface:
+`GTA6.exe --play`, `GTA6.exe --prepare`, `GTA6.exe --book`, `GTA6.exe --install`.
+
+**O que muda nesta máquina**
+
+| variável | valor | por quê |
+| --- | --- | --- |
+| `VICTORY_OUTPUT` | `1280x720` | o menor modo do título |
+| `VICTORY_RENDER_SCALE` | `1.0` | 720p inteiro, sem o halo do upscaler |
+| `VICTORY_LIBRARY` | `1` | a biblioteca de pipelines em disco |
+| `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | `512` | menos VRAM reservada, mais textura |
+| `VICTORY_TEXTURE_ROOM_PERCENT` | `95` | textura até 95% da VRAM |
+| `VICTORY_THIN` | `1` | tradução de lista em 8 threads |
+| `VICTORY_PORT_CBV` | `1` | o buffer de constantes lido no lugar |
+
+**Não defina `VICTORY_TEXTURE_BUDGET_MB`.** Ele substitui a checagem de VRAM por
+um teto fixo, e o mundo (que pede ~4 GB de textura) fica sem textura.
+
+**Não use `scripts\play.ps1 -Safe` nesta máquina.** Medido: 3.000 a 8.800
+ms/quadro contra 460 a 730 ms do perfil padrão.
+
