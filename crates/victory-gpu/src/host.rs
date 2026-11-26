@@ -555,11 +555,16 @@ fn create() -> windows::core::Result<Host> {
     unsafe {
         // The debug layer only in builds with diagnostics.
         let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+            cfg!(feature = "diagnostics") && (std::env::var_os("VICTORY_D3D12_DEBUG").is_some() || crate::pso_trace::enabled());
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
-                Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
+                Ok(()) => {
+                    layer.iter().for_each(|l| l.EnableDebugLayer());
+                    if crate::pso_trace::enabled() {
+                        tracing::info!(interface = layer.is_some(), "PSOTRACE1 debug layer requested before device creation; EnableDebugLayer called if interface present");
+                    }
+                },
                 Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
             }
             // GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range
@@ -632,9 +637,13 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
-        let messages = debug
-            .then(|| device.cast::<ID3D12InfoQueue>().ok())
-            .flatten();
+        let messages = debug.then(|| match device.cast::<ID3D12InfoQueue>() {
+            Ok(q) => Some(q),
+            Err(e) => {
+                if crate::pso_trace::enabled() { tracing::warn!(error = %e, "PSOTRACE1 InfoQueue cast failed"); }
+                None
+            }
+        }).flatten();
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
@@ -658,6 +667,8 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        // Register after fallible initialization; the Host singleton lives until process exit.
+        crate::pso_trace::register(&device, messages.as_ref());
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -4945,7 +4956,11 @@ impl Host {
                     let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
-                    tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
+                    if crate::pso_trace::enabled() {
+                        crate::pso_trace::queued(m, text);
+                    } else {
+                        tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
+                    }
                     if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
                         first_error = Some(text.to_owned());
                     }

@@ -547,7 +547,10 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        let make_root = || root_signature(&host.device, &params, &samplers, compute.is_some());
+        let (root, root_blob) = match if let Some(cs) = compute {
+            crate::pso_trace::call(&cs.hash, "root", make_root)
+        } else { make_root() } {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -563,7 +566,7 @@ impl HostPipeline {
                 },
             )
         };
-        if compute.is_some() {
+        if let Some(cs) = compute {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -574,9 +577,9 @@ impl HostPipeline {
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
-                |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+                |library, name| crate::pso_trace::call(&cs.hash, "load", || unsafe { library.LoadComputePipeline(name, &desc) }),
                 // SAFETY: as above.
-                || unsafe { host.device.CreateComputePipelineState(&desc) },
+                || crate::pso_trace::call(&cs.hash, "create", || unsafe { host.device.CreateComputePipelineState(&desc) }),
             );
             let pso = match made {
                 Ok(pso) => pso,
