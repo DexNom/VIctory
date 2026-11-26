@@ -30,6 +30,8 @@
 //! Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 //! EXPRESS OR IMPLIED.
 
+use std::sync::OnceLock;
+
 /// A swizzle mode, by its hardware number (addrlib's `ADDR_SW_*` order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Swizzle(pub u32);
@@ -157,6 +159,9 @@ pub struct Tail {
     pub y: u32,
 }
 
+type Pattern = [Vec<u32>; 3];
+static EMPTY_PATTERN: Pattern = [const { Vec::new() }; 3];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub desc: Desc,
@@ -176,7 +181,7 @@ pub struct Layout {
     pub mips: Vec<Mip>,
     /// Byte offsets inside a block of each element coordinate bit, per
     /// axis; empty for linear and unsupported modes.
-    pattern: [Vec<u32>; 3],
+    pattern: &'static Pattern,
 }
 
 /// Micro tile (256 bytes) patterns by log2 of the element size: for each
@@ -379,7 +384,7 @@ impl Layout {
             alignment: 256,
             first_tail_mip: d.mips,
             mips,
-            pattern: Default::default(),
+            pattern: &EMPTY_PATTERN,
         }
     }
 
@@ -547,12 +552,20 @@ impl Layout {
             } else {
                 usize::from(d.swizzle.display())
             };
-            pattern(kind, element_log2, block_log2).map(|bits| spread(&bits))
+            // Three axis patterns, five element sizes, three block sizes (8, 12, 16).
+            static STANDARD: [OnceLock<Pattern>; 45] = [const { OnceLock::new() }; 45];
+            let index = (kind * 5 + element_log2 as usize) * 3 + ((block_log2 - 8) / 4) as usize;
+            STANDARD[index].get_or_init(|| {
+                pattern(kind, element_log2, block_log2).map(|bits| spread(&bits))
+            })
         } else if d.swizzle == Swizzle::SW_64KB_R_X && d.dimension == Dimension::Tex2d
             && d.depth == 1 && d.mips == 1 && d.samples == 1 && d.block == 1 {
-            render_xor_pattern(series_s, d.element_bytes)
+            static RENDER: [[OnceLock<Pattern>; 5]; 2] =
+                [const { [const { OnceLock::new() }; 5] }; 2];
+            RENDER[usize::from(series_s)][element_log2 as usize]
+                .get_or_init(|| render_xor_pattern(series_s, d.element_bytes))
         } else {
-            Default::default()
+            &EMPTY_PATTERN
         };
         Layout {
             desc: d,
@@ -962,6 +975,24 @@ mod tests {
             samples: 1,
             swizzle,
         }
+    }
+
+
+    #[test]
+    fn layouts_share_model_specific_render_patterns() {
+        let d = desc(128, 128, 1, 4, Swizzle::SW_64KB_R_X);
+        let x = Layout::new_for_model(&d, false).unwrap();
+        let s = Layout::new_for_model(&d, true).unwrap();
+        assert_ne!(x.pattern, s.pattern);
+        std::thread::scope(|scope| {
+            for (model, original) in [(false, &x), (true, &s)] {
+                scope.spawn(move || {
+                    let layout = Layout::new_for_model(&d, model).unwrap();
+                    assert!(std::ptr::eq(layout.pattern, original.pattern));
+                    assert!(std::ptr::eq(layout.clone().pattern, original.pattern));
+                });
+            }
+        });
     }
 
     /// Sizes past the hardware's 16384 texels per side are refused instead
