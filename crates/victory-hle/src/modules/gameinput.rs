@@ -1165,7 +1165,7 @@ mod host {
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_LBUTTON, VK_RBUTTON,
+        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_ESCAPE, VK_LBUTTON, VK_RBUTTON,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1347,11 +1347,16 @@ mod host {
     }
 
     /// Mouse look: the cursor is kept at the game window's center while the
-    /// window has focus, so its travel never leaves the client area.
+    /// window has focus and the look is held, so its travel never leaves the
+    /// client area. The look is taken by a click inside the window and let go
+    /// by `Esc`, so the cursor is the PC's again the moment the player wants
+    /// it: a title at two frames a second would otherwise pull it back to the
+    /// center faster than a hand can reach the task bar.
     #[derive(Default)]
     struct Mouse {
         last: Option<(i32, i32)>,
         center: Option<(i32, i32)>,
+        held: bool,
     }
 
     impl Mouse {
@@ -1360,6 +1365,7 @@ mod host {
             if !focused() {
                 self.last = None;
                 self.center = None;
+                self.held = false;
                 return pointer;
             }
             // SAFETY: plain queries.
@@ -1369,6 +1375,20 @@ mod host {
             if !look_enabled() {
                 self.last = None;
                 self.center = None;
+                return pointer;
+            }
+            // SAFETY: a plain query.
+            if unsafe { GetAsyncKeyState(i32::from(VK_ESCAPE)) } < 0 {
+                self.held = false;
+            }
+            if !self.held {
+                // The cursor is the PC's: no warp, no delta, and the next
+                // click inside the window takes the look again.
+                self.last = None;
+                self.center = None;
+                if pointer.left {
+                    self.held = true;
+                }
                 return pointer;
             }
             let mut at = POINT::default();
