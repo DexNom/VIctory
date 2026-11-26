@@ -32,15 +32,25 @@ $settings = @{
     VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'
     # The 8 GB card, named so the choice never falls on the integrated one.
     VICTORY_D3D12_ADAPTER = 'NVIDIA'
-    # 16 GB of PC memory: everything the host keeps, kept small.
+    # The title reads the console's display mode, which is 3840x2160 unless
+    # told otherwise, and renders 2560x1440 (FidelityFX's 2/3) into a 1080p
+    # window: 4x the targets, 4x the copies, 4x the memory, for pixels that
+    # are thrown away. 1920x1080 makes it render 1280x720 and upscale to the
+    # window. (VICTORY_DISPLAY_MODE changes nothing: the title matches its
+    # own mode list, not the output's.)
+    VICTORY_OUTPUT = '1920x1080'
+    # 16 GB of PC memory: everything the host keeps, kept small. The card has
+    # room (7 GB, 5 used at 4K), so the host's copies go there rather than
+    # into the PC's memory, which the driver counts as shared with the card.
     VICTORY_PIPELINE_CACHE = '0'
     VICTORY_PIPELINE_WORKERS = '6'
     VICTORY_UPLOAD_AHEAD = '0'
-    VICTORY_TEXTURE_BUDGET_MB = '2048'
-    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '2048'
-    VICTORY_MEMORY_CARD_MB = '2048'
-    VICTORY_CARD_BUFFERS_MB = '512'
-    VICTORY_KEEP_SNAPSHOTS_MB = '128'
+    VICTORY_TEXTURE_BUDGET_MB = '3072'
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1536'
+    VICTORY_MEMORY_CARD_MB = '4096'
+    VICTORY_CARD_BUFFERS_MB = '1024'
+    VICTORY_CARD_WINDOWS_MB = '512'
+    VICTORY_KEEP_SNAPSHOTS_MB = '64'
     # The mouse looks and shoots on the stand-in pad (the fork's own port).
     VICTORY_MOUSE_LOOK = '1'
     VICTORY_MOUSE_SENSITIVITY = '0.05'

@@ -7,10 +7,12 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
 
-// GTA6.exe - tudo em um so: extrai o runtime (VIctory DexNom RayTime + Agility
-// SDK), acha o dump, cria o game-path e joga. Teclado e mouse ja entram como
-// controle Xbox; a janela recebe foco sozinha para o titulo sair da tela de
-// configuracao.
+// GTA6.exe - tudo em um so: extrai o runtime (VIctory, base Belobug + o perfil
+// de 16 GB), o Agility SDK, acha o dump, cria o game-path e joga.
+//
+// Teclado e mouse ja entram como controle Xbox. O mouse olha enquanto o botao
+// direito esta apertado; solto, o cursor e o do PC. O console do runtime nao
+// abre janela: so a janela do jogo aparece.
 static class GTA6
 {
     const string GameExe = "game_scarlett_master.exe";
@@ -21,8 +23,9 @@ static class GTA6
 
     static Form window;
     static Label status;
+    static Button play720;
     static Button play1080;
-    static Button play1440;
+    static Button playPanel;
     static Process running;
     static Timer focus;
     static int focusTicks;
@@ -59,7 +62,9 @@ static class GTA6
         {
             try
             {
-                Process game = StartGame(args[0] == "--play-1440p", true);
+                bool high = args[0] == "--play-1080p" || args[0] == "--play-1440p";
+                bool panel = args[0] == "--play-panel";
+                Process game = StartGame(high, panel, true);
                 game.WaitForExit();
                 Environment.Exit(game.ExitCode);
             }
@@ -85,11 +90,8 @@ static class GTA6
         Directory.CreateDirectory(Path.Combine(Runtime, "D3D12"));
 
         Extract("victory.exe", Path.Combine(Runtime, "victory.exe"));
-        Extract("victory-play.exe", Path.Combine(Runtime, "victory-play.exe"));
-        Extract("victory-warm.exe", Path.Combine(Runtime, "victory-warm.exe"));
         Extract("D3D12Core.dll", Path.Combine(Runtime, "D3D12", "D3D12Core.dll"));
         Extract("CONTROLES.md", Path.Combine(Runtime, "CONTROLES.md"));
-        Extract("BUILD-MAQUINA.md", Path.Combine(Runtime, "BUILD-MAQUINA.md"));
         Extract("OTIMIZACOES.md", Path.Combine(Runtime, "OTIMIZACOES.md"));
 
         if (!File.Exists(GamePathFile) || !File.Exists(ReadGamePath()))
@@ -197,9 +199,79 @@ static class GTA6
         }
     }
 
-    // ------------------------------------------------------------------- game
+    // ------------------------------------------------------------------ play
 
-    static Process StartGame(bool high, bool headless)
+    // O perfil do fork numa maquina de 16 GB (Ryzen 5 5600G, 16 GB, RTX 3060 Ti
+    // 8 GB, Windows 10). Cada linha foi medida; o porque esta em OTIMIZACOES.md.
+    static void Settings(ProcessStartInfo start, bool high, bool panel)
+    {
+        // O fork em modo rapido.
+        start.EnvironmentVariables["VICTORY_TEXTURE_NO_WAIT"] = "1";
+        start.EnvironmentVariables["VICTORY_RELAY"] = "2";
+        start.EnvironmentVariables["VICTORY_WIDE_BACK"] = "1";
+        start.EnvironmentVariables["VICTORY_CARD_REHASH_RUNS"] = "1";
+        start.EnvironmentVariables["VICTORY_JOIN_COPIES"] = "1";
+        start.EnvironmentVariables["VICTORY_INDIRECT_WINDOW"] = "1";
+        start.EnvironmentVariables["VICTORY_RELAY_COPY"] = "1";
+        start.EnvironmentVariables["VICTORY_CARD_STEPS"] = "2";
+        start.EnvironmentVariables["VICTORY_INDIRECT_BATCH"] = "2";
+        start.EnvironmentVariables["VICTORY_MAP_THREADS"] = "1";
+        start.EnvironmentVariables["VICTORY_TITLE_PRIORITIES"] = "0";
+        start.EnvironmentVariables["VICTORY_CARD_AWAKE"] = "1";
+        start.EnvironmentVariables["VICTORY_SHOW_AFTER"] = "1";
+        start.EnvironmentVariables["VICTORY_AMBIENT"] = "0.8";
+        start.EnvironmentVariables["VICTORY_D3D12_DRED"] = "light";
+        start.EnvironmentVariables["VICTORY_THIN"] = "1";
+        start.EnvironmentVariables["VICTORY_JOIN_PARTS"] = "8";
+        // A placa de 8 GB, nomeada para a escolha nunca cair na integrada.
+        start.EnvironmentVariables["VICTORY_D3D12_ADAPTER"] = "NVIDIA";
+        // O titulo acredita que a TV e 4K e desenha 2560x1440 dentro de uma
+        // janela 1080p: 4x os alvos, 4x as copias. VICTORY_OUTPUT e o modo que
+        // ele reporta; a escala 0.5 desenha 640x360 e sobe para 720p com o
+        // upscaler dele mesmo (6), nao o FidelityFX (7).
+        start.EnvironmentVariables["VICTORY_OUTPUT"] = high ? "1920x1080" : "1280x720";
+        start.EnvironmentVariables["VICTORY_UPSCALER"] = "6";
+        start.EnvironmentVariables["VICTORY_RENDER_SCALE"] = high ? "0.67" : "0.5";
+        // O cache de pipelines: 171 MB de disco que valem a fila inteira
+        // (1.200 pipelines, um por segundo, sem ele).
+        start.EnvironmentVariables["VICTORY_PIPELINE_CACHE"] = "1";
+        start.EnvironmentVariables["VICTORY_PIPELINE_WORKERS"] = "10";
+        // 16 GB de RAM: tudo o que o host guarda, pequeno. Sem
+        // VICTORY_TEXTURE_BUDGET_MB de proposito: com ele o host para de
+        // subir textura no teto e o mundo fica sem as 4 GB que pede.
+        start.EnvironmentVariables["VICTORY_UPLOAD_AHEAD"] = "0";
+        start.EnvironmentVariables["VICTORY_CARD_ROOM_FOR_TARGETS_MB"] = "512";
+        start.EnvironmentVariables["VICTORY_TEXTURE_ROOM_PERCENT"] = "95";
+        start.EnvironmentVariables["VICTORY_MEMORY_CARD_MB"] = "2048";
+        start.EnvironmentVariables["VICTORY_CARD_WINDOWS_MB"] = "512";
+        start.EnvironmentVariables["VICTORY_CARD_BUFFERS_MB"] = "256";
+        start.EnvironmentVariables["VICTORY_KEEP_SNAPSHOTS_MB"] = "32";
+        // O mouse olha enquanto o botao direito esta apertado.
+        start.EnvironmentVariables["VICTORY_MOUSE_LOOK"] = "1";
+        start.EnvironmentVariables["VICTORY_MOUSE_SENSITIVITY"] = "0.05";
+        start.EnvironmentVariables["VICTORY_LOG"] = "warn";
+        if (panel)
+        {
+            start.EnvironmentVariables["VICTORY_PANEL"] = "1";
+        }
+        // O que estiver no ambiente do Windows vence, para testar sem
+        // recompilar. As pastas nunca sao sobrescritas.
+        string[] keep =
+        {
+            "VICTORY_CONFIG", "VICTORY_GAME_DIR", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR",
+            "VICTORY_FIDELITYFX_DIR",
+        };
+        foreach (string name in keep)
+        {
+            string value = Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrEmpty(value))
+            {
+                start.EnvironmentVariables[name] = value;
+            }
+        }
+    }
+
+    static Process StartGame(bool high, bool panel, bool headless)
     {
         string game = ReadGamePath();
         if (game.Length == 0 || !File.Exists(game))
@@ -211,53 +283,18 @@ static class GTA6
             game = ReadGamePath();
         }
 
-        string exe = Path.Combine(Runtime, "victory-play.exe");
+        string exe = Path.Combine(Runtime, "victory.exe");
         ProcessStartInfo start = new ProcessStartInfo(exe);
         start.WorkingDirectory = Runtime;
         start.UseShellExecute = false;
-        start.Arguments = (high
-            ? "--no-rt --console series-x --1080p-to-1440p --local-gpu-memory --sparse-textures --no-upload-ahead"
-            : "--no-rt --console series-s --local-gpu-memory --sparse-textures --no-upload-ahead")
-            + " \"" + game + "\"";
-        start.EnvironmentVariables["VICTORY_AMBIENT_FALLBACK"] = "1";
-        start.EnvironmentVariables["VICTORY_FSR_4K"] = "0";
-        start.EnvironmentVariables["VICTORY_LOG"] = "warn";
-        // CPU: the fill and memory jobs across every logical processor. The
-        // fill count is capped at 6 in the runtime; the wide jobs go to 12.
-        start.EnvironmentVariables["VICTORY_FILL_WORKERS"] = "6";
-        start.EnvironmentVariables["VICTORY_WIDE_WORKERS"] = "12";
-        start.EnvironmentVariables["VICTORY_PIPELINE_WORKERS"] = "8";
-        start.EnvironmentVariables["VICTORY_PARALLEL_PRELUDES"] = "1";
-        start.EnvironmentVariables["VICTORY_WIDE_REFRESH"] = "1";
-        // GPU: the title issues its mesh draws one record per call, and each
-        // clamp was a compute pass of its own between two waits. A window of
-        // records per pass took the card from 0.7% to 19-55% while the world
-        // loaded (run 23, 26 November).
-        start.EnvironmentVariables["VICTORY_INDIRECT_WINDOW"] = "1";
-        // The title caps itself at 30 Hz (33.333 ms); 16667 is 60.
-        start.EnvironmentVariables["VICTORY_FRAME_INTERVAL"] = "16667";
-        // 8 GB card: the system gives the process about 7.2 GB of its own
-        // memory. Past that Windows moves textures to shared memory and the
-        // device is removed (the runtime's own note: runs 20 and 24). Cap
-        // the title-filled copies at 5.2 GB and leave the rest for render
-        // targets, buffers and the swap chain.
-        start.EnvironmentVariables["VICTORY_TEXTURE_BUDGET_MB"] = "5200";
-        start.EnvironmentVariables["VICTORY_TEXTURE_ROOM_PERCENT"] = "80";
-        // The title otherwise believes the television is 4K and renders a 4K
-        // scene into a 1080p window. Tell it the window's own size.
-        start.EnvironmentVariables["VICTORY_DISPLAY_MODE"] = high ? "2560x1440" : "1920x1080";
-        foreach (string name in new[] { "VICTORY_AMBIENT_FALLBACK", "VICTORY_FSR_4K", "VICTORY_LOG", "VICTORY_FILL_WORKERS", "VICTORY_WIDE_WORKERS", "VICTORY_PIPELINE_WORKERS", "VICTORY_PARALLEL_PRELUDES", "VICTORY_WIDE_REFRESH", "VICTORY_INDIRECT_WINDOW", "VICTORY_TEXTURE_BUDGET_MB", "VICTORY_TEXTURE_ROOM_PERCENT", "VICTORY_GPU_MEMORY_MB", "VICTORY_INPLACE", "VICTORY_INPLACE_MB", "VICTORY_ADAPTER", "VICTORY_DISPLAY_MODE", "VICTORY_FRAME_INTERVAL" })
-        {
-            string value = Environment.GetEnvironmentVariable(name);
-            if (!string.IsNullOrEmpty(value))
-            {
-                start.EnvironmentVariables[name] = value;
-            }
-        }
+        // O console do runtime nao abre janela: so a do titulo aparece.
+        start.CreateNoWindow = true;
+        start.Arguments = "run \"" + game + "\" --execute --console series-s";
+        Settings(start, high, panel);
         return Process.Start(start);
     }
 
-    static void Play(bool high)
+    static void Play(bool high, bool panel)
     {
         if (running != null && !running.HasExited)
         {
@@ -267,216 +304,125 @@ static class GTA6
 
         try
         {
-            running = StartGame(high, false);
+            running = StartGame(high, panel, false);
+            status.Text = "Carregando. O primeiro carregamento demora: o mundo chega em 3 a 5 minutos.";
+            focusTicks = 0;
+            focus.Start();
         }
         catch (Exception error)
         {
             MessageBox.Show(error.Message, "GTA6", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return;
-        }
-
-        play1080.Enabled = false;
-        play1440.Enabled = false;
-        status.Text = high ? "Abrindo em 1440p..." : "Abrindo em 1080p...";
-
-        focusTicks = 0;
-        focus.Start();
-
-        running.EnableRaisingEvents = true;
-        running.Exited += delegate
-        {
-            try
-            {
-                window.BeginInvoke((MethodInvoker)delegate { Finished(); });
-            }
-            catch (Exception)
-            {
-            }
-        };
-    }
-
-    static void Finished()
-    {
-        focus.Stop();
-        int code = -1;
-        try
-        {
-            code = running.ExitCode;
-        }
-        catch (Exception)
-        {
-        }
-        running = null;
-        play1080.Enabled = true;
-        play1440.Enabled = true;
-        if (code == 0)
-        {
-            status.Text = "Jogo encerrado. Pronto para abrir de novo.";
-            return;
-        }
-        status.Text = "Runtime terminou com codigo " + code + ". Veja Logs.";
-        string tail = LogTail();
-        if (tail != null)
-        {
-            MessageBox.Show("Codigo " + code + ".\n\n" + tail, "GTA6 - ultimas linhas do log",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
-    static string LogTail()
-    {
-        try
-        {
-            string folder = Path.Combine(Runtime, "logs");
-            string[] files = Directory.GetFiles(folder, "*.log");
-            if (files.Length == 0)
-            {
-                return null;
-            }
-            Array.Sort(files, delegate (string a, string b)
-            {
-                return File.GetLastWriteTime(b).CompareTo(File.GetLastWriteTime(a));
-            });
-            string[] lines = File.ReadAllLines(files[0]);
-            int from = Math.Max(0, lines.Length - 10);
-            string text = string.Join("\n", lines, from, lines.Length - from);
-            if (text.Length > 1500)
-            {
-                text = text.Substring(text.Length - 1500);
-            }
-            return text;
-        }
-        catch (Exception)
-        {
-            return null;
-        }
-    }
-
-    // -------------------------------------------------------------------- ui
+    // ------------------------------------------------------------------- ui
 
     static void BuildWindow()
     {
         window = new Form();
-        window.Text = "GTA6 no PC - tudo em um";
-        window.ClientSize = new Size(520, 316);
+        window.Text = "GTA6";
+        window.ClientSize = new Size(560, 300);
         window.FormBorderStyle = FormBorderStyle.FixedSingle;
         window.MaximizeBox = false;
         window.StartPosition = FormStartPosition.CenterScreen;
-        window.BackColor = Color.FromArgb(22, 22, 26);
-        window.ForeColor = Color.Gainsboro;
+        window.BackColor = Color.FromArgb(24, 24, 28);
+        window.ForeColor = Color.FromArgb(232, 232, 236);
+        window.Font = new Font("Segoe UI", 9.5f);
 
         Label title = new Label();
-        title.Text = "GTA6 - VIctory (DexNom RayTime)";
-        title.Font = new Font("Segoe UI", 12f, FontStyle.Bold);
-        title.SetBounds(18, 14, 480, 26);
+        title.Text = "GTA6 no PC";
+        title.Font = new Font("Segoe UI", 20f, FontStyle.Bold);
+        title.ForeColor = Color.FromArgb(255, 255, 255);
+        title.SetBounds(28, 22, 500, 40);
         window.Controls.Add(title);
 
-        Label info = new Label();
-        info.Text = "Runtime, Agility SDK, teclado/mouse e perfis no mesmo arquivo.";
-        info.ForeColor = Color.Gray;
-        info.SetBounds(20, 42, 480, 18);
-        window.Controls.Add(info);
+        Label sub = new Label();
+        sub.Text = "Runtime VIctory, base Belobug, perfil de 16 GB.";
+        sub.ForeColor = Color.FromArgb(150, 150, 160);
+        sub.SetBounds(30, 64, 500, 22);
+        window.Controls.Add(sub);
 
-        play1080 = MakeButton("JOGAR 1080p", 18, 72, 240, 48);
-        play1080.Click += delegate { Play(false); };
-        play1440 = MakeButton("JOGAR 1440p", 266, 72, 240, 48);
-        play1440.Click += delegate { Play(true); };
+        play720 = MakeButton("Jogar  720p", 30, 104, 240);
+        play720.Click += delegate { Play(false, false); };
+        window.Controls.Add(play720);
 
-        Button warm = MakeButton("Aquecer cache", 18, 132, 150, 30);
-        warm.Click += delegate { Warm(); };
-        Button controls = MakeButton("Controles", 176, 132, 110, 30);
-        controls.Click += delegate { OpenFile("CONTROLES.md"); };
-        Button logs = MakeButton("Logs", 294, 132, 90, 30);
-        logs.Click += delegate { OpenFolder("logs"); };
-        Button game = MakeButton("Jogo", 392, 132, 110, 30);
-        game.Click += delegate { if (AskGame()) UpdateStatus(); };
-        Button tuning = MakeButton("Otimizações", 18, 168, 110, 26);
-        tuning.Click += delegate { OpenFile("OTIMIZACOES.md"); };
+        play1080 = MakeButton("Jogar  1080p", 290, 104, 240);
+        play1080.Click += delegate { Play(true, false); };
+        window.Controls.Add(play1080);
+
+        playPanel = MakeButton("Jogar com painel (F3)", 30, 156, 240);
+        playPanel.Click += delegate { Play(false, true); };
+        window.Controls.Add(playPanel);
+
+        Button folder = MakeButton("Pasta do jogo", 290, 156, 240);
+        folder.Click += delegate
+        {
+            if (AskGame())
+            {
+                status.Text = "Jogo: " + ReadGamePath();
+            }
+        };
+        window.Controls.Add(folder);
 
         status = new Label();
-        status.ForeColor = Color.Silver;
-        status.SetBounds(20, 204, 482, 110);
+        status.Text = "Jogo: " + (ReadGamePath().Length > 0 ? ReadGamePath() : "nao encontrado");
+        status.ForeColor = Color.FromArgb(150, 150, 160);
+        status.SetBounds(30, 212, 500, 60);
         window.Controls.Add(status);
 
         focus = new Timer();
         focus.Interval = 500;
-        focus.Tick += delegate { FocusGame(); };
-
-        UpdateStatus();
+        focus.Tick += delegate { Watch(); };
     }
 
-    static Button MakeButton(string text, int x, int y, int width, int height)
+    static Button MakeButton(string text, int x, int y, int width)
     {
         Button button = new Button();
         button.Text = text;
-        button.SetBounds(x, y, width, height);
+        button.SetBounds(x, y, width, 40);
         button.FlatStyle = FlatStyle.Flat;
         button.FlatAppearance.BorderColor = Color.FromArgb(70, 70, 80);
-        button.BackColor = Color.FromArgb(38, 38, 46);
-        button.ForeColor = Color.Gainsboro;
-        button.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
-        window.Controls.Add(button);
+        button.BackColor = Color.FromArgb(40, 40, 48);
+        button.ForeColor = Color.FromArgb(240, 240, 245);
+        button.Cursor = Cursors.Hand;
         return button;
     }
 
-    static void UpdateStatus()
+    // A janela do titulo nasce fora da tela e sem foco; ela e trazida para
+    // frente algumas vezes no comeco e o acompanhamento para depois.
+    static void Watch()
     {
-        string game = ReadGamePath();
-        string gameLine = File.Exists(game) ? Shorten(game) : "nao configurado";
-        long cache = 0;
-        try
+        if (running == null || running.HasExited)
         {
-            foreach (string file in Directory.GetFiles(Path.Combine(Runtime, "cache"), "*", SearchOption.AllDirectories))
-            {
-                cache += new FileInfo(file).Length;
-            }
-        }
-        catch (Exception)
-        {
-        }
-        status.Text =
-            "Runtime: " + Runtime + "\n" +
-            "Jogo: " + gameLine + "\n" +
-            "Cache: " + (cache / (1024 * 1024)) + " MB\n" +
-            "Teclado: WASD + mouse | Esc pausa | Tab mapa";
-    }
-
-    static string Shorten(string path)
-    {
-        return path.Length <= 62 ? path : "..." + path.Substring(path.Length - 59);
-    }
-
-    static void FocusGame()
-    {
-        focusTicks++;
-        if (focusTicks < 12)
-        {
+            focus.Stop();
+            status.Text = "O jogo fechou.";
             return;
         }
-        IntPtr handle = IntPtr.Zero;
-        if (running != null && !running.HasExited)
-        {
-            running.Refresh();
-            handle = running.MainWindowHandle;
-        }
-        if (handle == IntPtr.Zero)
-        {
-            handle = FindWindow("sgaWindowClass", null);
-        }
-        if (handle != IntPtr.Zero)
+
+        focusTicks++;
+        IntPtr handle = Biggest(running.Id);
+        if (handle != IntPtr.Zero && focusTicks < 240)
         {
             ShowWindow(handle, 9);
             SetForegroundWindow(handle);
-            focus.Stop();
         }
-        else if (focusTicks > 80)
+        else if (focusTicks > 240)
         {
             focus.Stop();
         }
     }
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    static extern IntPtr FindWindow(string className, string windowName);
+    [DllImport("user32.dll")]
+    static extern bool EnumWindows(EnumProc callback, IntPtr param);
+
+    [DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr handle, out uint pid);
+
+    [DllImport("user32.dll")]
+    static extern bool IsWindowVisible(IntPtr handle);
+
+    [DllImport("user32.dll")]
+    static extern bool GetClientRect(IntPtr handle, out RECT rect);
 
     [DllImport("user32.dll")]
     static extern bool ShowWindow(IntPtr handle, int command);
@@ -484,41 +430,47 @@ static class GTA6
     [DllImport("user32.dll")]
     static extern bool SetForegroundWindow(IntPtr handle);
 
-    // --------------------------------------------------------------- extras
+    delegate bool EnumProc(IntPtr handle, IntPtr param);
 
-    static void Warm()
+    [StructLayout(LayoutKind.Sequential)]
+    struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+    static IntPtr Biggest(int pid)
     {
-        string exe = Path.Combine(Runtime, "victory-warm.exe");
-        ProcessStartInfo start = new ProcessStartInfo(exe);
-        start.WorkingDirectory = Runtime;
-        start.UseShellExecute = false;
-        start.EnvironmentVariables["VICTORY_LOG"] = "warn";
-        try
+        IntPtr best = IntPtr.Zero;
+        long area = 0;
+        EnumWindows(delegate(IntPtr handle, IntPtr param)
         {
-            Process.Start(start);
-            status.Text = "Aquecendo o cache de shaders. Pode demorar alguns minutos.";
-        }
-        catch (Exception error)
-        {
-            MessageBox.Show(error.Message, "GTA6", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
+            uint owner;
+            GetWindowThreadProcessId(handle, out owner);
+            if (owner != pid || !IsWindowVisible(handle))
+            {
+                return true;
+            }
+            RECT rect;
+            if (!GetClientRect(handle, out rect))
+            {
+                return true;
+            }
+            long size = (long)(rect.Right - rect.Left) * (rect.Bottom - rect.Top);
+            if (size > area)
+            {
+                area = size;
+                best = handle;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return best;
     }
+
+    // --------------------------------------------------------------- extras
 
     static void OpenFile(string name)
     {
         string path = Path.Combine(Runtime, name);
         if (File.Exists(path))
         {
-            Process.Start(path);
-        }
-    }
-
-    static void OpenFolder(string name)
-    {
-        string path = name.Length == 0 ? Runtime : Path.Combine(Runtime, name);
-        if (Directory.Exists(path))
-        {
-            Process.Start("explorer.exe", "\"" + path + "\"");
+            Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
         }
     }
 }
