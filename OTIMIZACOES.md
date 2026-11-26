@@ -1,0 +1,255 @@
+# O perfil de 16 GB — o que está ligado, por quê, e o que foi medido
+
+Esta base é o **`DoubleGhosty/cool_fox`** (`28ebb28`), que já unifica quatro
+trabalhos: `avatarmanz` (os ports do renderer), `codec-d`, `DexNom` e
+`Belobug`. Por cima dele: o mouse look, o perfil em funções, o launcher
+`GTA6.exe` e esta documentação.
+
+O `GTA6.exe` já abre com o perfil abaixo; não precisa configurar nada.
+
+A máquina de referência: Ryzen 5 5600G (6c/12t), 16 GB DDR4-3200, GeForce RTX
+3060 Ti 8 GB, Windows 10 19045, janela 1280x720, console Series S.
+
+---
+
+## O que o jogo precisa, em números
+
+Medido no `victory.err` com `VICTORY_LOG=info` e `VICTORY_MEMORY_CATEGORIES=1`:
+
+| item | valor |
+| --- | --- |
+| memória privada do processo no pico | 22 GB |
+| working set (o que está de fato na RAM) | 6,4 GB |
+| VRAM no mundo | 6,8 de 7,0 GB |
+| primeiro quadro do mundo | ~3 minutos depois do launcher |
+| quadro no mundo | 460 a 730 ms (1,4 a 2,2 fps) |
+| quadro no menu | 34 ms (29 fps) |
+| GPU ocupada por quadro | ~107 ms (30%) |
+| pipelines no livro | 84.000 criadas, ~2.400 desenhadas |
+
+O título pede 20 a 30 GB de memória privada e o fork recomenda 64 GB. Em 16 GB
+o Windows pagina: o processo fica com 22 GB de commit e 6,4 GB residentes, e é
+por isso que cada chamada de lista custa ~67 µs aqui contra ~6 µs num 12900K.
+
+---
+
+## O que o cool_fox conserta
+
+Três consertos desta base atacam exatamente o que se via na base anterior
+(`docs/bug-journal.md`):
+
+1. **`resource.rs`: os guards de lane são restaurados em joins mortos.** O
+   compute `CS_AlphTransmissionPrefilterMip` (`2da4beb386509b77`) era recusado
+   em todo quadro; agora é feito. É a água e o vidro do prólogo.
+2. **`Detached::release_tables()` + `settle_for_fence()`** (`host.rs`/`draw.rs`):
+   slots dinâmicos presos pelo `bury_lag()` (16 submissions) esgotavam o pool de
+   262k da NVIDIA e derrubavam draws. Era o frame drop e o flick.
+3. **`residency.rs`: pressão leve separada de `critical_commit()`** (<1536 MiB).
+   Antes dezenas de milhares de texturas travavam em `neutral()` mesmo com RAM
+   sobrando. Era a fila de textura: **13.494 slots, 186 devidas por quadro,
+   9.107 esperando memória, 15 subindo**.
+
+O terceiro é o que mais importa aqui: a fila era a causa do flick, e agora a
+admissão é pareto — com 32 GiB ou menos ela já limita o prefetch a 64 MiB por
+quadro e solta staging parado, **sem knob**.
+
+---
+
+## Onde o quadro vai (mundo, 546 ms)
+
+| etapa | ms |
+| --- | --- |
+| tradução das listas (`VICTORY_THIN`, 8 threads) | 3.257 ms de CPU somada → ~550 ms de parede em 6 núcleos |
+| passos das listas no thread de submissão | 105 |
+| varredura do view heap (`looking at slots`) | 97 a 119 |
+| snapshots | 65 |
+| cópias (ida) | 40 a 130 |
+| cópias de volta (read-back do write watch) | 60 a 120 |
+| GPU | 107 |
+
+35 a 48 mil chamadas de lista por quadro, 188 a 223 listas, 318 a 477 pedaços.
+É o preço de emular o console: cada chamada é traduzida para D3D12 na CPU antes
+de virar trabalho para a placa. Num 12900K são 230 ms somados; aqui são 3 a 5
+segundos, e é isso que separa 45 ms de 550 ms.
+
+---
+
+## As três coisas que destravam
+
+### 1. A biblioteca de pipelines
+
+`VICTORY_LIBRARY=1` · `VICTORY_LIBRARY_STORE_LATER=1`
+
+Sem ela, cada execução recompila ~1.200 pipelines de shader, a ~1 por segundo
+com 10 threads, e cada pipeline custa ~4 MB de memória de driver que não volta.
+A biblioteca fica em `%LOCALAPPDATA%\VIctory\cache\pipelines\` e cresce a cada
+execução até cobrir o jogo.
+
+`STORE_LATER` entrega a pipeline na hora e a grava junto com o save, em vez de
+segurar o quadro esperando o disco.
+
+**A primeira execução ainda compila.** A segunda é a rápida. Se você apagar os
+`.bin`, volta ao começo.
+
+**Compilar antes de jogar.** O livro guarda o que o jogo *já pediu*. O que o
+jogo vai pedir no meio de uma cena ainda é compilado dentro do quadro — e
+`docs/findings.md` conta **270 a 660 s de uma sessão com quadros acima de 200
+ms, quase todos enquanto uma pipeline nova era feita**. Dois passos, uma vez
+cada (ou o botão **Preparar (compilar)** / `GTA6.exe --prepare`):
+
+```powershell
+# 1. uma sessão que grava o livro de pipelines que o título criou
+$env:VICTORY_PIPELINE_BOOK = '1'
+scripts\play-16gb.ps1 -Exe <game_scarlett_master.exe>
+# 2. traduz os shaders e fabrica as host pipelines das que os quadros desenham
+scripts\prepare-16gb.ps1 -Exe <victory.exe> -Shaders <shaders.rpf>
+```
+
+O livro é `known-pipelines.bin` (as chaves) mais `known-shaders.bin` (o código
+do título, 189 MB, fica no cache e não sai de lá); o `warm` roda em processos
+próprios, de dois terços dos núcleos, e cada pipeline é solta em seguida — quem
+guarda é o cache do driver.
+
+O perfil é o mesmo dos dois lados (`scripts\profile-16gb.ps1`): a chave de uma
+host pipeline inclui os ajustes do host, então aquecer com outro perfil fabrica
+pipelines que o jogo não pede.
+
+### 2. A resolução que o título acredita
+
+`VICTORY_OUTPUT=1280x720` · `VICTORY_UPSCALER=6` · `VICTORY_RENDER_SCALE=1.0`
+
+O título reporta a TV como **3840x2160** por padrão e desenha 2560x1440 dentro
+de uma janela 1080p: quatro vezes os alvos de render, quatro vezes as cópias,
+quatro vezes a memória, para pixels que são jogados fora no present.
+
+`VICTORY_OUTPUT` é o único que muda isso — o título casa contra a própria lista
+de modos (`1280x720`, `1664x936`, `1920x1080`, `2560x1440`, `3840x2160`).
+`VICTORY_DISPLAY_MODE` não serve: ele muda o que o host reporta, e o título não
+olha para isso.
+
+Com escala `1.0` ele desenha 720p inteiro e não há upscaling nenhum: a imagem
+sai dura de propósito, sem o halo de nitidez que a escala 0.5 produzia. A placa
+está 70% ociosa de qualquer jeito — o que manda no quadro é a CPU.
+
+**Não suba para 1080p nesta placa.** A 720p a VRAM já está em 6,8 de 7,0 GB;
+os alvos 2,25x maiores derramam textura para a RAM do sistema, que já vive com
+300 MB livres. Ficaria mais bonito e mais lento.
+
+### 3. O teto de textura que não existe
+
+**Não defina `VICTORY_TEXTURE_BUDGET_MB`.**
+
+Esse knob parece um limite de memória, mas no código ele substitui a checagem
+de VRAM:
+
+```rust
+if let Some(limit) = limit {
+    return filled < limit;   // ignora a VRAM por completo
+}
+```
+
+Com um teto de 2 GB o host para de subir textura em 2 GB e o mundo — que pede
+~4 GB — fica **sem textura**, não mais leve. Foi o que manteve a tela preta nas
+primeiras execuções. Sem o knob, quem manda é a VRAM
+(`VICTORY_TEXTURE_ROOM_PERCENT=95`).
+
+Nesta base a residência também não precisa de knob: `residency.rs` detecta
+32 GiB ou menos e aplica o perfil de máquina pequena sozinho.
+
+---
+
+## Os ports do avatarmanz: o que valeu nesta máquina
+
+| port | o que faz | veredito nesta máquina |
+| --- | --- | --- |
+| `VICTORY_PORT_DESCRIPTORS=1` | troca a varredura de ~600.000 slots por um patch nas stores do título | **inerte**: a varredura continuou em 119 ms por quadro. O patch de byte-check não casou com a versão 1.0.2.1 |
+| `VICTORY_PORT_GUARD=1` | lock dos write guards por bloco de 64 KiB | inerte junto (mesma run) |
+| `VICTORY_PORT_JOURNAL=1` | journal dos heaps em 64 partes | inerte junto (mesma run) |
+| `VICTORY_PORT_CBV=1` | shaders leem constant buffers no lugar, como bytes crus: ~22.000 fills por quadro viram leitura de GPU | **a aposta**: ligado só depois da baseline limpa, porque muda a chave da pipeline e exige re-traduzir os 25.694 shaders |
+| `VICTORY_PORT_CONSTANTS=1` | os 174 MB de constantes lidos pela placa onde o título escreve: sem upload, sem fill | adiado. Risco de VRAM com a placa em 6,8/7,0 GB |
+
+`VICTORY_INDIRECT_REST=0` foi medido e descartado: **0,00 registros indiretos
+vazios por quadro**, não há o que restaurar.
+
+### O `-Safe` do fork não serve nesta máquina
+
+O `scripts/play.ps1 -Safe` desliga `VICTORY_UNDER_WIDE` e `VICTORY_LAND_ECHO`,
+que vêm ligados por padrão. Medido aqui, com o resto do perfil igual:
+
+| perfil | quadro no mundo |
+| --- | --- |
+| padrão (`LAND_ECHO=1`, `UNDER_WIDE=1`) | 460 a 730 ms |
+| `-Safe` (`LAND_ECHO=0`, `UNDER_WIDE=0`) | **3.000 a 8.800 ms** (0,1 a 0,4 fps) |
+
+Com `LAND_ECHO=0` as cópias voltam para o caminho do quadro: 1.400 a 2.900 ms e
+350 a 640 MB por quadro. Não é uma opção de conserto aqui — é 10x mais lento.
+
+---
+
+## O resto do perfil
+
+| variável | valor | por quê |
+| --- | --- | --- |
+| `VICTORY_OUTPUT` | `1280x720` | o menor modo do título |
+| `VICTORY_RENDER_SCALE` | `1.0` | 720p inteiro, sem upscaler |
+| `VICTORY_UPSCALER` | `6` | o upscaler do título, não o FidelityFX |
+| `VICTORY_LIBRARY` | `1` | a biblioteca de pipelines em disco |
+| `VICTORY_LIBRARY_STORE_LATER` | `1` | grava com o save, sem segurar o quadro |
+| `VICTORY_PIPELINE_WORKERS` | `10` | um por thread do 5600G |
+| `VICTORY_TEXTURE_ROOM_PERCENT` | `95` | textura até 95% da VRAM |
+| `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | `512` | menos VRAM reservada, mais textura |
+| `VICTORY_MEMORY_CARD_MB` | `2048` | espelho da memória do título na placa |
+| `VICTORY_CARD_WINDOWS_MB` | `512` | as janelas desse espelho |
+| `VICTORY_CARD_BUFFERS_MB` | `256` | buffers na placa |
+| `VICTORY_KEEP_SNAPSHOTS_MB` | `32` | snapshots para o read-back |
+| `VICTORY_UPLOAD_AHEAD` | `1` | sobe textura em threads nossas, à frente do quadro |
+| `VICTORY_PLACED_FILLER` | `1` | duas texturas iguais com filler diferente viram uma |
+| `VICTORY_THIN` | `1` | tradução de lista em 8 threads |
+| `VICTORY_JOIN_PARTS` | `8` | listas cortadas em partes, enviadas juntas |
+| `VICTORY_RELAY` | `2` | o caminho rápido de submissão do fork |
+| `VICTORY_MOUSE_LOOK` | `1` | olhar com o botão direito |
+| `VICTORY_MOUSE_SENSITIVITY` | `0.05` | radianos por pixel contado |
+
+A residência (`residency.rs`) é automática: com 32 GiB ou menos ela já limita o
+prefetch a 64 MiB por quadro e solta staging parado. Não existe
+`VICTORY_RESIDENCY` nesta base.
+
+Qualquer uma pode ser sobrescrita pelo ambiente do Windows: o launcher deixa o
+que estiver definido vencer.
+
+---
+
+## Rodar sem o launcher
+
+```powershell
+$env:VICTORY_OUTPUT = '1280x720'
+$env:VICTORY_LIBRARY = '1'
+.\victory.exe run "C:\...\game_scarlett_master.exe" --execute --console series-s
+```
+
+Ou use o perfil pronto:
+
+```powershell
+.\scripts\play-16gb.ps1 -Exe "C:\...\game_scarlett_master.exe" -Build release
+```
+
+---
+
+## Limites conhecidos
+
+- **16 GB é o piso, não o recomendado.** O processo chega a 22 GB privados; o
+  Windows segura com o arquivo de paginação, mas o mundo leva ~3 minutos para
+  carregar e roda a 1,4–2,2 fps nesta CPU.
+- **O teto é a CPU, não a placa.** A GPU fica em 30% porque só recebe 2 quadros
+  por segundo. Não existe knob de GPU que conserte isso: o trabalho é traduzir
+  chamada de lista, e é trabalho de CPU.
+- **O heap de descritores é menor na NVIDIA.** O título pede 1.245.184 views;
+  em AMD o driver aceita 2.097.152, em NVIDIA o teto é 1.000.000 (737.856
+  úteis depois dos slots dinâmicos). As views acima disso leem o slot nulo. O
+  título usa até ~720.000, então cabe — apertado.
+- **`raw twins` não existe na NVIDIA.** É o caminho que o fork usa em RDNA para
+  ler buffer por índice sem cópia; aqui `raw_views` fica desligado.
+- **195 shaders não traduzem** de 25.694 (containers sem programa de vertex,
+  pixel, compute ou mesh). São geometria não usada.
+- **`amd_fidelityfx_upscaler_xbox.dll` é recusado no primeiro pedido** e
+  carregado depois como DLL do título. É normal no log.

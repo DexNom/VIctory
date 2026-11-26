@@ -347,7 +347,6 @@ static class GTA6
         string[] keep =
         {
             "VICTORY_CONFIG", "VICTORY_GAME_DIR", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR",
-            "VICTORY_FIDELITYFX_DIR",
         };
         foreach (string name in keep)
         {
