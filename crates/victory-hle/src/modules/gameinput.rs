@@ -1381,16 +1381,16 @@ mod host {
             if unsafe { GetAsyncKeyState(i32::from(VK_ESCAPE)) } < 0 {
                 self.held = false;
             }
-            if !self.held {
-                // The cursor is the PC's: no warp, no delta, and the next
-                // click inside the window takes the look again.
+            // The look is held by the right button, as a title's aim is: the
+            // cursor is the PC's the moment it is let go, so a hand can always
+            // reach the task bar while a title runs at two frames a second.
+            if !pointer.right {
                 self.last = None;
                 self.center = None;
-                if pointer.left {
-                    self.held = true;
-                }
+                self.held = false;
                 return pointer;
             }
+            self.held = true;
             let mut at = POINT::default();
             // SAFETY: room for the point.
             if unsafe { GetCursorPos(&mut at) } == 0 {
