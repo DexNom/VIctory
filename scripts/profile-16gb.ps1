@@ -14,6 +14,9 @@ $settings = @{
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
+    # A nevoa marrom de interior que a luz do ceu dos probes poe: 1.5 e o valor
+    # que o proprio fork usa no perfil pareto-residency.
+    VICTORY_AMBIENT_AIR = '1.5'
     VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1'
     # Renderer Port 5 (zero-copy CBV): the constant buffer is read as bytes in
     # place, without the copy it made per draw. On six cores and ~48,000 list

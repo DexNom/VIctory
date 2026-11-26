@@ -53,6 +53,22 @@ O terceiro é o que mais importa aqui: a fila era a causa do flick, e agora a
 admissão é pareto — com 32 GiB ou menos ela já limita o prefetch a 64 MiB por
 quadro e solta staging parado, **sem knob**.
 
+### O Agility SDK
+
+O `cool_fox` não traz o export que carrega o Direct3D 12 1.620. Sem ele o
+`d3d12.dll` do Windows 10 19045 (que para no Shader Model 6.5) é usado, e ele
+recusa o root signature que o runtime monta:
+
+```
+root signature: Unsupported bit-flag set (root signature flags c00).
+host root signature refused error=Parâmetro incorreto. (0x80070057)
+```
+
+Resultado: **nenhuma host pipeline é criada** — o `warm` reporta "2.438 have no
+host pipeline" e o jogo fica sem desenho. O `apps/victory/build.rs` desta base
+exporta `D3D12SDKVersion=620` e `D3D12SDKPath=.\D3D12\`, e a pasta `D3D12\`
+com o `D3D12Core.dll` 1.620.2 anda ao lado do executável.
+
 ---
 
 ## Onde o quadro vai (mundo, 546 ms)

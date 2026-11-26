@@ -278,6 +278,9 @@ static class GTA6
     {
         start.EnvironmentVariables["VICTORY_SHOW_AFTER"] = "1";
         start.EnvironmentVariables["VICTORY_AMBIENT"] = "0.8";
+        // A nevoa marrom de interior que a luz do ceu dos probes poe: 1.5 e o
+        // valor que o proprio fork usa no perfil pareto-residency.
+        start.EnvironmentVariables["VICTORY_AMBIENT_AIR"] = "1.5";
         // O titulo acredita que a TV e 4K e desenha 2560x1440 dentro de uma
         // janela 1080p: 4x os alvos, 4x as copias. VICTORY_OUTPUT e o modo que
         // ele reporta; a escala 1.0 desenha na resolucao do modo, sem upscaler.
