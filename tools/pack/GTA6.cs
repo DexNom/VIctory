@@ -222,16 +222,21 @@ static class GTA6
         start.EnvironmentVariables["VICTORY_AMBIENT"] = "0.8";
         start.EnvironmentVariables["VICTORY_D3D12_DRED"] = "light";
         start.EnvironmentVariables["VICTORY_THIN"] = "1";
+        // O corte das listas em partes (1 a 3 ms por quadro) e o bercario de
+        // listas do host ficam no padrao do fork: com 8 partes e 2.048 listas
+        // guardadas o processo ficou MAIOR e morreu antes (runs 13 e 14).
         start.EnvironmentVariables["VICTORY_JOIN_PARTS"] = "8";
         // A placa de 8 GB, nomeada para a escolha nunca cair na integrada.
         start.EnvironmentVariables["VICTORY_D3D12_ADAPTER"] = "NVIDIA";
         // O titulo acredita que a TV e 4K e desenha 2560x1440 dentro de uma
         // janela 1080p: 4x os alvos, 4x as copias. VICTORY_OUTPUT e o modo que
-        // ele reporta; a escala 0.5 desenha 640x360 e sobe para 720p com o
-        // upscaler dele mesmo (6), nao o FidelityFX (7).
+        // ele reporta; a escala 1.0 desenha na resolucao do modo, sem upscaler.
+        // A 0.5 (640x360) o upscaler dele mesmo (6) aplica nitidez e a imagem
+        // fica dura, com halo; a placa fica 78% ociosa de qualquer jeito, entao
+        // desenhar 720p inteiro custa quase nada e tira o serrilhado.
         start.EnvironmentVariables["VICTORY_OUTPUT"] = high ? "1920x1080" : "1280x720";
         start.EnvironmentVariables["VICTORY_UPSCALER"] = "6";
-        start.EnvironmentVariables["VICTORY_RENDER_SCALE"] = high ? "0.67" : "0.5";
+        start.EnvironmentVariables["VICTORY_RENDER_SCALE"] = high ? "0.85" : "1.0";
         // O cache de pipelines: 171 MB de disco que valem a fila inteira
         // (1.200 pipelines, um por segundo, sem ele).
         start.EnvironmentVariables["VICTORY_PIPELINE_CACHE"] = "1";
@@ -245,7 +250,18 @@ static class GTA6
         start.EnvironmentVariables["VICTORY_MEMORY_CARD_MB"] = "2048";
         start.EnvironmentVariables["VICTORY_CARD_WINDOWS_MB"] = "512";
         start.EnvironmentVariables["VICTORY_CARD_BUFFERS_MB"] = "256";
+        // 16 GB: o que da para encolher sem tirar nada do jogo.
         start.EnvironmentVariables["VICTORY_KEEP_SNAPSHOTS_MB"] = "32";
+        // Duas texturas com as mesmas palavras de descricao, mudando so o
+        // "filler", viravam dois recursos e duas copias (8.438 delas na run 15).
+        start.EnvironmentVariables["VICTORY_PLACED_FILLER"] = "1";
+        // Abaixo de 3 GiB livre limita o prefetch a 64 MiB por quadro e solta
+        // scratch e staging parados; com 32 GiB ou menos, os budgets de um PC
+        // menor. E o knob desenhado para esta maquina.
+        start.EnvironmentVariables["VICTORY_RESIDENCY"] = "1";
+        // Um pipeline que falta faz o draw sumir; 1 s de espera por quadro
+        // custa menos que um personagem sem corpo na cutscene.
+        start.EnvironmentVariables["VICTORY_PIPELINE_WAIT_MS"] = "1000";
         // O mouse olha enquanto o botao direito esta apertado.
         start.EnvironmentVariables["VICTORY_MOUSE_LOOK"] = "1";
         start.EnvironmentVariables["VICTORY_MOUSE_SENSITIVITY"] = "0.05";
@@ -411,6 +427,13 @@ static class GTA6
             focus.Stop();
         }
     }
+
+    // O piso duro de memoria residente (SetProcessWorkingSetSizeEx com
+    // HARDWS_MIN) foi medido e reprovado: com piso de 9.728 MB o gerenciador
+    // segura as paginas do jogo e passa a tirar as do resto do sistema, mas o
+    // processo ficou em 11.184 ms por quadro (0,1 fps) e morreu em 147 s,
+    // contra 550 a 710 ms e 333 s sem piso. O Windows pagina melhor sozinho.
+    // Nao volte a ligar isso.
 
     [DllImport("user32.dll")]
     static extern bool EnumWindows(EnumProc callback, IntPtr param);
