@@ -207,6 +207,8 @@ impl Bits<'_> {
 struct Vlc {
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
+    /// Index of the code at each eight-bit prefix boundary, plus the last code.
+    first: [u16; 257],
 }
 
 impl Vlc {
@@ -217,13 +219,25 @@ impl Vlc {
             codes.push((code as u32, len, symbol));
             code += 1 << (32 - len);
         }
-        Vlc { codes }
+        let first = std::array::from_fn(|prefix| {
+            let start = (prefix as u64) << 24;
+            let i = codes.partition_point(|c| u64::from(c.0) <= start) - 1;
+            u16::try_from(i).expect("the XMA codebooks fit in u16")
+        });
+        Vlc { codes, first }
     }
 
     fn read(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
-        let i = self.codes.partition_point(|c| c.0 <= v) - 1;
-        let (_, len, symbol) = self.codes[i];
+        let prefix = (v >> 24) as usize;
+        let first = usize::from(self.first[prefix]);
+        let mut entry = self.codes[first];
+        if entry.1 > 8 {
+            let last = usize::from(self.first[prefix + 1]);
+            let more = &self.codes[first + 1..=last];
+            entry = self.codes[first + more.partition_point(|c| c.0 <= v)];
+        }
+        let (_, len, symbol) = entry;
         bits.pos += len as usize;
         symbol
     }
@@ -1022,6 +1036,22 @@ fn to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_lookup_reads_every_code_and_consumes_its_bits() {
+        let c = codes();
+        for table in [&c.scale, &c.scale_rl, &c.coef[0], &c.coef[1], &c.vec4, &c.vec2, &c.vec1] {
+            for (i, &(start, len, symbol)) in table.codes.iter().enumerate() {
+                let end = table.codes.get(i + 1).map_or(u32::MAX, |next| next.0 - 1);
+                for word in [start, end] {
+                    let data = word.to_be_bytes();
+                    let mut bits = Bits { data: &data, pos: 0, end: 32 };
+                    assert_eq!(table.read(&mut bits), symbol);
+                    assert_eq!(bits.pos, usize::from(len));
+                }
+            }
+        }
+    }
 
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.
     fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {
