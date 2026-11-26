@@ -56,11 +56,13 @@ $launcher = Join-Path $env:LOCALAPPDATA 'DexNom Runtime\victory-play.exe'
 
 `--no-rt` skips acceleration-structure building, traversal, and lighting
 resolve. Supported material shaders get a diffuse ambient fill based on
-their base color. Some interiors can still look darker.
+their base color. Some interiors can still look darker. Baked lighting
+or a probe-based indirect-light fallback remains open work. [RT pass selection](../crates/victory-gpu/src/pipeline/ray_tracing.rs) · [Ambient fill](../crates/victory-shader/src/emit/mod.rs)
 
 To try partial ray tracing, replace `--no-rt` with `--rt-static-bvh`.
 Keep FSR disabled. This mode traces the prebuilt world structure and
 skips rebuilding it for dynamic geometry. Traversal and lighting resolve
 can still be expensive, and moving objects may have incomplete shadows
 or reflections. Use the same scene and resolution for both runs and
-record the GPU, driver, frame times, and lighting differences. [Ray-tracing implementation](fork-ray-tracing.md) · [Report a test result](CONTRIBUTING.md#report-a-bug-or-benchmark)
+record the GPU, driver, frame times, and lighting differences. The run log
+records the requested ray-tracing mode. [Ray-tracing implementation](fork-ray-tracing.md) · [Open the latest log](troubleshooting.md#open-the-latest-log) · [Report a test result](CONTRIBUTING.md#report-a-bug-or-benchmark)

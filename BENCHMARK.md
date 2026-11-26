@@ -114,11 +114,16 @@ One City texture staging sample spent 846 ms waiting on the global memory mappin
   The runtime merges overlapping memory notifications and rescans tracked
   textures if the notification queue fills. Descriptor allocation looks
   for contiguous slots and can admit already-resident textures under
-  memory pressure.
+  memory pressure. A previously refused buffer view is checked again
+  when its backing allocation changes.
 - The runtime prioritizes previously used depth-only pipelines over
   speculative material pipelines to reduce missing shadows during loading.
   Distant dock fixtures also appeared dark with the ray-structure builder
   disabled. Their cause and the gameplay impact of these changes remain open.
+- Ray-tracing descriptors preserve raw buffer offsets, and each command
+  list prepares the guest memory it reads.
+- The shader translator preserves the guest wave width during lane
+  permutations and handles texture-size queries on heap-indexed resources.
 - Save handling flushes copied blobs before publication and can recover
   a complete checkpoint.
 
@@ -126,7 +131,8 @@ One City texture staging sample spent 846 ms waiting on the global memory mappin
 
 To test four CPU workers for eligible upload batches and parallel
 recording of independent transition command lists, launch from PowerShell.
-The final GPU queue keeps the original submission order.
+Final GPU submission, fence signals, and resource transitions keep the
+game's ordering.
 
 ~~~powershell
 $env:VICTORY_FILL_WORKERS = '4'

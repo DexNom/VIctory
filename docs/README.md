@@ -21,5 +21,6 @@
 - **The XCL contributors** published an independent compatibility layer that informed work on shader translation and CPU/GPU memory synchronization. [XCL](https://github.com/xcl-dev/xcl)
 - **AMD** supplies the FSR upscaler used by the Quality 4K profile. [AMD FSR SDK](https://gpuopen.com/amd-fsr-sdk/)
 
-The source is licensed under GPL-3.0-or-later. The BCPack tables required for
-the build are supplied separately and verified by setup. [License](../LICENSE) · [Asset policy](asset-policy.md) · [Upstream README and historical credits](../README.upstream.md)
+The source is licensed under GPL-3.0-or-later. Upstream supplies the
+BCPack tables separately from the GPL source. Setup verifies the tables
+before building. [License](../LICENSE) · [Asset policy](asset-policy.md) · [Upstream README and historical credits](../README.upstream.md)
