@@ -12,6 +12,8 @@
   <a href="BENCHMARK.md">Benchmarks</a>
 </p>
 
+![VIctory × RayTime pixel-art banner in a PowerShell window](.github/assets/raytime-banner.png)
+
 ## Get started
 
 Use Windows x64 and a Direct3D 12 GPU with mesh shader and Shader Model 6.6
