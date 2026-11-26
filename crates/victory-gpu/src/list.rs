@@ -1798,6 +1798,7 @@ impl ValueWait {
         met
     }
 
+    #[cfg(windows)]
     fn holds(&self) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
@@ -1815,6 +1816,14 @@ impl ValueWait {
             return true;
         }
         self.holds_for(u64::from_le_bytes(raw))
+    }
+
+    /// This runtime has no guest memory to read off Windows; report the wait met so nothing
+    /// spins on it in a check-only build.
+    #[cfg(not(windows))]
+    fn holds(&self) -> bool {
+        let _ = self;
+        true
     }
 
     /// Where the value waited for is: address and bytes.
