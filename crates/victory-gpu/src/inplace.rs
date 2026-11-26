@@ -1399,7 +1399,16 @@ mod tests {
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
             drop(placed);
             // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            // The software adapter lets go of the opened pages after the heap's
+            // last reference goes, not with it: under load (the whole suite in
+            // parallel) the decommit can still meet them held and fail with
+            // ERROR_INVALID_PARAMETER for a few milliseconds.
+            let mut tries = 0;
+            while mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT) == 0 {
+                tries += 1;
+                assert!(tries < 400, "decommit refused for 2 s: {:?}", windows::Win32::Foundation::GetLastError());
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
