@@ -1042,6 +1042,82 @@ mod tests {
         }
     }
 
+    fn put_packet(data: &mut [u8], index: usize, frames: u32, first: u32, skip: u32) {
+        put_bits(
+            data,
+            index * PACKET_BITS,
+            32,
+            (frames << 26) | (first << 11) | skip,
+        );
+    }
+
+    #[test]
+    fn continuation_frame_walk_follows_interleaved_packet_skips() {
+        // This stream uses packets 0, 2, 5 and 6. The others belong to
+        // another stream and contain nonzero data that must not be gathered.
+        let mut data = vec![0u8; 7 * PACKET_BYTES];
+        for other in [1, 3, 4] {
+            data[other * PACKET_BYTES..(other + 1) * PACKET_BYTES].fill(0xff);
+        }
+        put_packet(&mut data, 0, 2, 0, 1);
+        put_packet(&mut data, 2, 0, 0x7fff, 2);
+        put_packet(&mut data, 5, 0, 64, 0);
+        put_packet(&mut data, 6, 1, 0, 0);
+
+        let second = HEADER_BITS + 16000;
+        let bits = PACKET_BITS - second + PACKET_BITS - HEADER_BITS + 64;
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, 16000);
+        put_bits(&mut data, second - 1, 1, 1); // another frame follows the first
+        put_bits(&mut data, second, LENGTH_BITS, bits as u32);
+        let next = 6 * PACKET_BITS + HEADER_BITS;
+        put_bits(&mut data, next, LENGTH_BITS, 100);
+
+        assert_eq!(read_frame(&data, HEADER_BITS).unwrap().next, Some(second));
+        let frame = read_frame(&data, second).unwrap();
+        let mut expected = vec![0u8; bits.div_ceil(8)];
+        put_bits(&mut expected, 0, LENGTH_BITS, bits as u32);
+        assert_eq!(frame.data, expected);
+        assert_eq!(frame.next, Some(next));
+        assert_eq!(read_frame(&data, next).unwrap().next, None);
+    }
+
+    #[test]
+    fn packet_boundary_walk_skips_packets_without_frame_starts() {
+        let mut data = vec![0u8; 6 * PACKET_BYTES];
+        put_packet(&mut data, 0, 1, 0, 0);
+        put_packet(&mut data, 1, 0, 0x7fff, 1);
+        put_packet(&mut data, 3, 0, 0x7fff, 1);
+        put_packet(&mut data, 5, 1, 0, 0);
+        put_bits(
+            &mut data,
+            HEADER_BITS,
+            LENGTH_BITS,
+            (PACKET_BITS - HEADER_BITS) as u32,
+        );
+        let next = 5 * PACKET_BITS + HEADER_BITS;
+        put_bits(&mut data, next, LENGTH_BITS, 100);
+
+        let frame = read_frame(&data, HEADER_BITS).unwrap();
+        assert_eq!(frame.bits, PACKET_BITS - HEADER_BITS);
+        assert_eq!(frame.next, Some(next));
+        assert_eq!(read_frame(&data, next).unwrap().next, None);
+    }
+
+    #[test]
+    fn frame_walk_ends_when_only_packets_without_frame_starts_remain() {
+        let mut data = vec![0u8; 4 * PACKET_BYTES];
+        put_packet(&mut data, 0, 1, 0, 0);
+        for index in 1..4 {
+            put_packet(&mut data, index, 0, 0x7fff, 0);
+        }
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, 100);
+        assert_eq!(read_frame(&data, HEADER_BITS).unwrap().next, None);
+
+        // A partial header after the empty packets is not a new frame.
+        data.extend_from_slice(&[0xff; 3]);
+        assert_eq!(read_frame(&data, HEADER_BITS).unwrap().next, None);
+    }
+
     /// A damaged packet whose first frame says it is 0 bits long: finding
     /// the frame after a later one must give up, not walk in place forever
     /// (found by random-input testing).
