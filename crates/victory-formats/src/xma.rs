@@ -279,6 +279,24 @@ fn log2(v: usize) -> u32 {
 
 // The inverse transform.
 
+struct Rotation {
+    before_fft: (f64, f64),
+    after_fft: (f64, f64),
+}
+
+/// The rotations depend only on the subframe length (128, 256 or 512).
+fn rotations(n: usize) -> &'static [Rotation] {
+    static TABLES: [OnceLock<Vec<Rotation>>; BLOCK_SIZES] = [const { OnceLock::new() }; BLOCK_SIZES];
+    TABLES[(n / MIN_SUBFRAME).ilog2() as usize].get_or_init(|| {
+        (0..n / 2)
+            .map(|k| Rotation {
+                before_fft: (-std::f64::consts::PI * k as f64 / n as f64).sin_cos(),
+                after_fft: (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos(),
+            })
+            .collect()
+    })
+}
+
 /// Half-length inverse MDCT as FFmpeg defines it (`av_tx` MDCT, inverse):
 /// `n` coefficients to the middle `n` samples of the 2n-sample window,
 /// negated and scaled by `scale`. Computed as a DCT-IV through an
@@ -288,14 +306,15 @@ fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
     let m = n / 2;
     let mut re = vec![0f64; m];
     let mut im = vec![0f64; m];
-    for k in 0..m {
+    let rotations = rotations(n);
+    for (k, rotation) in rotations.iter().enumerate() {
         let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
-        let (s, c) = (-std::f64::consts::PI * k as f64 / n as f64).sin_cos();
+        let (s, c) = rotation.before_fft;
         (re[k], im[k]) = (a * c - b * s, a * s + b * c);
     }
     fft(&mut re, &mut im);
-    for k in 0..m {
-        let (s, c) = (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos();
+    for (k, rotation) in rotations.iter().enumerate() {
+        let (s, c) = rotation.after_fft;
         let (wr, wi) = (re[k] * c - im[k] * s, re[k] * s + im[k] * c);
         // DCT-IV: c[2k] = Re, c[n-1-2k] = -Im; output j is c[n-1-j].
         out[n - 1 - 2 * k] = (wr as f32) * scale;
