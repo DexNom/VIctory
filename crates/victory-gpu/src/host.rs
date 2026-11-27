@@ -7900,9 +7900,6 @@ impl Meter {
             RELAY_FETCH_SAVINGS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
-        // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -8011,12 +8008,13 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
-                for (why, n) in drops.iter().take(40) {
-                    tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / frames
-                    );
+                let report_frames = std::mem::take(&mut self.copy_stats_frames);
+                crate::copystat::log(report_frames as f64);
+                // The caption has a shorter interval. Keep the reasons until
+                // this report so the counts and frame total cover the same window.
+                for (why, count) in crate::pipeline::take_drops().into_iter().take(40) {
+                    let per_frame = count as f64 / report_frames as f64;
+                    tracing::info!(count, frames = report_frames, "dropped {per_frame:.1}/frame: {why}");
                 }
             }
         }
