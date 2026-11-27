@@ -118,9 +118,20 @@ Perfis:
 | perfil | UI | LOD de textura | para quem |
 |---|---|---|---|
 | `balanced` | 1280x720 | 1.0, mip bias -1.5 | padrão: toda textura presente, menos nítida |
+| `fps` | 1280x720 | 2.0, mip bias -2.5 | textura a um quarto, mesma geometria. Nada some |
 | `maxfps` | 640x480 | 2.0 | quem quer quadros e aceita imagem macia |
 | `potato` | 640x480 | 4.0, mip bias -2.0 | o piso: geometria em 0.4, culling em 3.0, veículo no último LOD |
 | `sharp` | 1920x1080 | 1.0, mip bias 0 | quem tem folga e quer nitidez |
+
+Nenhum perfil tira textura: todos só descem o nível de mip, então a textura
+fica mais macia e continua no lugar. Textura que *sumia* era o
+`VICTORY_MIP_BIAS` do runtime, que deu `0x887A0001` e está desligado desde o
+`85003c4` — não é o mesmo ajuste.
+
+**Sobre o `fps`:** medido, ele **não ganha fps**. O custo do runtime é por draw,
+não por texel: `potato` com textura a um dezesseis avos roda no mesmo 115,8 ms
+da textura cheia. O `fps` existe para quem prefere a imagem mais macia; não é
+alavanca de desempenho.
 
 O que `balanced` corta: sombra por ray tracing, reflexo da água por SSR,
 motion blur, sombra de partícula, duas amostras de SSRO para uma, UI de 4K para
@@ -131,4 +142,6 @@ ray tracing **não roda** aqui (`VICTORY_BVH_BUILDER` desligado), e o
 `VICTORY_AMBIENT` põe a luz indireta no lugar. Com `rtDynamicShadows` ligado
 o título monta e despacha trabalho de RT que a gente descarta — trabalho puro.
 
-No `settings.ini` do launcher, `gamecuts=0` desliga tudo isso.
+No `settings.ini` do launcher, `gamecuts=0` desliga tudo isso, e
+`profile=fps` troca só a textura (mais macia, nada some); `profile=balanced`
+volta ao padrão.

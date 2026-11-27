@@ -538,6 +538,18 @@ static class GTA6
         "texLodScale_Objects=1.000000", "texLodScale_HD=1.000000",
     };
 
+    // `profile=fps` no settings.ini: as mesmas listas acima com a textura mais
+    // macia, e nada mais. Cada textura desce dois niveis de mip (fica com um
+    // quarto dos pixels) e continua la: nenhuma some, nenhuma e' descartada.
+    // Medido: nao ganha fps (o custo e' por draw, nao por texel), entao nao e'
+    // o padrao. E' opcao de gosto, e volta com `profile=balanced`.
+    static readonly string[] GameCutsFps = new string[]
+    {
+        "manualMipBias=-2.500000", "maxTexUpgradesPerFrame=2",
+        "texLodScale_Global=2.000000", "texLodScale_Buildings=2.000000",
+        "texLodScale_Objects=2.000000", "texLodScale_HD=2.000000",
+    };
+
     static string TitleSettings()
     {
         try
@@ -572,6 +584,14 @@ static class GTA6
         }
     }
 
+    static string[] Combine(string[] first, string[] second)
+    {
+        string[] all = new string[first.Length + second.Length];
+        Array.Copy(first, 0, all, 0, first.Length);
+        Array.Copy(second, 0, all, first.Length, second.Length);
+        return all;
+    }
+
     static void TweakGame()
     {
         if (Setting("gamecuts", "1") == "0")
@@ -588,7 +608,10 @@ static class GTA6
             }
             string text = File.ReadAllText(file);
             int changed = 0;
-            foreach (string cut in GameCuts)
+            string[] cuts = Setting("profile", "balanced") == "fps"
+                ? Combine(GameCuts, GameCutsFps)
+                : GameCuts;
+            foreach (string cut in cuts)
             {
                 int at = cut.IndexOf('=');
                 string tag = cut.Substring(0, at);
