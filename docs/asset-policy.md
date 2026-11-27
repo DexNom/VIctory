@@ -35,8 +35,11 @@ The original upstream repository tracks the tables in its history.
 ## Where data lives
 
 Outside the repository, configured in `victory.toml`: `game_dir` (the
-user's dump), `test_titles`, and `cache_dir` for everything derived
+user's dump), `test_titles`, and `cache_dir` for derived assets
 (default `%LOCALAPPDATA%\victory\cache`).
+
+The launcher may write local diagnostic logs directly under the checkout's
+ignored `logs/` directory. The installer remembers which checkout to use.
 
 ## Enforcement
 
@@ -45,8 +48,8 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
    type, be under 512 KiB, contain no binary data or known binary
    signatures, and hold no long hex/base64 runs.
-3. At runtime, everything that writes derived data calls
-   `victory_core::ensure_outside_repo`.
+3. Asset and cache writers call `victory_core::ensure_outside_repo`.
+   Runtime log writers use `victory_core::policy::ensure_log_path`.
 4. Tests that need real files take their paths from environment variables
    and skip when unset. They assert on properties, never on snapshots.
 

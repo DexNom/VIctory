@@ -1,5 +1,5 @@
 This marker file identifies the root of the VIctory source tree.
 
-Tools refuse to write game-derived output (caches, converted assets, prepared
-images, logs containing game data) anywhere below a directory that contains
-this file. See docs/asset-policy.md.
+Caches, converted assets and prepared images stay outside this directory.
+The ignored logs/ directory is reserved for local runtime diagnostics.
+See docs/asset-policy.md.

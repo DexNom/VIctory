@@ -559,6 +559,22 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+pub(crate) fn telemetry_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_TELEMETRY").is_some_and(|v| v == "1"))
+}
+
+// Additional copy paths outside PREPARING, COPY_BACK and CARD_STATS.
+static READBACK_BYTES: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+pub(crate) fn count_readback(vram_read: usize, ram_read: usize, ram_write: usize) {
+    if telemetry_enabled() {
+        for (counter, bytes) in READBACK_BYTES.iter().zip([vram_read, ram_read, ram_write]) {
+            counter.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+}
 pub(crate) fn completed_texture_uploads() -> Option<u64> {
     // SAFETY: a live fence. D3D12 reports device removal as the maximum value.
     let completed = unsafe { host()?.fence.GetCompletedValue() };
@@ -3773,6 +3789,7 @@ fn read_backs(list: &HostList) {
             }
         }
         let bytes = row * rows;
+        count_readback(bytes, 0, if landed { bytes } else { 0 });
         walls_landed(READ_BACK, *at, pitch * (rows - 1) + row, bytes, if landed { bytes } else { 0 }, *source, Some(*recorded));
     }
 }
@@ -4632,6 +4649,7 @@ impl Host {
                 pieces.next();
             }
             if !packed.is_empty() { gpu = &packed; }
+            count_readback(gpu.len(), 0, 0);
             let bytes = shadow.card_merge_relay(*lo, gpu, *after, &mut scratch, owners);
             shadow.walls_merged(gpu.len(), bytes);
             written += bytes as u64;
@@ -7743,6 +7761,8 @@ fn caption(figures: &str, up: Duration) -> String {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    last_present: Option<std::time::Instant>,
+    frame_times: std::collections::VecDeque<f32>,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -7763,6 +7783,8 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            last_present: None,
+            frame_times: std::collections::VecDeque::new(),
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -7775,7 +7797,14 @@ impl Meter {
     }
 
     /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    fn frame(&mut self, hwnd: HWND, host: &Host) {
+        let presented = std::time::Instant::now();
+        if telemetry_enabled() && let Some(previous) = self.last_present.replace(presented) {
+            if self.frame_times.len() == crate::debug_hud::FRAME_HISTORY {
+                self.frame_times.pop_front();
+            }
+            self.frame_times.push_back((presented - previous).as_secs_f32() * 1_000.0);
+        }
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -7785,7 +7814,7 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
-        let elapsed = self.since.elapsed();
+        let elapsed = presented - self.since;
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
@@ -7794,7 +7823,7 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        (self.since, self.frames, self.drawn) = (presented, 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -7813,14 +7842,72 @@ impl Meter {
         };
         self.gpu_pct = if ms > 0.0 { gpu / ms * 100.0 } else { 0.0 };
         self.ram_mb = process_working_set().unwrap_or(0) as f64 / (1024.0 * 1024.0);
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-        });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
+        let [copy_us, copy_bytes, texture_us, texture_bytes] =
+            PREPARING.each_ref().map(|counter| counter.swap(0, Ordering::Relaxed));
+        let [back_us, back_bytes] =
+            COPY_BACK.each_ref().map(|counter| counter.swap(0, Ordering::Relaxed));
+        let [copy_ms, texture_ms, back_ms] =
+            [copy_us, texture_us, back_us].map(|us| us as f64 / 1e3 / frames);
+        let [copy_mb, texture_mb, back_mb] =
+            [copy_bytes, texture_bytes, back_bytes].map(|bytes| bytes as f64 / 1e6 / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        let card = crate::shadow::card_stats();
+        let transfer_bytes = telemetry_enabled().then(|| {
+            let [vram_read, ram_read, ram_write] = READBACK_BYTES
+                .each_ref().map(|counter| counter.swap(0, Ordering::Relaxed));
+            [
+                copy_bytes + texture_bytes + ram_read,
+                back_bytes + ram_write,
+                card[4] + vram_read,
+                card[0] + crate::texture::UPLOADED_BYTES.swap(0, Ordering::Relaxed),
+            ]
+        });
+        if let Some([ram_read_bytes, ram_write_bytes, vram_read_bytes, vram_write_bytes]) = transfer_bytes
+            && tracing::enabled!(target: "victory_telemetry::gpu", tracing::Level::INFO)
+        {
+            let memory = host.video_memory_groups();
+            let [upload_buffers, upload_bytes, shared_buffers, shared_bytes, local_buffers, local_bytes] =
+                MADE.each_ref().map(|counter| counter.load(Ordering::Relaxed));
+            let [live_textures, live_texture_bytes] = crate::resource::HOST_TEXTURES
+                .each_ref()
+                .map(|counter| counter.load(Ordering::Relaxed));
+            tracing::info!(
+                target: "victory_telemetry::gpu",
+                pid = std::process::id(),
+                window_ms = elapsed.as_secs_f64() * 1000.0,
+                window_us = elapsed.as_micros() as u64,
+                ram_read_bytes,
+                ram_write_bytes,
+                vram_read_bytes,
+                vram_write_bytes,
+                presents = frames as u32,
+                fps,
+                mean_frame_ms = ms,
+                cpu_prepare_ms_per_frame = cpu,
+                gpu_wait_ms_per_frame = gpu,
+                copy_back_ms_per_frame = back_ms,
+                draws_per_frame = draws,
+                dropped_draws_per_frame = dropped,
+                pipelines_building = crate::pipeline::making(),
+                title_buffer_copied_bytes = copy_bytes,
+                title_texture_read_bytes = texture_bytes,
+                title_copy_back_written_bytes = back_bytes,
+                indexed_texture_uploaded_bytes_total = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed),
+                upload_buffer_requests_total = upload_buffers,
+                upload_buffer_requested_bytes_total = upload_bytes,
+                shared_buffer_requests_total = shared_buffers,
+                shared_buffer_requested_bytes_total = shared_bytes,
+                local_buffer_requests_total = local_buffers,
+                local_buffer_requested_bytes_total = local_bytes,
+                host_textures_live = live_textures,
+                host_texture_bytes_accounted = live_texture_bytes,
+                gpu_local_bytes = memory.map(|groups| groups[0][1]),
+                gpu_local_budget_bytes = memory.map(|groups| groups[0][0]),
+                gpu_nonlocal_bytes = memory.map(|groups| groups[1][1]),
+                gpu_nonlocal_budget_bytes = memory.map(|groups| groups[1][0]),
+                "frame sample"
+            );
+        }
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
@@ -7893,8 +7980,6 @@ impl Meter {
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         // Depth planes drawn from their twins.
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
-        // Copies in the card's memory (`crate::shadow::cards`).
-        let card = crate::shadow::card_stats();
         let card_fetch_copies = CARD_FETCH_COPIES.swap(0, Ordering::Relaxed);
         let [fetch_bytes_saved, fetch_ranges_joined] =
             RELAY_FETCH_SAVINGS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
@@ -8021,8 +8106,15 @@ impl Meter {
             }
         }
         let (cpu_pct, gpu_pct, ram_mb) = (self.cpu_pct, self.gpu_pct, self.ram_mb);
-        crate::debug_hud::update(hwnd, || {
-            format!("DexNom RayTime diagnostics\n{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\nGPU wait {gpu:.1} ms   CPU prep {cpu:.1} ms   Copy-back {back_ms:.1} ms\nDropped {dropped:.0}/frame   RAM {ram_mb:.0} MB")
+        crate::debug_hud::update(hwnd, &self.frame_times, || {
+            use std::fmt::Write as _;
+            let mut hud = format!("DexNom RayTime diagnostics\n{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\nGPU wait {gpu:.1} ms   CPU prep {cpu:.1} ms   Copy-back {back_ms:.1} ms\nDropped {dropped:.0}/frame   RAM {ram_mb:.0} MB");
+            if let Some(bytes) = transfer_bytes {
+                let [ram_read, ram_write, vram_read, vram_write] =
+                    bytes.map(|bytes| bytes as f64 / (1u64 << 20) as f64 / elapsed.as_secs_f64());
+                let _ = write!(hud, "\nTracked transfers (MiB/s)\nRAM   read {ram_read:7.1}   write {ram_write:7.1}\nVRAM  read {vram_read:7.1}   write {vram_write:7.1}");
+            }
+            hud
         });
         let text = format!(
             "DexNom RayTime | {fps:.0} fps {ms:.1} ms/frame | gpu {gpu_pct:.0}% busy \
@@ -8182,7 +8274,7 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
+            p.meter.frame(p.hwnd, self);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]

@@ -6,6 +6,7 @@
 //! logs info and above whatever the filter asks for.
 
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -18,18 +19,30 @@ const CAP: LevelFilter = if cfg!(feature = "diagnostics") {
 };
 
 pub fn init(default_level: &str) {
+    init_with_error_file(default_level, None);
+}
+
+pub fn init_with_error_file(default_level: &str, errors: Option<std::fs::File>) {
     let filter = std::env::var("VICTORY_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
         .and_then(|v| EnvFilter::try_new(v).ok())
         .unwrap_or_else(|| EnvFilter::new(default_level));
+    let console = tracing_subscriber::fmt::layer()
+        .with_ansi(errors.is_none())
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .with_filter(filter);
+    // Keep errors and warnings even if the regular output filter hides their targets.
+    let errors = errors.map(|file| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(file)
+            .with_filter(LevelFilter::WARN)
+    });
     let _ = tracing_subscriber::registry()
         .with(CAP)
-        .with(filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_target(true)
-                .with_writer(std::io::stderr),
-        )
+        .with(console)
+        .with(errors)
         .try_init();
 }

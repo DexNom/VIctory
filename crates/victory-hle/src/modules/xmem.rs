@@ -36,6 +36,12 @@ use crate::{HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
 
+fn memory_telemetry() -> bool {
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_TELEMETRY").is_some_and(|v| v == "1"));
+    *ENABLED && tracing::enabled!(target: "victory_telemetry::memory", tracing::Level::INFO)
+}
+
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
 pub(crate) fn on_wine() -> bool {
     static WINE: LazyLock<bool> = LazyLock::new(|| {
@@ -176,14 +182,27 @@ pub extern "system" fn XMemVirtualAlloc(
         }
         // SAFETY: restores this thread's error after logging.
         unsafe { SetLastError(error) };
-    } else if base.is_null() {
-        tracing::debug!(
-            size,
-            kind = format_args!("{kind:#x}"),
-            flags = format_args!("{flags:#x}"),
-            at = format_args!("{at:p}"),
-            "XMemVirtualAlloc"
-        );
+    } else {
+        if memory_telemetry() {
+            tracing::info!(
+                target: "victory_telemetry::memory",
+                pid = std::process::id(),
+                requested_bytes = size,
+                reserve = kind & MEM_RESERVE != 0,
+                commit = kind & MEM_COMMIT != 0,
+                placeholder,
+                "XMemVirtualAlloc"
+            );
+        }
+        if base.is_null() {
+            tracing::debug!(
+                size,
+                kind = format_args!("{kind:#x}"),
+                flags = format_args!("{flags:#x}"),
+                at = format_args!("{at:p}"),
+                "XMemVirtualAlloc"
+            );
+        }
     }
     at
 }
@@ -490,6 +509,16 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(number) };
     }
+    drop(physical);
+    if memory_telemetry() {
+        tracing::info!(
+            target: "victory_telemetry::memory",
+            pid = std::process::id(),
+            pages = n,
+            section_bytes = size,
+            "XMemAllocatePhysicalPages"
+        );
+    }
     1
 }
 
@@ -504,9 +533,20 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
         return 0;
     }
     let mut physical = physical();
+    let mut removed = 0;
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        removed += usize::from(physical.pages.remove(&unsafe { *pages.add(i) }).is_some());
+    }
+    drop(physical);
+    if removed != 0 && memory_telemetry() {
+        tracing::info!(
+            target: "victory_telemetry::memory",
+            pid = std::process::id(),
+            pages = removed,
+            page_bytes_removed = removed * PAGE,
+            "XMemFreePhysicalPages"
+        );
     }
     1
 }

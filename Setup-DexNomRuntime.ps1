@@ -77,10 +77,12 @@ try {
         } finally { if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } }
     }
     [IO.File]::WriteAllText($config, $game.FullName, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $InstallDir 'source-path.txt'), $PSScriptRoot, [Text.UTF8Encoding]::new($false))
 } finally { $lock.Dispose() }
 
 $launcher = Join-Path $InstallDir 'victory-play.exe'
 Write-Host "Installed DexNom RayTime in $InstallDir"
+Write-Host "Run logs will be written to $(Join-Path $PSScriptRoot 'logs')"
 [IO.Directory]::CreateDirectory($ShortcutDirectory) | Out-Null
 $shell = New-Object -ComObject WScript.Shell
 foreach ($entry in @(

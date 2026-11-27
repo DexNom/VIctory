@@ -158,7 +158,9 @@ pub fn run(
         return Ok(());
     }
     victory_loader::report_crashes();
-    victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    if std::env::var_os("VICTORY_PLAY_LAUNCHER").is_none() {
+        victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    }
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);

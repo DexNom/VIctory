@@ -523,6 +523,9 @@ fn next_batch() -> (Vec<Job>, u64) {
 
 fn finish(jobs: Vec<Job>, copied: bool) {
     for job in jobs {
+        if copied {
+            job.copy.count_transfer();
+        }
         if copied && job.finish() {
             BYTES.fetch_add(job.copy.staging.bytes, Relaxed);
             let n = COMPLETED.fetch_add(1, Relaxed) + 1;

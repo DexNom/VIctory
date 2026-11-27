@@ -22,8 +22,8 @@ The Radeon FSR Quality 4K build is our most stable tested baseline for shaders a
 
 1. Use 64-bit Windows and a current Direct3D 12 driver. The game uses mesh shaders and Shader Model 6.6. The Radeon gameplay results and known issues are listed below.
 2. Install Rust for Windows and Visual Studio Build Tools. In the Visual Studio installer, select **Desktop development with C++**, including the x64 MSVC toolset and a Windows 10 or 11 SDK. [Rust installer](https://rustup.rs/) · [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-3. Download this repository using **Code → Download ZIP**, extract the ZIP to a writable folder, and double-click **Setup.cmd**. Select the Series X game executable inside your own extracted game installation. Keep its accompanying files together. Setup downloads the pinned build dependencies, verifies the BCPack format tables, and compiles the three Windows programs locally. [Download source ZIP](https://github.com/DexNom/VIctory/archive/refs/heads/main.zip)
-4. Open **DexNom RayTime** from the Windows Start menu. Use a controller for the game's first-time setup. The launcher and your local data are in `%LOCALAPPDATA%\DexNom Runtime`. Saves are in `state`, shader caches in `cache`, and per-run diagnostics in `logs`. The file `logs\latest.txt` points to the latest game log.
+3. Download this repository using **Code → Download ZIP**, extract the ZIP to a writable folder, and double-click **Setup.cmd**. Select the Series X game executable inside your own extracted game installation. Keep its accompanying files together. Setup downloads the pinned build dependencies, verifies the BCPack format tables, and compiles the three Windows programs locally. [Download source ZIP](https://github.com/jbdc1/VIctory/archive/refs/heads/main.zip)
+4. Open **DexNom RayTime** from the Windows Start menu. Use a controller for the game's first-time setup. The launcher and local data are in `%LOCALAPPDATA%\DexNom Runtime`. Saves are in `state` and shader caches are in `cache`. To record a session, follow [Run with logging](#run-with-logging).
 
 To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** again. It reuses the saved game path and the same save directory. To select a different installation, pass its executable path to Setup from PowerShell:
 
@@ -34,6 +34,38 @@ To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** 
 To warm the shader cache, open `victory-warm.exe` in the installed runtime directory. The log lists translated and refused shaders. Graphics pipelines also depend on draw state encountered during play. If you see a missing `VCRUNTIME140.dll` error, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 
 For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
+
+### Run with logging
+
+After running `Setup.cmd`, open PowerShell and launch the game with `--telemetry` to record performance, warnings and errors.
+
+```powershell
+& "$env:LOCALAPPDATA\DexNom Runtime\victory-play.exe" --telemetry
+```
+
+To also record the runtime's full console output, use both flags.
+
+```powershell
+& "$env:LOCALAPPDATA\DexNom Runtime\victory-play.exe" --telemetry --telemetry-full-log
+```
+
+Open the `logs` folder in the copy of the project where you ran Setup. Each session's files begin with its local start date and time, followed by the launcher PID. For example, `2026-11-26_18-34-43-904_27312_performance.txt`. Sort by name to group files from the same session. `logs\latest.txt` contains the path to the latest session log.
+
+Setup records the source checkout in the installation. If you move the checkout, run Setup from its new location to update the path. Portable installs without a source checkout use `logs` next to the launcher.
+
+The FPS overlay adds RAM read, RAM write, VRAM read and VRAM write rates in MiB/s. These rates measure transfers the renderer tracks. RAM counts buffer and texture reads from title memory and writes back to it. VRAM counts tracked uploads to host textures and GPU-local buffers and readbacks from them. Texture copy estimates include footprint padding. For integrated adapters or WARP, host textures can live in system RAM. Full memory-bus activity and general CPU or shader loads and stores require hardware profiling.
+
+The graph at the bottom of the overlay plots up to 120 frame intervals in milliseconds across the panel, with the newest frame on the right. Its vertical scale accommodates spikes in the visible history.
+
+- `*_performance.txt` shows the session's time-weighted means and peak sample rates with UTC timestamps and process IDs. The averages cover completed frame measurement windows. The file updates during longer sessions and on exit, including after a runtime crash.
+- `*_errors.txt` records the session's warnings, errors, crash reports and exit status. The runtime's warning and error output goes to this file independently of the regular log filter. This includes warnings from shader translation and pipeline creation.
+- `*_run.log` and `*_run.csv` can be matched by process ID and UTC time. The CSV records CPU, physical RAM, private commit and cumulative process I/O once a second, including during startup and stalls. Its timestamps use Unix time in milliseconds. Process I/O can include more than disk traffic. A blank cell represents an unavailable measurement. On machines with multiple CPU groups, system CPU covers the launcher's processor group and process CPU is normalized to all active logical processors. Process samples follow the runtime started by the launcher.
+- Filter for `victory_telemetry::memory` to see successful XMem virtual reservations and commits, physical-page allocation and removal, and graphics backing allocations and releases of at least 1 MiB in system RAM. A reservation is address space. Removing a page from the XMem table can leave it alive through an existing mapping. Backing allocations may overlap with requests reported by XMem.
+- Filter for `victory_telemetry::gpu` to see DXGI local and nonlocal memory usage and budgets, graphics buffer allocation requests, live host textures, frame times and work done by the renderer. Transfer counters cover the layer's tracked buffer copies, texture reads from title RAM, indexed texture uploads and writes back to title RAM. Measuring all CPU or shader memory accesses and physical GPU memory bandwidth requires hardware profiling.
+
+- `*_flog.txt` captures the hidden runtime's stdout and stderr at the active `VICTORY_LOG` or `RUST_LOG` level when `--telemetry-full-log` is enabled. The compact session log records its final byte size. At an average of 200 bytes per line, 10 lines per second take about 7 MB/hour, 100 take about 72 MB/hour, and 1,000 take about 720 MB/hour.
+
+Launching the game without `--telemetry` creates no runtime log files. Shader preload uses its own log.
 
 ## FSR Quality 4K baseline
 
@@ -65,7 +97,7 @@ $env:VICTORY_AMBIENT_FALLBACK = '1'
 
 For a separate partial RT experiment, replace `--no-rt` with `--rt-static-bvh` and keep the FSR preset off. This skips rebuilding the acceleration structure for dynamic geometry and still traces rays through the prebuilt world structure. Ray traversal and lighting resolve can still be expensive, and moving objects may have incomplete shadows or reflections. Baked lighting or a probe-based indirect-light fallback is future work. [Static BVH mode](crates/victory-gpu/src/pipeline/ray_tracing.rs)
 
-Keep the scene and resolution the same when comparing the two modes. Include the GPU actually used, its driver, frame times, and any lighting issues. The file `logs\latest.txt` points to the run log, which records the requested ray-tracing mode.
+Keep the scene and resolution the same when comparing the two modes. Include the GPU actually used, its driver, frame times, and any lighting issues. With `--telemetry`, `logs\latest.txt` points to the session log, which records the requested ray-tracing mode.
 
 ## Things to Be Done
 
