@@ -23,6 +23,12 @@ jobs:
     steps:
       # Pinned by commit; the tag is beside it. actions/checkout v5.0.0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Installer regression tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./tests/Test-Setup-DexNomRuntime.ps1
+      - name: Installer regression tests (PowerShell 7)
+        shell: pwsh
+        run: ./tests/Test-Setup-DexNomRuntime.ps1
       - name: Prepare verified BCPack format tables
         shell: pwsh
         run: ./Initialize-FormatTables.ps1
