@@ -84,6 +84,8 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
+            "VICTORY_FIRST_HALF",
+            "VICTORY_FIRSTLANE_OWN",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
         ] {
