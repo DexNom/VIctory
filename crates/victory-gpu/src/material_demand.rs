@@ -26,8 +26,63 @@ pub(crate) fn enabled() -> bool {
     })
 }
 
+pub(crate) fn trace_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    cfg!(feature = "diagnostics")
+        && *TRACE.get_or_init(|| {
+            std::env::var_os("VICTORY_MATERIAL_TEXTURE_TRACE").is_some_and(|v| v == "1")
+        })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Capture {
+    pub(crate) shader: &'static str,
+    pub(crate) frame: u64,
+    pub(crate) list: usize,
+}
+
+pub(crate) fn capture_for(hash: &str, list: &HostList) -> Option<Capture> {
+    #[cfg(feature = "diagnostics")]
+    if trace_enabled() {
+        let shader = match hash {
+            "a402e650d0acbc92" => "a402e650d0acbc92",
+            "b15ba4896d650511" => "b15ba4896d650511",
+            _ => return None,
+        };
+        return crate::capture::recording_listed().then(|| Capture {
+            shader,
+            frame: crate::queue::presented() + 1,
+            list: std::ptr::from_ref(list) as usize,
+        });
+    }
+    let _ = (hash, list);
+    None
+}
+
+// A listed frame can contain thousands of commands, even when the concurrent
+// readbacks finish before the recorder reaches the end of that frame.
+fn capture_budget(frame: u64) -> bool {
+    static BUDGET: Mutex<(u64, usize)> = Mutex::new((0, 0));
+    let mut budget = BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+    if frame < budget.0 {
+        return false;
+    }
+    if frame != budget.0 {
+        *budget = (frame, 0);
+    }
+    if budget.1 == LIMIT {
+        return false;
+    }
+    budget.1 += 1;
+    true
+}
+
 pub(crate) fn fields(hash: &str) -> Option<&'static [u32]> {
     match hash {
+        // The deferred character shaders read heap indices from the same
+        // material buffer; the packed variant also samples fields 28 and 32.
+        "a402e650d0acbc92" => Some(&[0, 4, 8, 12, 16, 20, 24]),
+        "b15ba4896d650511" => Some(&[0, 4, 8, 12, 16, 20, 24, 28, 32]),
         "d9fcb8a4425fc59b" | "43fc2af1f70920f1" => Some(&[0, 4, 8]),
         "271a87c54ac648a5" => Some(&[0, 4, 12, 16]),
         "d2e683031b764939" => Some(&[0, 4, 8, 16]),
@@ -56,7 +111,51 @@ pub(crate) struct Mark {
 }
 
 #[derive(Default)]
-pub(crate) struct Mailbox(Arc<Mutex<Vec<Observation>>>);
+pub(crate) struct Mailbox {
+    observations: Arc<Mutex<Vec<Observation>>>,
+    #[cfg(feature = "diagnostics")]
+    uploads: Mutex<UploadWatch>,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct UploadWatch(Vec<WatchedUpload>);
+
+#[cfg(feature = "diagnostics")]
+struct WatchedUpload {
+    slot: u32,
+    write: u64,
+    expires: u64,
+    remaining: u8,
+}
+
+#[cfg(feature = "diagnostics")]
+impl UploadWatch {
+    const SLOTS: usize = LIMIT * 9;
+    const FRAMES: u64 = 256;
+    const ATTEMPTS: u8 = 8;
+
+    fn watch(&mut self, slot: u32, write: u64, frame: u64) {
+        self.0.retain(|entry| entry.expires >= frame);
+        let expires = frame.saturating_add(Self::FRAMES);
+        if let Some(entry) = self.0.iter_mut().find(|entry| (entry.slot, entry.write) == (slot, write)) {
+            entry.expires = expires;
+        } else if self.0.len() < Self::SLOTS {
+            self.0.push(WatchedUpload { slot, write, expires, remaining: Self::ATTEMPTS });
+        }
+    }
+
+    fn record(&mut self, slot: u32, write: u64, frame: u64) -> bool {
+        let Some(entry) = self.0.iter_mut().find(|entry| (entry.slot, entry.write) == (slot, write)) else {
+            return false;
+        };
+        if frame > entry.expires || entry.remaining == 0 {
+            return false;
+        }
+        entry.remaining -= 1;
+        true
+    }
+}
 
 struct Observation {
     source_slot: u32,
@@ -65,6 +164,20 @@ struct Observation {
     frame: u64,
     stamp: Mark,
     slots: Vec<u32>,
+    capture: Option<CapturedMaterial>,
+}
+
+struct CapturedMaterial {
+    draw: Capture,
+    record: u32,
+    fields: Vec<(u32, u32)>,
+}
+
+pub(crate) struct Request {
+    pub(crate) record: u32,
+    pub(crate) fields: &'static [u32],
+    pub(crate) prioritize: bool,
+    pub(crate) capture: Option<Capture>,
 }
 
 type RecordKey = (usize, u32, &'static [u32]);
@@ -174,7 +287,7 @@ fn indices(words: &[u32], fields: &[u32], count: u32) -> Vec<u32> {
     for field in fields {
         if let Some(&word) = words.get((field / 4) as usize) {
             // The guest shifts the packed index left five bits in a 32-bit register.
-            let slot = word.wrapping_shl(5) >> 5;
+            let slot = heap_slot(word);
             if slot < count && !slots.contains(&slot) {
                 slots.push(slot);
             }
@@ -183,13 +296,17 @@ fn indices(words: &[u32], fields: &[u32], count: u32) -> Vec<u32> {
     slots
 }
 
+fn heap_slot(word: u32) -> u32 {
+    word.wrapping_shl(5) >> 5
+}
+
 pub(crate) fn record(
     list: &HostList,
     heap: &Heap,
     table: u64,
-    record: u32,
-    fields: &'static [u32],
+    request: Request,
 ) {
+    let Request { record, fields, prioritize, capture } = request;
     let Some(handle) = table.checked_add(TABLE_DWORDS * 4) else {
         return;
     };
@@ -221,6 +338,10 @@ pub(crate) fn record(
     {
         return;
     }
+    let capture = capture.filter(|draw| capture_budget(draw.frame));
+    if !prioritize && capture.is_none() {
+        return;
+    }
     let Some(gpu) = crate::host::host() else {
         return;
     };
@@ -228,7 +349,7 @@ pub(crate) fn record(
         return;
     };
     let shadow = Arc::downgrade(&source);
-    let mailbox = Arc::downgrade(&host.material_demand.0);
+    let mailbox = Arc::downgrade(&host.material_demand.observations);
     let count = host.count();
     // SAFETY: the verified range is in the title buffer in use as an SRV.
     // Like the title's indirect-record reads, its buffer promotes to COPY_SOURCE.
@@ -239,7 +360,9 @@ pub(crate) fn record(
     }
     list.keep(&back);
     list.keep(&source.buffer);
-    RECORDED.fetch_add(1, Ordering::Relaxed);
+    if prioritize {
+        RECORDED.fetch_add(1, Ordering::Relaxed);
+    }
     list.defer_after(move || {
         if !ticket.finish() || frame.abs_diff(crate::frame::current()) > MAX_AGE {
             return;
@@ -261,12 +384,23 @@ pub(crate) fn record(
             if back.Map(0, Some(&read), Some(&mut data)).is_err() {
                 return;
             }
-            let slots = if data.is_null() {
-                Vec::new()
+            let words = if data.is_null() {
+                &[]
             } else {
-                let words = std::slice::from_raw_parts(data.cast::<u32>(), bytes / 4);
-                indices(words, fields, count)
+                std::slice::from_raw_parts(data.cast::<u32>(), bytes / 4)
             };
+            let slots = if prioritize { indices(words, fields, count) } else { Vec::new() };
+            let captured = capture.map(|draw| CapturedMaterial {
+                draw,
+                record,
+                fields: fields
+                    .iter()
+                    .filter_map(|&offset| {
+                        let word = *words.get((offset / 4) as usize)?;
+                        Some((offset, heap_slot(word)))
+                    })
+                    .collect(),
+            });
             back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
             if !slots.is_empty() {
                 let n = OBSERVED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -279,6 +413,8 @@ pub(crate) fn record(
                         "GPU material records read for texture scheduling"
                     );
                 }
+            }
+            if !slots.is_empty() || captured.is_some() {
                 observations.push(Observation {
                     source_slot: slot,
                     view: view.clone(),
@@ -286,6 +422,7 @@ pub(crate) fn record(
                     stamp,
                     frame,
                     slots,
+                    capture: captured,
                 });
             }
         }
@@ -293,21 +430,43 @@ pub(crate) fn record(
 }
 
 impl Mailbox {
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn captured_fields(&self) -> Vec<(u32, u32)> {
+        let observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+        observations
+            .iter()
+            .find_map(|obs| obs.capture.as_ref())
+            .map(|capture| capture.fields.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn upload_outcome(&self, slot: u32, write: u64, frame: u64, outcome: &'static str) {
+        if trace_enabled()
+            && self.uploads.lock().unwrap_or_else(|e| e.into_inner()).record(slot, write, frame)
+        {
+            tracing::info!(slot, write, frame, outcome, "material texture upload outcome");
+        }
+    }
+
     pub(crate) fn take(&self, heap: &Heap, host: &HostHeap, frame: u64) -> Vec<(u32, u64, bool)> {
-        let observations = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+        let observations = std::mem::take(&mut *self.observations.lock().unwrap_or_else(|e| e.into_inner()));
         let mut priority = Vec::new();
         for obs in observations {
-            if frame.abs_diff(obs.frame) > MAX_AGE
-                || heap
+            let current = frame.abs_diff(obs.frame) <= MAX_AGE
+                && heap
                     .handle(obs.source_slot)
                     .and_then(crate::descriptor::checked_view)
                     .as_ref()
-                    != Some(&obs.view)
-                || !obs
+                    == Some(&obs.view)
+                && obs
                     .shadow
                     .upgrade()
-                    .is_some_and(|s| host.shows(obs.source_slot, &s.buffer) == Some(true))
-            {
+                    .is_some_and(|s| host.shows(obs.source_slot, &s.buffer) == Some(true));
+            if let Some(capture) = &obs.capture {
+                capture.report(heap, host, obs.stamp, frame, current);
+            }
+            if !current {
                 continue;
             }
             for slot in obs.slots {
@@ -321,8 +480,42 @@ impl Mailbox {
                     priority.push(item);
                 }
             }
+            // This observes the queue after demand has had its normal turn.
+            // Trace-only recording never enrols, promotes or reorders a slot.
+            #[cfg(feature = "diagnostics")]
+            if let Some(capture) = &obs.capture {
+                for &(offset, slot) in &capture.fields {
+                    if let Some(write) = host.material_queued_write(heap, slot, obs.stamp) {
+                        self.uploads.lock().unwrap_or_else(|e| e.into_inner()).watch(slot, write, frame);
+                        tracing::info!(shader = capture.draw.shader, draw_frame = capture.draw.frame,
+                            record = capture.record, offset, slot, write, frame,
+                            "watch material texture upload");
+                    }
+                }
+            }
         }
         priority
+    }
+}
+
+impl CapturedMaterial {
+    fn report(&self, heap: &Heap, host: &HostHeap, stamp: Mark, frame: u64, source_current: bool) {
+        let Capture { shader, frame: draw_frame, list } = self.draw;
+        tracing::info!(
+            shader, draw_frame, host_list = format_args!("{list:#x}"),
+            record = self.record, observed_frame = frame, source_current,
+            fields = ?self.fields, "material texture indices read back"
+        );
+        #[cfg(feature = "diagnostics")]
+        if source_current {
+            for &(offset, slot) in &self.fields {
+                let state = host.material_slot_state(heap, slot, stamp, frame);
+                tracing::info!(shader, draw_frame, host_list = format_args!("{list:#x}"),
+                    record = self.record, observed_frame = frame, offset, slot, %state,
+                    "material texture descriptor observed");
+            }
+        }
+        let _ = (heap, host, stamp);
     }
 }
 
@@ -391,6 +584,41 @@ mod tests {
         assert_eq!(byte_range(12, fields, 35), None);
         assert_eq!(byte_range(u32::MAX - 3, fields, u64::MAX), None);
         assert_eq!(byte_range(3, fields, 36), None);
+    }
+
+    #[test]
+    fn character_material_sampling_covers_both_record_layouts() {
+        let words = [11, 12, 13, 14, 15, 16, 17, 0xf8000012, 19];
+        let regular = fields("a402e650d0acbc92").expect("deferred character material");
+        let packed = fields("b15ba4896d650511").expect("packed deferred character material");
+
+        assert_eq!(indices(&words, regular, 20), [11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(indices(&words, packed, 20), [11, 12, 13, 14, 15, 16, 17, 18, 19]);
+        assert_eq!(byte_range(16, regular, 44), Some((16, 28)));
+        assert_eq!(byte_range(16, packed, 44), None);
+        assert_eq!(byte_range(16, packed, 52), Some((16, 36)));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn material_upload_watch_matches_the_write_and_bounds_repeated_logs() {
+        let mut watch = UploadWatch::default();
+        watch.watch(7, 10, 4);
+        assert!(!watch.record(7, 11, 4));
+        assert!(!watch.record(8, 10, 4));
+        for _ in 0..UploadWatch::ATTEMPTS {
+            assert!(watch.record(7, 10, 4));
+        }
+        watch.watch(7, 10, 5);
+        assert!(!watch.record(7, 10, 5));
+        watch.watch(7, 11, 5);
+        assert!(watch.record(7, 11, 5));
+        let late = 6 + UploadWatch::FRAMES;
+        assert!(!watch.record(7, 11, late));
+        for slot in 0..=UploadWatch::SLOTS as u32 {
+            watch.watch(slot, 12, late);
+        }
+        assert_eq!(watch.0.len(), UploadWatch::SLOTS);
     }
 
     #[test]

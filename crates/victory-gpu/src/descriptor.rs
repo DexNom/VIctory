@@ -1146,8 +1146,9 @@ mod tests {
         put(3, addr + small, 0); // touches the nominal interval, starts after the visible mips
         let revived = host.demand_material_texture(heap, 1, stamp, frame).unwrap();
         assert!(host.texture_slots_due(frame, 8).0.contains(&revived));
-        assert!(host.material_upload_allowed(1, revived.1, addr, small, small));
-        assert!(!host.material_upload_allowed(1, revived.1, addr, small, small - 1));
+        assert_eq!(host.material_upload_refusal(1, revived.1, addr, small, small), None);
+        assert_eq!(host.material_upload_refusal(1, revived.1 + 1, addr, small, small), Some("stale_write"));
+        assert_eq!(host.material_upload_refusal(1, revived.1, addr, small, small - 1), Some("pages_unavailable"));
         let srv = host.mirror(1, heap.handle(1).unwrap(), true).unwrap();
         let live = host::placed_texture(&srv).unwrap();
         let View::Shader(texture, _) = live.view else { panic!("no sampled texture") };
@@ -1212,8 +1213,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn material_demand_follows_gpu_record_and_rejects_reused_texture_memory() {
+        material_record_on_gpu(false);
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn material_trace_reads_packed_indices_without_scheduling_uploads() {
+        material_record_on_gpu(true);
+    }
+
+    #[cfg(windows)]
+    fn material_record_on_gpu(trace: bool) {
         use windows::Win32::Graphics::Direct3D12::*;
-        let Some(device) = crate::host::host() else { return };
+        let Some(device) = crate::host::host() else {
+            assert!(!trace, "trace fixture requires a D3D12 device");
+            return;
+        };
         let null = std::ptr::null();
         let mut object = null;
         assert_eq!(create(HeapDesc { kind: 0, count: 128, flags: 1, nodes: 0 }, Placement { address: 0, size: 0 }, &mut object), S_OK);
@@ -1267,19 +1282,54 @@ mod tests {
             create_placed_srv(null, &shape, &srv, heap.handle(8).unwrap());
             create_cbv(null, &[0x400, 6, 256, 0], heap.handle(8).unwrap());
         }
-        let words = [0xf800_0003u32, 0, 7, 0, 5, 6];
+        let mut words = [0xf800_0003u32, 0, 7, 0, 5, 6, 0, 0, 0];
+        let fields = if trace {
+            words[4..6].fill(0);
+            words[7..9].copy_from_slice(&[5, 6]);
+            crate::material_demand::fields("b15ba4896d650511").unwrap()
+        } else {
+            &[0, 16, 20][..]
+        };
         let bytes = std::mem::size_of_val(&words) as u64;
         let (upload, mapped) = device.upload_buffer(bytes).unwrap();
         // SAFETY: copy the full upload allocation into the owned material range.
-        // CPU memory for all six words stays zero; the selected values exist only on the GPU.
+        // CPU memory for these words stays zero; the selected values exist only on the GPU.
         unsafe {
             std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), mapped, bytes as usize);
             list.list.CopyBufferRegion(&shadow.buffer, shadow.offset(address), &upload, 0, bytes);
             list.list.ResourceBarrier(&[crate::host::transition(&shadow.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         }
-        crate::material_demand::record(&list, heap, heap.start, 0, &[0, 16, 20]);
+        crate::material_demand::record(&list, heap, heap.start, crate::material_demand::Request {
+            record: 0,
+            fields,
+            prioritize: !trace,
+            capture: trace.then_some(crate::material_demand::Capture {
+                shader: "b15ba4896d650511",
+                frame: frame + 1,
+                list: std::ptr::from_ref(&list) as usize,
+            }),
+        });
+        #[cfg(feature = "diagnostics")]
+        let trace_stamp = host.material_write_stamp();
         list.close();
         device.execute(&[&list]);
+        #[cfg(feature = "diagnostics")]
+        if trace {
+            let fields = host.material_demand.captured_fields();
+            assert_eq!(fields, [
+                (0, 3), (4, 0), (8, 7), (12, 0), (16, 0), (20, 0), (24, 0), (28, 5), (32, 6),
+            ]);
+            assert_eq!(record_bytes, [0; 8]);
+            assert!(host.material_slot_state(heap, 5, trace_stamp, frame)
+                .contains("title_texture=true native_resource=false"));
+            create_cbv(null, &[0x400, 6, 256, 0], heap.handle(6).unwrap());
+            assert_eq!(host.material_slot_state(heap, 6, trace_stamp, frame), "title descriptor rewritten");
+            let due = host.texture_slots_due(frame, 128).0;
+            assert!(host.material_demand.take(heap, host, frame).is_empty());
+            assert_eq!(host.texture_slots_due(frame, 128).0, due);
+            assert_eq!(release(object), 0);
+            return;
+        }
         let mut due: Vec<_> = (32..48).map(|n| (n,1,false)).collect();
         due.push(write);
         let wanted = host.material_demand.take(heap, host, frame);

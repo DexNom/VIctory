@@ -1339,6 +1339,55 @@ impl HostHeap {
         }
     }
 
+    /// Observe a sampled descriptor at readback time. A title rewrite
+    /// invalidates comparison with the command that selected the slot.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn material_slot_state(
+        &self,
+        heap: &super::Heap,
+        index: u32,
+        stamp: crate::material_demand::Mark,
+        frame: u64,
+    ) -> String {
+        let Some(epoch) = self.material_epochs.get().and_then(|e| e.get(index as usize)) else {
+            return "outside host view heap".into();
+        };
+        let unchanged = || epoch.load(std::sync::atomic::Ordering::Relaxed) <= stamp.descriptor;
+        if !unchanged() {
+            return "title descriptor rewritten".into();
+        }
+        let title = heap.handle(index).and_then(super::checked_view);
+        let native = self
+            .kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(Option::is_some);
+        let host = self.describe_slot(index).unwrap_or_else(|| "unavailable".into());
+        let queue = self.texture_slot_state(index, frame, title.as_ref());
+        if unchanged() {
+            format!(
+                "title_texture={} native_resource={native} host=[{host}] queue=[{queue}]",
+                title.as_ref().is_some_and(is_texture_view),
+            )
+        } else {
+            "title descriptor rewritten".into()
+        }
+    }
+
+    /// A sampled generation still owned by the texture upload queue.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn material_queued_write(&self, heap: &super::Heap, index: u32, stamp: crate::material_demand::Mark) -> Option<u64> {
+        let epoch = self.material_epochs.get()?.get(index as usize)?;
+        let unchanged = || epoch.load(std::sync::atomic::Ordering::Relaxed) <= stamp.descriptor;
+        if !unchanged() || !heap.handle(index).and_then(super::checked_view).as_ref().is_some_and(is_texture_view) {
+            return None;
+        }
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let queued = textures.slots.get(&index)?;
+        (unchanged() && (queued.write <= stamp.write || queued.recovered)).then_some(queued.write)
+    }
+
     /// A shader-selected material field can re-enrol its current null block-compressed SRV.
     /// Never supersede another allocation, or upload title bytes over a GPU writer.
     pub(crate) fn demand_material_texture(&self, heap: &super::Heap, index: u32, stamp: crate::material_demand::Mark, frame: u64) -> Option<(u32, u64, bool)> {
@@ -1385,14 +1434,21 @@ impl HostHeap {
 
     /// Between observation and upload the queue can be delayed by budgeting, a writable
     /// resource can appear over the same pages, or streaming can remove a mip.
-    pub(crate) fn material_upload_allowed(&self, index: u32, write: u64, start: u64, len: u64, mapped: u64) -> bool {
+    pub(crate) fn material_upload_refusal(&self, index: u32, write: u64, start: u64, len: u64, mapped: u64) -> Option<&'static str> {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(waiting) = textures.slots.get(&index).filter(|w| w.write == write) else { return false };
-        if !waiting.recovered { return false; }
+        if !textures.slots.get(&index).is_some_and(|w| w.write == write && w.recovered) {
+            return Some("stale_write");
+        }
         drop(textures);
-        start.checked_add(len).is_some_and(|end| mapped == len
-            && !crate::resource::writable_texture_overlaps(start, end)
-            && !crate::texture::host_written_overlaps(start, end))
+        let Some(end) = start.checked_add(len) else {
+            return Some("invalid_texture_span");
+        };
+        if mapped != len {
+            return Some("pages_unavailable");
+        }
+        (crate::resource::writable_texture_overlaps(start, end)
+            || crate::texture::host_written_overlaps(start, end))
+            .then_some("recovery_conflicts_with_gpu_writes")
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -2483,6 +2539,12 @@ impl HostHeap {
         queued_write: Option<u64>,
         allow: impl FnOnce(&View, bool) -> bool,
     ) -> Result<Option<View>, ()> {
+        #[cfg(feature = "diagnostics")]
+        let trace = |outcome| {
+            if let Some(write) = queued_write {
+                self.material_demand.upload_outcome(index, write, crate::frame::current(), outcome);
+            }
+        };
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2495,10 +2557,14 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
+            #[cfg(feature = "diagnostics")]
+            trace("outside_host_heap");
             return Ok(None);
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         if queued_write.is_some_and(|write| !self.queued_write_current(index, write)) {
+            #[cfg(feature = "diagnostics")]
+            trace("stale_write");
             return Ok(None);
         }
         if !for_draw && let Some(epochs) = self.material_epochs.get() {
@@ -2524,6 +2590,8 @@ impl HostHeap {
                 let _ = self.note_buffer(index, None, false);
             }
             self.update_sparse(index, None, None, false);
+            #[cfg(feature = "diagnostics")]
+            trace("invalid_title_view");
             return Ok(None);
         };
         if queued_write.is_some() && let View::Placed(false, resource, desc) = &view {
@@ -2536,6 +2604,8 @@ impl HostHeap {
                 let span = placed.bytes(resource, crate::resource::first_mip(desc))
                     .map(|bytes| (start, start.saturating_add(bytes)));
                 if span.is_none() || placed.by_slot.get(&index) != span.as_ref() {
+                    #[cfg(feature = "diagnostics")]
+                    trace("displaced_view");
                     return Ok(None);
                 }
             }
@@ -2552,6 +2622,8 @@ impl HostHeap {
         });
         let current = (made[index as usize] == key && !changed_owner) || pending;
         if !allow(&view, current) {
+            #[cfg(feature = "diagnostics")]
+            trace("vram_budget");
             return Err(());
         }
         if !current {
@@ -2620,6 +2692,15 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+        }
+        #[cfg(feature = "diagnostics")]
+        if queued_write.is_some() && crate::material_demand::trace_enabled() && is_texture_view(&view) {
+            let native = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some();
+            trace(match (current, native) {
+                (false, true) => "srv_installed",
+                (true, true) => "srv_already_present",
+                (_, false) => "srv_unavailable",
+            });
         }
         Ok(Some(view))
     }

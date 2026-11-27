@@ -1269,7 +1269,11 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                if !compute && crate::material_demand::enabled()
+                let capture = (!compute)
+                    .then(|| crate::material_demand::capture_for(&stage.shader.hash, list))
+                    .flatten();
+                let demand = !compute && crate::material_demand::enabled();
+                if (demand || capture.is_some())
                     && let Some(fields) = crate::material_demand::fields(&stage.shader.hash)
                     && t.host.user_data.iter().any(|u| u.index == 8 && u.root == RootType::Table && u.slot == 0)
                     && let Some(u) = t.host.user_data.iter().find(|u| u.index == 14 && u.root == RootType::Constants)
@@ -1280,9 +1284,16 @@ impl State {
                     && !heap.samplers()
                     && let Some(&bound) = values.get(8)
                     && Some(u64::from(bound)) == table.checked_sub(heap.start)
-                    && crate::material_demand::wants(heap, record, fields)
                 {
-                    crate::material_demand::record(list, heap, *table, record, fields);
+                    let prioritize = demand && crate::material_demand::wants(heap, record, fields);
+                    if prioritize || capture.is_some() {
+                        crate::material_demand::record(
+                            list,
+                            heap,
+                            *table,
+                            crate::material_demand::Request { record, fields, prioritize, capture },
+                        );
+                    }
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -1983,7 +1994,8 @@ impl State {
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[2].store(waiting, Ordering::Relaxed);
         }
-        let wanted = crate::material_demand::enabled().then(|| host.material_demand.take(heap, host, frame));
+        let wanted = (crate::material_demand::enabled() || crate::material_demand::trace_enabled())
+            .then(|| host.material_demand.take(heap, host, frame));
         let (mut due, census) = host.texture_slots_due(frame, 4096);
         if let Some(wanted) = wanted {
             crate::material_demand::promote(&mut due, &wanted, frame);
@@ -2054,7 +2066,11 @@ impl State {
         };
         let began = std::time::Instant::now();
         for (index, write, recovered) in due {
+            #[cfg(feature = "diagnostics")]
+            let trace = |outcome| host.material_demand.upload_outcome(index, write, frame, outcome);
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+                #[cfg(feature = "diagnostics")]
+                trace("staging_pass_limit");
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -2075,11 +2091,17 @@ impl State {
                 // another texture's.
                 let len = crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
-                if recovered && !host.material_upload_allowed(index, write, address, len, mapped) {
+                if recovered && let Some(reason) = host.material_upload_refusal(index, write, address, len, mapped) {
+                    #[cfg(feature = "diagnostics")]
+                    trace(reason);
+                    #[cfg(not(feature = "diagnostics"))]
+                    let _ = reason;
                     host.texture_slot_done(index, write, None);
                     continue;
                 }
                 if mapped == 0 {
+                    #[cfg(feature = "diagnostics")]
+                    trace("pages_unavailable");
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index, write);
@@ -2088,6 +2110,8 @@ impl State {
                 }
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
+                        #[cfg(feature = "diagnostics")]
+                        trace("no_more_pages_mapped");
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
                         host.texture_slot_later(index, write, frame, most);
                         continue;
@@ -2123,10 +2147,17 @@ impl State {
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
             let Some(handle) = heap.handle(index) else {
+                #[cfg(feature = "diagnostics")]
+                trace("missing_title_slot");
                 host.texture_slot_done(index, write, None);
                 continue;
             };
-            let upload = (room || reupload_when_full())
+            let can_mirror = room || reupload_when_full();
+            #[cfg(feature = "diagnostics")]
+            if !can_mirror {
+                trace("vram_budget");
+            }
+            let upload = can_mirror
                 .then(|| host.mirror_queued(index, handle, write, !room))
                 .and_then(Result::ok);
             let Some((view, _residence)) = upload else {
