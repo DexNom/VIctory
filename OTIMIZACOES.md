@@ -678,6 +678,40 @@ nem um 9800X3D faz neste runtime. Para referência, a máquina dos docs
 (i7-14700KF + RTX 4070 12 GB + 32 GB) roda este mesmo título a **2–5 fps**.
 Aqui está em **10,8–11,4**.
 
+### O water light, portado do `trustno1-coder/VIctory-NVIDIA` (27/11)
+
+Dois programas de compute do título — `water_shading:CS_TransmissionVolumetrics_Tiled`
+e `_Tiled_LocalLights`, hashes `5dc3b25986622949` e `6f225b641c5b0708` — são de
+**uma wave de 64 lanes por grupo**. Numa placa de 32 lanes (toda GeForce) eles
+só têm a forma wave-wide, e nessa forma deixam **tiles inteiros do mar escuros**
+(em volta de barcos, na beira, sob pontes) e custam **~15 ms de GPU por quadro**.
+
+O fork NVIDIA os deixa de fora. Portado para `pipeline/make.rs` (`left_out`),
+com a mesma licença (GPL-3.0-or-later) e o crédito no comentário. O log confirma
+no nosso dump:
+
+```
+a pipeline of the water's tiled light was asked for asked=false wave=32 hashes=["5dc3b25986622949"]
+the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out wave=32
+a pipeline of the water's tiled light was asked for asked=false wave=32 hashes=["6f225b641c5b0708"]
+```
+
+**O que muda na imagem:** a água perde a luz da própria profundidade — fica mais
+escura e mais azul — e os blocos escuros somem. `VICTORY_WATER_LIGHT=1` religa
+os dois programas (e os blocos).
+
+**O que muda no número, medido (soak17, `balanced`):**
+
+| | soak16 (sem) | soak17 (com) |
+|---|---|---|
+| fps médio | 11,36 | 11,34 |
+| ms/frame | 90,0 | 88,6 |
+| GPU por quadro | 39,6–50,1 ms | **28,3–36,5 ms** |
+
+**A GPU caiu ~10 ms e o fps não mudou** — porque o quadro é limitado pela CPU
+(`preparing` 42–48 ms). É ganho de folga na placa, não de relógio. Guardado
+porque a placa agora tem margem para quando o caminho de submissão for atacado.
+
 ## Limites conhecidos
 
 - **16 GB é o piso, não o recomendado.** O processo chega a 22 GB privados; o

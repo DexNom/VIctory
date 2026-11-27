@@ -137,6 +137,13 @@ alavanca de desempenho.
 de 3 para 5 levou o quadro de 115,5 ms para **90,0 ms** (soak15/soak16), sem
 mexer em imagem nenhuma. É o padrão do perfil desde 27/11.
 
+**Água sem blocos escuros:** dois programas de luz da água do título
+(`5dc3b25986622949`, `6f225b641c5b0708`) rodam em wave de 64 e numa GeForce
+(32 lanes) saem em forma wave-wide: deixam tiles do mar pretos e custam ~15 ms
+de GPU. Ficam de fora por padrão — água mais escura e azulada, blocos fora,
+GPU ~10 ms mais leve. `VICTORY_WATER_LIGHT=1` religa os dois (e os blocos).
+Portado de `trustno1-coder/VIctory-NVIDIA`.
+
 O que `balanced` corta: sombra por ray tracing, reflexo da água por SSR,
 motion blur, sombra de partícula, duas amostras de SSRO para uma, UI de 4K para
 720p, VSync, o limite de 30 quadros e o LOD de geometria de 1.0 para 0.8.

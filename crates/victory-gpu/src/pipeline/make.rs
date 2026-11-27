@@ -73,7 +73,32 @@ fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
     named(shaders, b"CS_ComputeBlendshapeMappings")
 }
 
+/// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`, GTA VI 1.0.2.1): programs of one 64-lane wave a group, which a
+/// host of 32-lane waves gets in the wave-wide form only. In that form they leave whole
+/// tiles of open water dark (around boats, along shores, under bridges) and take about
+/// 15 ms of the card a frame. Left out there, the water has no light of its own depth
+/// (darker, bluer) and no blocks; `VICTORY_WATER_LIGHT=1` runs them as before.
+/// Ported from trustno1-coder/VIctory-NVIDIA (GPL-3.0-or-later, same licence).
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    let asked = *ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"));
+    !asked && victory_shader::emit::host_settings()[0] == 32 && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if water_light_left_out(shaders) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                wave = victory_shader::emit::host_settings()[0],
+                "the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out"
+            );
+        });
+        return Some("the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out");
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
