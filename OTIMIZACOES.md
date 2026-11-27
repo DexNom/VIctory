@@ -712,6 +712,39 @@ os dois programas (e os blocos).
 (`preparing` 42–48 ms). É ganho de folga na placa, não de relógio. Guardado
 porque a placa agora tem margem para quando o caminho de submissão for atacado.
 
+### O cache de pipelines do ScarlettPort entra no nosso runtime (27/11)
+
+O que faz o ScarlettPort parecer melhor não é fps — `docs/STATUS.md:7` deles
+publica **~4 fps no prólogo** num RTX 3060, contra os nossos 11,3. É **cache
+construído**: 4,11 GB em `%LOCALAPPDATA%\ScarlettPort\cache`, com
+`host-pipelines.bin` de 358 MB, `known-shaders.bin` de 198 MB e 83.561
+pipelines no livro.
+
+A tela preta com áudio era isso: em `soak22`, **1.644 de 2.192 draws por quadro
+sem pipeline de host**, GPU 0,0 ms, 534 ms de quadro. O nosso cache tinha 1.726
+shaders de ~26.000 — o `victory shaders` nunca tinha rodado até o fim.
+
+Medido em 27/11, com o binário release desta árvore:
+
+| arquivo | teste | resultado |
+|---|---|---|
+| `known-pipelines.bin` (48 MB) | `victory warm --used --limit 20` | 20 feitas, 0 sem host pipeline, 0 ruins |
+| `known-shaders.bin` (189 MB) | o mesmo | 20 feitas (o tradutor gera o mesmo container) |
+| `host-pipelines.bin` (341 MB) | primeiros 48 bytes idênticos | carrega no `CreatePipelineLibrary` |
+| `early-pipelines.txt` (3.543) | união com o nosso (1.948) | 3.549 hashes |
+
+O `GTA6.exe` agora faz duas coisas com isso:
+
+1. `ImportScarlettCache()` no Setup: se o ScarlettPort estiver instalado, copia
+   o livro, os shaders e a biblioteca de host. Sem ele, nada muda.
+2. `--prepare` roda `victory shaders <shaders.rpf>` **antes** do `warm --used`,
+   como o "Build shaders" deles (`scarlett warm`, 25.889 shaders em 171 s).
+   Era o passo que faltava para o cache ser construído em vez de improvisado.
+
+**O que ainda falta validar:** a biblioteca de host de 341 MB numa partida. Se o
+driver recusar, o runtime abre uma vazia e o número volta ao de antes — sem
+dano, só sem o ganho.
+
 ## Limites conhecidos
 
 - **16 GB é o piso, não o recomendado.** O processo chega a 22 GB privados; o
