@@ -114,8 +114,33 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     }
     let mut out = vec![0u8; bits.div_ceil(8)];
     let mut cursor = Cursor { data, pos: start };
-    for i in 0..bits {
-        out[i / 8] |= (cursor.bit()? as u8) << (7 - i % 8);
+    let (whole, tail) = out.split_at_mut(bits / 8);
+    let mut remaining = whole;
+    while !remaining.is_empty() {
+        let offset = cursor.pos % PACKET_BITS;
+        let count = remaining.len().min((PACKET_BITS - offset) / 8);
+        if offset == 0 || count == 0 {
+            // A byte that begins at or straddles a packet boundary must follow its skip.
+            remaining[0] = cursor.bits(8)? as u8;
+            remaining = &mut remaining[1..];
+            continue;
+        }
+        let (dst, rest) = remaining.split_at_mut(count);
+        let shift = cursor.pos % 8;
+        let src = data.get(cursor.pos / 8..)?.get(..count + usize::from(shift != 0))?;
+        if shift == 0 {
+            dst.copy_from_slice(src);
+        } else {
+            for (byte, pair) in dst.iter_mut().zip(src.windows(2)) {
+                *byte = pair[0] << shift | pair[1] >> (8 - shift);
+            }
+        }
+        cursor.pos += count * 8;
+        remaining = rest;
+    }
+    if let Some(last) = tail.first_mut() {
+        let n = (bits % 8) as u32;
+        *last = (cursor.bits(n)? << (8 - n)) as u8;
     }
     let end = cursor.pos;
     let next = next_frame(data, start, end);
@@ -1028,6 +1053,61 @@ mod tests {
         for i in 0..n as usize {
             if value >> (n as usize - 1 - i) & 1 == 1 {
                 data[(pos + i) / 8] |= 1 << (7 - (pos + i) % 8);
+            }
+        }
+    }
+
+    #[test]
+    fn frame_bytes_match_the_packet_bit_cursor() {
+        let mut seed = 1u32;
+        let source: Vec<u8> = (0..5 * PACKET_BYTES).map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 24) as u8
+        }).collect();
+        for offset in [HEADER_BITS, PACKET_BITS - 16, PACKET_BITS - 8, PACKET_BITS] {
+            for shift in 0..8 {
+                let start = offset + shift;
+                for length in [16usize, 17, 23, 24, 239, 16383, 32766] {
+                    let mut data = source.clone();
+                    for (index, packet) in data.chunks_exact_mut(PACKET_BYTES).enumerate() {
+                        let skip = u32::from(index == 0);
+                        packet[..4].copy_from_slice(&((1u32 << 26) | skip).to_be_bytes());
+                    }
+                    let mut cursor = Cursor { data: &data, pos: start };
+                    let mut positions = Vec::new();
+                    for _ in 0..LENGTH_BITS {
+                        cursor.bit().unwrap();
+                        positions.push(cursor.pos - 1);
+                    }
+                    for (i, pos) in positions.into_iter().enumerate() {
+                        let mask = 1 << (7 - pos % 8);
+                        data[pos / 8] &= !mask;
+                        if length & (1 << (LENGTH_BITS as usize - 1 - i)) != 0 {
+                            data[pos / 8] |= mask;
+                        }
+                    }
+                    let reference = |data: &[u8]| {
+                        let mut cursor = Cursor { data, pos: start };
+                        let mut bytes = vec![0u8; length.div_ceil(8)];
+                        for i in 0..length {
+                            bytes[i / 8] |= (cursor.bit()? as u8) << (7 - i % 8);
+                        }
+                        Some((bytes, cursor.pos))
+                    };
+                    let (_, end) = reference(&data).unwrap();
+                    // A stream skip may point beyond the supplied buffer.
+                    if start < PACKET_BITS && end > PACKET_BITS {
+                        let mut missing = data.clone();
+                        missing[3] = u8::MAX;
+                        assert!(read_frame(&missing, start).is_none());
+                    }
+                    for cut in [end.div_ceil(8) - 1, end.div_ceil(8), data.len()] {
+                        let data = &data[..cut];
+                        let expected = reference(data).map(|(bytes, end)| (bytes, next_frame(data, start, end)));
+                        let actual = read_frame(data, start).map(|f| (f.data, f.next));
+                        assert_eq!(actual, expected, "start={start} length={length} cut={cut}");
+                    }
+                }
             }
         }
     }
