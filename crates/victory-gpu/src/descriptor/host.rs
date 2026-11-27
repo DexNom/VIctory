@@ -954,6 +954,45 @@ pub(crate) fn probe_view_limit() {
 /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
+
+/// The fewest title slots a capped host heap keeps, however many dynamic
+/// slots `VICTORY_DYNAMIC_SLOTS` asks for ([`capped_dynamic_slots`]).
+const LEAST_TITLE: u32 = 1 << 16;
+
+/// `VICTORY_DYNAMIC_SLOTS`, if it is set to a number: the dynamic slots of
+/// a title heap that a capped host heap does not hold whole.
+fn dynamic_slots_set() -> Option<u32> {
+    static SET: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// The dynamic slots of a host heap capped below [`PORTABLE_VIEWS`]
+/// (NVIDIA; its null slot is `null`) for a title heap of `count` slots that
+/// does not fit in it with [`DYNAMIC`] more: they come out of the title's.
+/// `set` is `VICTORY_DYNAMIC_SLOTS` (at least [`DYNAMIC`], which is what
+/// every such heap had before, and leaving the title [`LEAST_TITLE`]
+/// slots).
+///
+/// Unset, the title keeps its lower 393,215 slots, where its long-lived
+/// views are. From slot 393,216 on the retail title's heap (1,245,184
+/// slots) is a ring of the tables it writes for each draw: every 256-slot
+/// page of it held views, rewritten all the time, and all 507,205 views
+/// seen past slot 737,855 were in tables made afresh for a draw
+/// (`draw.rs`, `tables`), none a view only an index reaches. Those tables
+/// are made in the dynamic slots anyway, so host slots kept for the ring
+/// stood unused while 262,144 dynamic ones ran dry every frame (a frame
+/// asks for about 200,000 and holds them until the GPU has run it; 13,000
+/// to 60,000 tables were refused per 5 s and their draws dropped). With
+/// 606,784: none refused, 350,000 free at the fewest (RTX 5060 Ti, open
+/// world, measured in a fork of avatarmanz/VIctory-7900XTX).
+///
+/// The title's slots past the ones left have no host slot: a table
+/// reaching there is made afresh for its draw, as it was past 737,855.
+fn capped_dynamic_slots(count: u32, null: u32, set: Option<u32>) -> u32 {
+    const CAPPED_TITLE: u32 = 393_215;
+    let most = null.saturating_sub(LEAST_TITLE).max(DYNAMIC);
+    set.unwrap_or(null.saturating_sub(CAPPED_TITLE.min(count))).clamp(DYNAMIC, most)
+}
 const NULL_BLOCK: u32 = 1 << 16;
 
 impl HostHeap {
@@ -987,6 +1026,13 @@ impl HostHeap {
             0
         } else {
             victory_shader::emit::view_heap_limit()
+        };
+        // A title heap a capped host heap does not hold whole gives up its
+        // upper slots, a ring of per-draw tables, for dynamic ones.
+        let extra = if null != 0 && null < PORTABLE_VIEWS && count + extra > null {
+            capped_dynamic_slots(count, null, dynamic_slots_set())
+        } else {
+            extra
         };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
@@ -4820,6 +4866,21 @@ mod tests {
         heap.release(a, 50, true);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A title heap too big for a capped host heap (NVIDIA: the null slot
+    /// at 999,999) keeps its lower 393,215 slots unless
+    /// `VICTORY_DYNAMIC_SLOTS` says how many are dynamic: no fewer than
+    /// [`DYNAMIC`], and leaving the title [`LEAST_TITLE`].
+    #[test]
+    fn a_capped_heap_gives_its_upper_slots_to_dynamic_ones() {
+        let null = 999_999;
+        assert_eq!(capped_dynamic_slots(1_245_184, null, None), 606_784);
+        assert_eq!(capped_dynamic_slots(800_000, null, None), 606_784);
+        assert_eq!(capped_dynamic_slots(1_245_184, null, Some(DYNAMIC)), DYNAMIC);
+        assert_eq!(capped_dynamic_slots(1_245_184, null, Some(500_000)), 500_000);
+        assert_eq!(capped_dynamic_slots(1_245_184, null, Some(10)), DYNAMIC);
+        assert_eq!(capped_dynamic_slots(1_245_184, null, Some(u32::MAX)), null - LEAST_TITLE);
     }
 
     #[test]
