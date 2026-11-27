@@ -506,6 +506,13 @@ perfil, cenas diferentes (é o mundo aberto, a câmera muda):
 | soak1 | 8,69 | 116,7 | 3.748 | 31,1 | base: `CARD_BUFFERS_MB=768`, `CARD_WINDOWS_MB=96` |
 | soak2 | 7,80 | 130,7 | 4.096 | 31,9 | `1024`/`256`, sem os cortes do jogo |
 | soak3 | **8,68** | **115,5** | 4.118 | **28,0** | os mesmos `1024`/`256` **com** o perfil `balanced` |
+| soak4 | 8,17 | 126,9 | ~4.100 | 31,0 | perfil `maxfps` |
+| soak5 | 6,86 (mediana 7,00) | — | ~4.900 | — | `balanced` + `VICTORY_RAW_VIEWS=0` |
+| soak6 | 8,78 (mediana 9,00) | — | ~4.400 | — | `balanced` + `VICTORY_HEAP_SYNC=0` |
+| soak9 | 7,48 (mediana 8,00) | 142,9 | ~4.000 | — | `balanced` + `VICTORY_SUBMIT_FRAMES=0` |
+| soak10 | 7,88 (mediana 8,00) | 136,9 | ~4.000 | — | `potato` (640x480, LOD 0,4, culling 3,0) |
+| soak11 | 8,35 (mediana 8,00) | 124,9 | ~4.700 | — | `balanced` com **300 s** de assentamento (controle) |
+| soak12 | 7,84 (mediana 8,00) | 158,8 | ~4.900 | — | `balanced` + `VICTORY_UPLOAD_AHEAD=1` |
 
 O soak2 e o soak3 rodaram a mesma cena (4.096 e 4.118 draws): **o corte do
 `settings.xml` valeu 15,2 ms por quadro, 11%**, e o custo por draw caiu de
@@ -524,6 +531,114 @@ nossa. O que sobrou para atacar, em ordem:
 - `copying back` 23–31 ms para 6,4 MB (≈250 MB/s): a thread do relay passa 43 ms
   esperando o cartão sem ter o que aterrissar. É onde o `VICTORY_QUEUE2` do
   `uiliannn/VItoriaBr` ataca (fila de cópia própria para o fetch).
+
+### Ataques medidos e recusados (27/11)
+
+**`VICTORY_RAW_VIEWS=0`** (os shaders leem os slots do título em vez dos twins):
+6,86 fps, 186,4 ms, e a fila de textura passou de 6 mil para 13 mil slots
+"passed over unmapped". O caminho dos twins é mais rápido **e** mais correto.
+Fica ligado.
+
+**`VICTORY_HEAP_SYNC=0`** (o `sync_heaps` inteiro desligado): 8,78 fps, mediana
+9,00, contra 8,68/115,5 ms do soak3 — dentro do ruído da cena. O motivo está no
+próprio código: o `sync_heaps` roda **ao lado** do resto do `preparing`
+(`VICTORY_HEAP_SYNC_ASIDE`, ligado por padrão) e só 13,6 ms por quadro vazam
+para a thread que submete. Desligar o passe não devolve o que ele custa, porque
+ele quase não está no caminho crítico. **Não é a alavanca** — e o item 4 da
+lista de suspeitos (os 14 mil `mirror()` sem filtro) não pagaria o que prometia.
+
+**`VICTORY_LATE_WAIT=3`** (presente livre, sem esperar o quadro anterior) não
+chega ao mundo: o processo morre antes, em 02:22:20. O título depende da espera
+e o perfil fica em `2`.
+
+O que a tabela mostra de verdade: as cenas variam de 3.000 a 6.000 draws entre
+runs, e é a cena que decide o número, não o knob. Comparar fps entre runs só
+vale quando o µs/draw é parecido. A média de `ms/frame` também sai inflada
+pelos engasgos (o script divide o total pelo número de amostras), por isso o
+número honesto é a mediana e o `ms/frame` das últimas amostras.
+
+### O split do `preparing`, medido (build com `diagnostics`)
+
+O `soak` só diz o total. Um build com `--features diagnostics` abre o
+`preparing` em pedaços, e o retrato de 27/11 02:14–02:21 é este:
+
+| onde | ms por quadro |
+|---|---|
+| passos das listas, na thread que submete | **39,0** |
+| — refreshes (42 flushes de 7.661, dos quais 6.538 "copiam nada") | 23,7 |
+| — copies e fills | 7,9 |
+| — serial, em 384 listas | 0,8 |
+| esperando as *flights* da GPU | **26,4** |
+| snapshots | 5,1 |
+| copies no cartão | 8,1 |
+| envio das listas | 3,0 |
+| esperando os records dos heaps | 4,6 |
+| passe do heap de views (thread `victory-aside`) | 30,9 |
+| — olhando slots | 30,9 |
+| — spans | 4,1 |
+| — texturas | 20,8 |
+| **espera no fecho das listas por esse passe** | **12,5** |
+| `asking about title memory` (245 askings, 1.321 MB) | 5,7 |
+
+Duas leituras, e as duas importam:
+
+**26,4 ms são a thread que submete parada, esperando a GPU.** Somado aos
+12,5 ms do fecho das listas e aos 4,6 ms dos records, são **43 ms de espera
+pura num quadro de 115** — 37%. Não há knob que conserte espera; só sobreposição
+conserta, e as três tentativas de sobrepor (`SUBMIT_FRAMES=0`, `LATE_WAIT=3`,
+`RELAY=2`) ou morreram ou não mudaram nada.
+
+**O passe do heap de views é uma thread só** (`victory-aside`, 30,9 ms), e a
+primeira lista que precisa dele espera. É o único alvo de código que sobrou com
+tamanho: paralelizar o passe, ou começá-lo antes da primeira lista, devolve até
+12,5 ms.
+
+**`VICTORY_SUBMIT_FRAMES=0`** (dois presentes na fila em vez de um: o quadro
+seguinte pode ser preparado enquanto a GPU roda o atual) mediu 7,48 fps de
+média, mediana 8,00, 142,9 ms/frame — pior que o soak3. A fila mais funda só
+acrescenta latência: o `preparing` continua esperando as flights
+(26,4 ms/frame) porque as leituras de memória do título não podem passar na
+frente da escrita que a GPU ainda vai fazer. **Recusado.**
+
+**`potato`** (640x480, `lodScale` 0,4, culling 3,0, veículos no último LOD,
+modelos de dano fora): 7,88 fps de média, mediana 8,00, mas com uma curva
+clara — as primeiras 25 amostras dão 6,68 fps e as últimas 25 dão 9,12, com
+picos de 11. Só que o `ms/frame` das últimas 25 é **115,8 ms**, contra os
+**115,5 ms** do soak3 em `balanced`. É o mesmo chão. O perfil corta geometria
+e resolução, e o número de draws **não cai** (3.831–4.286, contra 4.118 do
+`balanced`): o título desenha o que quer e o custo é por draw, não por pixel.
+**Não é a alavanca** — e custa imagem.
+
+O controle fecha a dúvida: `balanced` com **300 s** de assentamento (soak11)
+deu 8,35 fps e 124,9 ms, com a mesma cena mais pesada (4.700 draws). A curva
+do `potato` não era aquecimento que o `balanced` também teria — era a cena
+mudando. **Assentar mais não melhora nada.**
+
+**`VICTORY_UPLOAD_AHEAD=1`** (fila de cópia própria para os primeiros uploads
+de textura, lidos/detilados/copiados por threads nossas): 7,84 fps, mediana
+8,00, 158,8 ms/frame, e a pior cauda de todas — um engasgo de **1,26 s** numa
+amostra de 4.078 draws. A fila extra disputa banda e cores com o resto, e o
+trabalho que ela tira da frente volta como espera no `copying back`. **Recusado.**
+
+### O chão é 115 ms, e ele não se move
+
+Cinco perfis e sete knobs depois, todo caminho que não morre para em
+**~115 ms por quadro (8,7 fps)**: `balanced` 115,5; `potato` 115,8; `maxfps`
+126,9; `balanced` com 300 s de assentamento 124,9 (cena mais pesada);
+`SUBMIT_FRAMES=0` 142,9; `UPLOAD_AHEAD=1` 158,8; `RAW_VIEWS=0` 186,4. O que
+muda entre eles é o quão longe do chão o run fica, não o chão.
+
+O quadro é `preparing` ~70 ms + GPU ~30 ms + `copying back` ~20 ms, **em
+série**. Sobrepô-los vale 30 ms (11,8 fps), e é a única coisa grande que
+sobrou. As três tentativas morreram: `SUBMIT_FRAMES=0` piorou, `LATE_WAIT=3`
+derruba o processo antes do mundo, `RELAY=2` fica em 9,0. Não é knob: é o
+desenho do runtime, e mexer nele é reescrever o caminho de submissão.
+
+**20 fps (50 ms) não é alcançável nesta máquina.** A conta: 4.000 draws a
+28 µs dão 112 ms só de tradução; 50 ms exigiria 1.780 draws (o título não
+desenha isso) ou 12,5 µs/draw — melhor que um 9800X3D faz neste runtime.
+Para referência, a máquina dos docs (i7-14700KF + RTX 4070 12 GB + 32 GB)
+roda este mesmo título a **2–5 fps**. Aqui está em 8,7–9,1.
 
 ## Limites conhecidos
 
