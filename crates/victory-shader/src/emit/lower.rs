@@ -6,6 +6,8 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+pub(super) mod amd;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
@@ -5962,7 +5964,7 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        let h = self.size_view_handle(site, first, &src, props, image.is_none())?; // amd.rs
         let words: Vec<(u32, V)> = match image {
             Some(kind) => self.image_size_words(h, kind, uav),
             None => {

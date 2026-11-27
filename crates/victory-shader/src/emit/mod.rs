@@ -777,6 +777,7 @@ fn emit_program(
         0xba30_5538_e28d_414c_af39_a51a_4bc2_f308
             | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
     ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
+    lower::amd::begin(c.digest);
     let l = lower::lower_program(&parts, box_rehydration, tiled_lighting_uint_srvs(c.digest), tiled_ambient(c, native))?;
     let wave_size = l.wave_size;
     let shader = HostShader {
