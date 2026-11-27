@@ -209,11 +209,11 @@ mod tests {
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
-        let before = Instant::now();
+        // The next tick is at most one interval (2 ms) away, so a time-out
+        // that long is enough: not the wall clock, which a busy PC stretches.
         let mut second = 0;
-        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
+        assert_eq!(wait(null, 0, 2, std::ptr::null(), 0, &mut second), S_OK);
         assert!(second > first);
-        assert!(before.elapsed() <= Duration::from_millis(50));
         assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;

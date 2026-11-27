@@ -828,6 +828,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         return false;
     }
     if !commit(base, len) {
+        // A copy's refresh may have guarded what was committed of it.
+        victory_gpu::title_memory_unmapping(base, len);
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -971,7 +973,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
+        victory_gpu::title_memory_unmapping(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
