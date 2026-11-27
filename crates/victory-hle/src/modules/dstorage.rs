@@ -1057,14 +1057,50 @@ fn into_destination(
         return fill_virtual_destination(out, fill, victory_gpu::title_bytes_written);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
-    // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+    let count = (offset + len).div_ceil(PAGE);
+    if !repage_on() {
+        let pages = &filled(request.destination.cast(), count)[..];
+        // Consecutive pages of one allocation (the usual case): written in
+        // place through one view.
+        if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+            fill(window.bytes())?;
+            // Noted only (`repage`).
+            let _ = repage(request, pages, count);
+            return Ok(());
+        }
+        let mut data = vec![0; len];
+        let n = fill(&mut data)?;
+        let _ = repage(request, pages, count);
+        return write_pages(request, pages, offset, len, &data[..n]);
     }
+    // Decoded first, and the array read only then: it may still hold the
+    // numbers of its last use while the request runs (`repage`).
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
+    let data = &data[..n];
+    let mut pages = filled(request.destination.cast(), count);
+    for _ in 0..4 {
+        // What lies there now, put back if the array turns out to name
+        // other pages after the write: those are another resource's.
+        let before = super::xmem::read_physical(&pages, offset, n);
+        let result = write_pages(request, &pages, offset, len, data);
+        let Some(now) = repage(request, &pages, count) else {
+            return result;
+        };
+        if let Some(before) = before
+            && !super::xmem::write_physical(&pages, offset, &before)
+        {
+            tracing::warn!(offset, len = n, "dstorage: pages a repaged destination wrote by mistake could not be put back");
+        }
+        pages = now;
+    }
+    write_pages(request, &pages, offset, len, data)
+}
+
+/// Writes a page destination's bytes into `pages`, trying again a while
+/// before failing.
+fn write_pages(request: &Request, pages: &[usize], offset: usize, len: usize, data: &[u8]) -> Result<(), HRESULT> {
+    let n = data.len();
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
     // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
@@ -1118,6 +1154,64 @@ fn fill_virtual_destination(
         publish(written);
     }
     Ok(())
+}
+
+/// Since the start: page destinations whose page array said other pages
+/// when the request had been written than when it began.
+static REPAGED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a page destination is decoded before its array is read, and
+/// written again into the pages the array says after the write if they
+/// differ, the pages written by mistake put back as they were
+/// (`VICTORY_DSTORAGE_REPAGE=0`: read first and decoded in place, as
+/// before; a change is only noted).
+///
+/// The title's arrays can hold the numbers of their last use while a
+/// request runs, and get this request's numbers some milliseconds later
+/// (run 17: the warning of [`repage`], from 2:15 uptime on): the bytes
+/// went into pages that are another texture's now, and the destination
+/// kept what its own pages held. Both show as sharp-edged patches of
+/// garbage on otherwise right textures (the skin of the intro's faces).
+fn repage_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_REPAGE").is_none_or(|v| v != "0"))
+}
+
+/// After a page destination was written into `used`: the page numbers its
+/// array holds now, if they differ (and none is 0) and are to be written
+/// too. The array is read when the request runs ([`filled`]); one that
+/// held the numbers of its last use then sent the bytes into pages that
+/// are another resource's now, and left the destination's own pages as
+/// they were.
+fn repage(request: &Request, used: &[usize], count: usize) -> Option<Vec<usize>> {
+    let array: *const usize = request.destination.cast();
+    // SAFETY: as in `filled`: the title keeps the array until completion.
+    let now: Vec<usize> = (0..count).map(|i| unsafe { array.add(i).read_volatile() }).collect();
+    if now == used || now.contains(&0) {
+        return None;
+    }
+    let n = REPAGED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        let differ = now.iter().zip(used).filter(|(a, b)| a != b).count();
+        // Whose the pages written by mistake are: a page known and shown
+        // somewhere is a live resource's memory.
+        let victim = used.first().and_then(|&p| super::xmem::page_shown(p));
+        tracing::warn!(
+            victim_known = victim.is_some(),
+            victim_shown_at = format_args!("{:#x}", victim.map_or(0, |v| v.0)),
+            victim_views = victim.map_or(0, |v| v.1),
+            requests = n,
+            pages = count,
+            differ,
+            used = format_args!("{:#x}", used.first().copied().unwrap_or(0)),
+            now = format_args!("{:#x}", now.first().copied().unwrap_or(0)),
+            size = request.destination_size,
+            options = format_args!("{:#x}", request.options),
+            rewrite = repage_on(),
+            "dstorage: a page destination's array changed while its request ran: the bytes went to other pages"
+        );
+    }
+    repage_on().then_some(now)
 }
 
 /// The page numbers of a destination. The title fills the array after it
