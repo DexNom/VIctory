@@ -669,24 +669,56 @@ impl PlacedFootprint {
         let (element, block) = element(self.format)?;
         let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
         let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        u64::from(self.row_pitch).checked_mul(lines.saturating_sub(1))?.checked_add(last)
     }
 
-    /// For a read back through a host buffer: this footprint at offset 0
-    /// with its rows pitched as the host wants them (multiples of 256
-    /// bytes), then the bytes that buffer needs, the bytes of a row, the
-    /// rows, and the title's own pitch.
-    pub(crate) fn host_rows(&self) -> Option<(PlacedFootprint, [u64; 4])> {
+    /// The staging footprint is compact, while the title keeps the row and
+    /// slice strides of its original destination footprint.
+    pub(crate) fn readback_region(&self, [x, y, z]: [u32; 3], [w, h, d]: [u32; 3], source_block: u32) -> Option<(Self, ReadbackRows, u64)> {
         let (element, block) = element(self.format)?;
-        let lines = (u64::from(self.height).div_ceil(block) * u64::from(self.depth)).max(1);
-        let row = u64::from(self.width).div_ceil(block) * element;
-        let pitch = row.max(1).next_multiple_of(256);
-        let host = PlacedFootprint {
-            offset: 0,
-            row_pitch: u32::try_from(pitch).ok()?,
-            ..*self
-        };
-        Some((host, [pitch * lines, row, lines, u64::from(self.row_pitch)]))
+        let block = block as u32;
+        if !x.is_multiple_of(block) || !y.is_multiple_of(block) || w == 0 || h == 0 || d == 0 {
+            return None;
+        }
+        // Coordinates are texels, but a copy transfers complete format blocks.
+        // In particular a 1x1 BC mip still stores one physical 4x4 block.
+        let w = w.div_ceil(source_block).checked_mul(block)?;
+        let h = h.div_ceil(source_block).checked_mul(block)?;
+        let blocks = |n: u32| n.div_ceil(block) as usize;
+        if blocks(x.checked_add(w)?) > blocks(self.width) || blocks(y.checked_add(h)?) > blocks(self.height) || z.checked_add(d)? > self.depth {
+            return None;
+        }
+        let row = blocks(w).checked_mul(element as usize)?;
+        let host_pitch = u32::try_from(row.checked_next_multiple_of(256)?).ok()?;
+        let pitch = self.row_pitch as usize;
+        let column = blocks(x).checked_mul(element as usize)?;
+        if column.checked_add(row)? > pitch {
+            return None;
+        }
+        let slice_rows = blocks(self.height);
+        let line = (z as usize).checked_mul(slice_rows)?.checked_add(blocks(y))?;
+        let first = line.checked_mul(pitch)?.checked_add(column)?;
+        let offset = self.offset.checked_add(first as u64)?;
+        let host = Self { offset: 0, width: w, height: h, depth: d, row_pitch: host_pitch, ..*self };
+        Some((host, ReadbackRows { row, rows: blocks(h), depth: d as usize, pitch, slice_rows }, offset))
+    }
+}
+
+/// Bytes copied in each buffer row, with the title's full destination strides.
+#[derive(Clone, Copy)]
+pub(crate) struct ReadbackRows {
+    pub(crate) row: usize,
+    pub(crate) rows: usize,
+    pub(crate) depth: usize,
+    pub(crate) pitch: usize,
+    pub(crate) slice_rows: usize,
+}
+
+impl ReadbackRows {
+    /// Bytes from the first destination pixel through the last copied pixel.
+    pub(crate) fn extent(self) -> Option<usize> {
+        let last_line = self.depth.checked_sub(1)?.checked_mul(self.slice_rows)?.checked_add(self.rows.checked_sub(1)?)?;
+        last_line.checked_mul(self.pitch)?.checked_add(self.row)
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -2874,6 +2906,106 @@ mod tests {
         creation_nodes: 0,
         visible_nodes: 0,
     };
+
+    #[test]
+    fn a_sub_block_mip_reads_one_complete_compressed_block() {
+        let footprint = PlacedFootprint { offset: 512, format: 71, width: 2, height: 2, depth: 1, row_pitch: 8 };
+        let (host, rows, first) = footprint.readback_region([0; 3], [4, 4, 1], 4).unwrap();
+        assert_eq!((host.width, host.height, host.row_pitch), (4, 4, 256));
+        assert_eq!((first, rows.extent(), host.bytes()), (512, Some(8), Some(8)));
+        assert!(footprint.readback_region([1, 0, 0], [1, 1, 1], 4).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn boxed_readback_preserves_unselected_pixels_and_rows() {
+        let Some(host) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let make = |desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(create_committed(null, &PROPERTIES, 0, desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+            out
+        };
+        let source = make(&ResourceDesc { dimension: TEXTURE_3D, depth_or_array_size: 3, flags: 1, ..texture(8, 8, 28, 2) });
+        let fill = host.new_list().unwrap();
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_RENDER_TARGET;
+        crate::list::ensure_state(&fill, source, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        let rtv = host.rtv(host_resource(source), None);
+        // SAFETY: a live 3D render target with all base-mip slices in the default view.
+        unsafe { fill.list.ClearRenderTargetView(rtv, &[1.0; 4], None) };
+        crate::texture::host_written(source);
+        fill.close();
+        host.execute(&[&fill]);
+        let dest = make(&buffer(768));
+        let (data, size) = buffer_bytes(dest).unwrap();
+        let mut allocator = null;
+        assert_eq!(crate::list::create_allocator(null, 0, &PAGEABLE_IIDS[1], &mut allocator), S_OK);
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const [u32; 6]);
+        let to = Location {
+            resource: dest, kind: 1,
+            footprint: PlacedFootprint { offset: 0, format: 28, width: 8, height: 8, depth: 3, row_pitch: 32 },
+        };
+        // Copy two columns and two rows from two volume slices. A null box
+        // on mip 1 copies that whole 4x4x1 mip, still only part of the destination.
+        for (mip, area, origin, starts, row_bytes, pixel) in [
+            (0, Some([3, 2, 1, 5, 4, 3]), [2, 1, 1], &[296, 328, 552, 584][..], 8, 0xff),
+            (1, None, [0, 0, 0], &[0, 32, 64, 96][..], 16, 0),
+            (0, Some([3, 2, 0, 3, 4, 1]), [0, 0, 0], &[][..], 0, 0),
+        ] {
+            let mut list = null;
+            assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &PAGEABLE_IIDS[1], &mut list), S_OK);
+            let from = Location { resource: source, kind: 0, footprint: PlacedFootprint { offset: mip, ..NO_FOOTPRINT } };
+            // SAFETY: the mapped destination has size bytes.
+            unsafe { data.write_bytes(0xa7, size as usize) };
+            slot::<Copy>(list, 0x80)(list, &to, origin[0], origin[1], origin[2], &from, area.as_ref().map_or(null.cast(), std::ptr::from_ref));
+            let recorded = crate::list::host_list(list).unwrap();
+            recorded.close();
+            host.execute(&[recorded]);
+            let mut expected = vec![0xa7; size as usize];
+            for &start in starts {
+                expected[start..start + row_bytes].fill(pixel);
+            }
+            // SAFETY: the completed copy targets this live mapped buffer.
+            let actual = unsafe { std::slice::from_raw_parts(data, size as usize) };
+            assert_eq!(actual, expected, "mip {mip}, box {area:?}");
+            slot::<Release>(list, 0x10)(list);
+        }
+        // The second copy overwrites part of the first. A replay lands in
+        // the same order, unless the mapping was replaced after recording.
+        let mut list = null;
+        assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &PAGEABLE_IIDS[1], &mut list), S_OK);
+        for (mip, x, width) in [(0, 0, 4), (1, 1, 2)] {
+            let from = Location { resource: source, kind: 0, footprint: PlacedFootprint { offset: mip, ..NO_FOOTPRINT } };
+            slot::<Copy>(list, 0x80)(list, &to, x, 0, 0, &from, &[0, 0, 0, width, 1, 1]);
+        }
+        let recorded = crate::list::host_list(list).unwrap();
+        recorded.close();
+        for valid in [true, true, false] {
+            if !valid {
+                crate::inplace::views_gone(data as usize, size as usize);
+            }
+            // SAFETY: the test holds the resource and its mapped destination.
+            unsafe { data.write_bytes(0xa7, size as usize) };
+            host.execute(&[recorded]);
+            let mut expected = [0xa7; 20];
+            if valid {
+                expected[..16].fill(0xff);
+                expected[4..12].fill(0);
+            }
+            // SAFETY: the fenced copy has finished and the buffer is live.
+            assert_eq!(unsafe { std::slice::from_raw_parts(data, 20) }, &expected);
+        }
+        slot::<Release>(list, 0x10)(list);
+        for object in [allocator, dest, source] {
+            slot::<Release>(object, 0x10)(object);
+        }
+    }
 
     fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {

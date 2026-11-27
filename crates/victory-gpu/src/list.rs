@@ -898,9 +898,8 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
-/// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// Texture copies run on the GPU. Buffer uploads are filled at submission,
+/// and texture readbacks land in the title buffer after the fence.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -1068,16 +1067,32 @@ fn read_back(
     if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
         return Err("not a texture subresource into a placed footprint");
     }
-    if (x, y, z) != (0, 0, 0) {
-        return Err("a destination corner other than the footprint's");
-    }
     let host = crate::host::host().ok_or("no host")?;
-    let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
-    // The title's buffer holds every row at its own pitch.
-    let bytes = pitch * (rows - 1) + row;
-    let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
-    let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
+    // SAFETY: a live host texture.
+    let desc = unsafe { texture.GetDesc() };
+    let source_block = crate::resource::element(desc.Format.0 as u32).map_or(1, |(_, block)| block as u32);
+    // SAFETY: the caller supplies a source box or null, as for CopyTextureRegion.
+    let area = unsafe { source_box.as_ref() };
+    let extent = if let Some(&[left, top, front, right, bottom, back]) = area {
+        if right <= left || bottom <= top || back <= front {
+            return Ok(()); // An empty box copies nothing.
+        }
+        [right - left, bottom - top, back - front]
+    } else {
+        // A whole source subresource can still be smaller than the destination.
+        let mut layout = windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        // SAFETY: a live texture and space for one output footprint.
+        unsafe {
+            host.device.GetCopyableFootprints(&desc, src.footprint.offset as u32, 1, 0, Some(&mut layout), None, None, None);
+        }
+        [layout.Footprint.Width, layout.Footprint.Height, layout.Footprint.Depth]
+    };
+    let (footprint, geometry, offset) = dst.footprint.readback_region([x, y, z], extent, source_block).ok_or("unsupported read-back footprint")?;
+    let bytes = geometry.extent().ok_or("invalid destination extent")?;
+    let data = buffer_range(dst.resource, offset, bytes as u64).ok_or("a destination outside its buffer")?;
+    let mapping = crate::inplace::ReadbackMapping::record(data as usize, bytes).ok_or("invalid destination mapping")?;
+    let buffer = host.read_back_buffer(footprint.bytes().ok_or("invalid staging extent")?).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
@@ -1094,8 +1109,8 @@ fn read_back(
     #[cfg(feature = "diagnostics")]
     list.note_op(|| {
         format!(
-            "read back of {:?} sub {} into buffer {:?}+{:#x}: {rows} rows of {row} bytes",
-            src.resource, src.footprint.offset as u32, dst.resource, dst.footprint.offset
+            "read back of {:?} sub {} into buffer {:?}+{:#x}: {} rows of {} bytes",
+            src.resource, src.footprint.offset as u32, dst.resource, offset, geometry.rows * geometry.depth, geometry.row
         )
     });
     // SAFETY: an open list; both locations in the host's layout (asserted
@@ -1105,7 +1120,7 @@ fn read_back(
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
     };
-    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize], src.resource);
+    list.defer_read_back(buffer, data, geometry, dst.resource, src.resource, mapping);
     Ok(())
 }
 
