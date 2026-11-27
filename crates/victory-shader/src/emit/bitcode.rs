@@ -30,6 +30,7 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    /// A 64-bit float.
     Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
@@ -108,6 +109,7 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -322,6 +324,15 @@ impl Module {
                 Const::Int(x) => Some(x),
                 _ => None,
             },
+            _ => None,
+        }
+    }
+
+    /// `x` when `v` is `sub 0, x` (an integer negation); `None` for anything else.
+    pub fn negated(&self, v: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        match self.insts[i as usize].op {
+            Op::Bin(Bin::Sub, a, x) if self.int_value(a) == Some(0) => Some(x),
             _ => None,
         }
     }
@@ -685,57 +696,7 @@ impl Module {
         // Phis nothing reads are left out (one register per phi makes many).
         let live = self.live();
 
-        // Blocks are laid out in reverse postorder, so every block follows
-        // its forward predecessors (drivers take a branch to an earlier
-        // block for a loop's back edge).
-        let succs = |b: usize| successors(self.blocks[b].term);
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match succs(b).get(k) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
-        let mut pos = vec![u64::MAX; self.blocks.len()];
-        for (n, &b) in post.iter().enumerate() {
-            pos[b] = n as u64;
-        }
-        // An empty latch (only a branch back to its loop header) is folded
-        // into its one predecessor, so the exiting block is the latch as in
-        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
-        let mut preds = vec![Vec::new(); self.blocks.len()];
-        for &b in &post {
-            for &s in succs(b).iter() {
-                preds[s].push(b);
-            }
-        }
-        let mut fold = vec![None; self.blocks.len()];
-        for &b in &post {
-            let blk = &self.blocks[b];
-            if let (Some(Term::Br(h)), true, [p]) = (
-                blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
-                &preds[b][..],
-            ) && pos[h] < pos[b]
-                && !succs(*p).contains(&h)
-            {
-                fold[b] = Some((*p, h));
-            }
-        }
-        let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
+        let (layout, fold) = self.layout();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in layout.iter().enumerate() {
             pos[b] = n as u64;
@@ -894,6 +855,178 @@ impl Module {
         w.exit();
         w.exit();
         w.finish()
+    }
+
+    /// Whether every value is defined where it is read, as SSA asks: an
+    /// instruction or branch reads values of its own block defined before
+    /// it, or of a block that dominates it; a phi's incoming value is
+    /// defined in a block that dominates the edge's predecessor. (Read in
+    /// a block laid out before its definition, a value stops
+    /// [`Self::write`]; elsewhere it makes code the driver may take
+    /// wrongly.) Lowering refuses a program that breaks this instead of
+    /// writing it.
+    pub fn defined_before_use(&self) -> bool {
+        let live = self.live();
+        let rpo = self.reverse_postorder();
+        let mut order = vec![usize::MAX; self.blocks.len()];
+        for (n, &b) in rpo.iter().enumerate() {
+            order[b] = n;
+        }
+        // Immediate dominators (Cooper, Harvey and Kennedy), by RPO number.
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for &b in &rpo {
+            for &s in successors(self.blocks[b].term).iter() {
+                preds[s].push(b);
+            }
+        }
+        let mut idom = vec![usize::MAX; self.blocks.len()];
+        if let Some(&entry) = rpo.first() {
+            idom[entry] = entry;
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in rpo.iter().skip(1) {
+                let mut new = usize::MAX;
+                for &p in preds[b].iter().filter(|&&p| idom[p] != usize::MAX) {
+                    new = if new == usize::MAX {
+                        p
+                    } else {
+                        let (mut x, mut y) = (p, new);
+                        while x != y {
+                            while order[x] > order[y] {
+                                x = idom[x];
+                            }
+                            while order[y] > order[x] {
+                                y = idom[y];
+                            }
+                        }
+                        x
+                    };
+                }
+                if new != idom[b] {
+                    idom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+        let dominates = |a: usize, mut b: usize| loop {
+            if a == b {
+                return true;
+            }
+            if idom[b] == b {
+                return false;
+            }
+            b = idom[b];
+        };
+        // Where each kept value is defined: block and place in it.
+        let mut def = vec![None; self.insts.len()];
+        for &b in &rpo {
+            let blk = &self.blocks[b];
+            let kept = blk.phis.iter().filter(|&&i| live[i as usize]).chain(&blk.body);
+            for (k, &i) in kept.enumerate() {
+                if !self.is_void(self.insts[i as usize].ty) {
+                    def[i as usize] = Some((b, k));
+                }
+            }
+        }
+        // `v` read in block `b` at place `k` (`usize::MAX`: at its end).
+        let defined = |v: V, b: usize, k: usize| match v {
+            V::Inst(i) => def[i as usize]
+                .is_some_and(|(d, j)| if d == b { j < k } else { dominates(d, b) }),
+            _ => true,
+        };
+        for &b in &rpo {
+            let blk = &self.blocks[b];
+            let kept = blk.phis.iter().filter(|&&i| live[i as usize]).chain(&blk.body);
+            for (k, &i) in kept.enumerate() {
+                let mut ok = true;
+                match &self.insts[i as usize].op {
+                    Op::Phi(incoming) => {
+                        for &(v, p) in incoming {
+                            if order[p] != usize::MAX {
+                                ok &= defined(v, p, usize::MAX);
+                            }
+                        }
+                    }
+                    op => for_each_operand(op, |v| ok &= defined(v, b, k)),
+                }
+                if !ok {
+                    return false;
+                }
+            }
+            if let Some(Term::CondBr(c, ..)) = blk.term
+                && !defined(c, b, usize::MAX)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The blocks reachable from the entry, in reverse postorder.
+    fn reverse_postorder(&self) -> Vec<usize> {
+        let succs = |b: usize| successors(self.blocks[b].term);
+        let mut seen = vec![false; self.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
+    /// The blocks in the order [`Self::write`] lays them out, and per block
+    /// the empty latch fold (its one predecessor, its loop header).
+    #[allow(clippy::type_complexity)]
+    fn layout(&self) -> (Vec<usize>, Vec<Option<(usize, usize)>>) {
+        // Blocks are laid out in reverse postorder, so every block follows
+        // its forward predecessors (drivers take a branch to an earlier
+        // block for a loop's back edge).
+        let succs = |b: usize| successors(self.blocks[b].term);
+        let post = self.reverse_postorder();
+        let mut pos = vec![u64::MAX; self.blocks.len()];
+        for (n, &b) in post.iter().enumerate() {
+            pos[b] = n as u64;
+        }
+        // An empty latch (only a branch back to its loop header) is folded
+        // into its one predecessor, so the exiting block is the latch as in
+        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for &b in &post {
+            for &s in succs(b).iter() {
+                preds[s].push(b);
+            }
+        }
+        let mut fold = vec![None; self.blocks.len()];
+        for &b in &post {
+            let blk = &self.blocks[b];
+            if let (Some(Term::Br(h)), true, [p]) = (
+                blk.term,
+                blk.phis.is_empty() && blk.body.is_empty(),
+                &preds[b][..],
+            ) && pos[h] < pos[b]
+                && !succs(*p).contains(&h)
+            {
+                fold[b] = Some((*p, h));
+            }
+        }
+        let layout = post.into_iter().filter(|&b| fold[b].is_none()).collect();
+        (layout, fold)
     }
 }
 
@@ -1194,6 +1327,62 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    /// A value read only where its block dominates, or through a phi, can
+    /// be written; read in the other arm of a diamond or after the join
+    /// it cannot (the 0x218 programs' lane-mask joins took a mask word into
+    /// such a block, and `write` stopped the emulator on it).
+    #[test]
+    fn values_read_where_they_are_not_defined_are_found() {
+        for synthetic in [synthetic(1, 0, 1), synthetic(8, 17, 3), synthetic(16, 40, 16)] {
+            assert!(synthetic.defined_before_use());
+        }
+        // entry -> then | other -> join; x is defined in then.
+        let diamond = |read: &dyn Fn(&mut Module, [usize; 3], V)| {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let (entry, then, other, join) =
+                (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+            let (one, two) = (m.i32(1), m.i32(2));
+            let c = m.cmp(entry, pred::EQ, one, two);
+            m.terminate(entry, Term::CondBr(c, then, other));
+            let x = m.bin(then, Bin::Add, one, two);
+            read(&mut m, [then, other, join], x);
+            m.terminate(then, Term::Br(join));
+            m.terminate(other, Term::Br(join));
+            let p = m.phi(join, i32t);
+            m.set_phi(p, vec![(x, then), (one, other)]);
+            let _ = m.bin(join, Bin::Add, p, one);
+            m.terminate(join, Term::Ret);
+            m
+        };
+        let fine = diamond(&|m, [then, ..], x| {
+            let _ = m.bin(then, Bin::Mul, x, x);
+        });
+        assert!(fine.defined_before_use());
+        let _ = fine.write();
+        let in_other_arm = diamond(&|m, [_, other, _], x| {
+            let _ = m.bin(other, Bin::Mul, x, x);
+        });
+        assert!(!in_other_arm.defined_before_use());
+        // (`other` is laid out before `then`: the writer stops on it.)
+        let write = std::panic::AssertUnwindSafe(|| in_other_arm.write());
+        assert!(std::panic::catch_unwind(write).is_err());
+        // Laid out after `then`, but not dominated by it: written, and wrong.
+        let after_join = diamond(&|m, [.., join], x| {
+            let _ = m.bin(join, Bin::Mul, x, x);
+        });
+        assert!(!after_join.defined_before_use());
+        // A phi bringing x along the edge from `other`.
+        let by_other_edge = diamond(&|m, [then, other, join], x| {
+            let i32t = m.int(32);
+            let p = m.phi(join, i32t);
+            let one = m.i32(1);
+            m.set_phi(p, vec![(one, then), (x, other)]);
+            let _ = m.bin(join, Bin::Add, p, p);
+        });
+        assert!(!by_other_edge.defined_before_use());
     }
 
     #[test]

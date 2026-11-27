@@ -237,6 +237,26 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
     }
 }
 
+/// [`WATERFALL_INDEXED_WAVE32`] as 0x218 programs write it (`m058`): the retry branch is
+/// `s_cbranch_scc1` on the `s_andn2_wrexec` SCC, and the lanes hold the entry's index, which
+/// the loop shifts into a byte offset (`s_lshl_b32 s20, s20, 5`) after reading it.
+#[test]
+fn lanes_sample_the_entry_their_index_names_in_a_scc1_waterfall() {
+    use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
+    let mut words = WATERFALL_INDEXED_WAVE32.to_vec();
+    let at = |w: &[u32], x: u32| w.iter().position(|&y| y == x).unwrap();
+    words.remove(at(&words, 0x340E_0E85)); // v_lshlrev_b32 v7, 5, v7
+    words.insert(at(&words, 0x7DA4_0E14) + 1, 0x8F14_8514); // s_lshl_b32 s20, s20, 5
+    let branch = at(&words, 0xBF89_FFF6);
+    words[branch] = 0xBF85_FFF5; // s_cbranch_scc1 -> the v_readfirstlane
+    let results = sampled(&build(&words, false));
+    assert!(!results.is_empty());
+    for (label, red) in results {
+        let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
+        assert_eq!(red, want, "{label}");
+    }
+}
+
 #[test]
 fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     use crate::resource::tests::cmpx_waterfall;

@@ -668,6 +668,216 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// Device method 0x218: a compute pipeline from a program the title has
+/// compiled already and put in its own memory. `desc` is a record of 0x60
+/// bytes: the root signature, then (address, size) pairs of the program's
+/// registers (0x1c bytes), of a second register block, of its code and of
+/// its resource table, two addresses and the program's 64-bit hash. The
+/// title makes one for every variant of its small compute programs (mip
+/// generation of texture arrays) at start.
+///
+/// The code is not that of the title's container of the same program: it is
+/// compiled again, for a root signature whose table can hold more ranges.
+/// So the program is read from the record
+/// ([`victory_shader::native::console_compute_container_rooted`], with the
+/// root signature's parameters the table does not name) and put in a
+/// container of its own, which is translated and cached as the title's
+/// containers are.
+pub(crate) extern "system" fn create_native_compute(
+    _: This,
+    desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static MADE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { *out = std::ptr::null() };
+    }
+    // VICTORY_NATIVE_COMPUTE=0: every 0x218 call fails as on main, to tell in one run whether
+    // a picture lost in game comes from these pipelines
+    static OFF: OnceLock<bool> = OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("VICTORY_NATIVE_COMPUTE").is_some_and(|v| v == "0")) {
+        return crate::object::E_NOTIMPL;
+    }
+    let program = (|| -> Result<Vec<u8>, String> {
+        let registers = title_bytes(desc, 1).map_err(|e| format!("registers: {e}"))?;
+        let code = title_bytes(desc, 5).map_err(|e| format!("code: {e}"))?;
+        let table = title_bytes(desc, 7).map_err(|e| format!("resource table: {e}"))?;
+        let root = root_blob(desc);
+        victory_shader::native::console_compute_container_rooted(&registers, &table, &code, root.as_deref())
+            .map_err(|e| e.to_string())
+    })();
+    let made = MADE[usize::from(program.is_err())].fetch_add(1, Ordering::Relaxed) + 1;
+    let container = match program {
+        Ok(container) => container,
+        Err(why) => {
+            dump_native(desc, &why);
+            if made <= 4 || made.is_power_of_two() {
+                tracing::warn!(
+                    missed = made,
+                    why,
+                    description = format_args!("{:x?}", title_words(desc)),
+                    "a compute pipeline from compiled code that is not read: the title goes without it"
+                );
+            }
+            return crate::object::E_NOTIMPL;
+        }
+    };
+    // With VICTORY_DUMP_NATIVE, a description whose program does not
+    // translate is saved too.
+    if dumping()
+        && let Err(e) = victory_shader::emit::translate(&container)
+    {
+        dump_native(desc, &format!("translation: {e}"));
+    }
+    let shader = shader("compute", &container);
+    if made.is_power_of_two() {
+        tracing::info!(made, hash = %shader.hash, "native compute descriptions decoded");
+    }
+    // A program that does not translate is refused here, as every 0x218 program was before:
+    // handed a pipeline whose dispatches are then dropped, the title's GPU-driven passes go on
+    // without their results instead of taking the way it has for a missing pipeline.
+    #[cfg(windows)]
+    if shader.translated().is_none() {
+        return crate::object::E_NOTIMPL;
+    }
+    hand_out(
+        vec![shader],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
+/// The bytes named by words `at` (address) and `at + 1` (size) of the
+/// title's description `desc`, read through the kernel: the title's own
+/// memory, which may not be mapped. Why not, if not.
+fn title_bytes(desc: *const u8, at: usize) -> Result<Vec<u8>, String> {
+    #[cfg(windows)]
+    {
+        let mut words = [0u8; 16];
+        if desc.is_null() {
+            return Err("no description".to_owned());
+        }
+        let start = desc.wrapping_add(8 * at);
+        if !crate::host::read_into(start, &mut words) {
+            return Err("the description is not readable".to_owned());
+        }
+        let address = u64::from_le_bytes(words[..8].try_into().unwrap()) as usize;
+        let size = u64::from_le_bytes(words[8..].try_into().unwrap()) as usize;
+        if address == 0 || !(4..=1 << 20).contains(&size) {
+            return Err(format!("implausible block {address:#x}+{size:#x}"));
+        }
+        let mut bytes = vec![0u8; size];
+        if crate::host::read_into(address as *const u8, &mut bytes) {
+            Ok(bytes)
+        } else {
+            Err(format!("block {address:#x}+{size:#x} not readable"))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (desc, at);
+        Err("not on this host".to_owned())
+    }
+}
+
+/// The serialized root signature word 0 of a 0x218 description names, if
+/// it is one of ours.
+fn root_blob(desc: *const u8) -> Option<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        crate::root::blob_of(title_words(desc)?[0] as usize as This)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = desc;
+        None
+    }
+}
+
+/// The folder `VICTORY_DUMP_NATIVE` names, if set.
+fn dump_folder() -> Option<&'static std::path::Path> {
+    use std::sync::OnceLock;
+    static FOLDER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    FOLDER
+        .get_or_init(|| std::env::var_os("VICTORY_DUMP_NATIVE").map(std::path::PathBuf::from))
+        .as_deref()
+}
+
+fn dumping() -> bool {
+    dump_folder().is_some()
+}
+
+/// `VICTORY_DUMP_NATIVE=<folder>`: a description device method 0x218 could
+/// not read, or whose program does not translate, is saved there, with the
+/// blocks it names, as `slot218-<n>-desc-<address>.bin`,
+/// `slot218-<n>-dNN-<address>-<size>.bin` and its root signature's
+/// serialized form as `slot218-<n>-root.bin` (what `pr64-replay` reads);
+/// four of each reason, 200 in all.
+fn dump_native(desc: *const u8, why: &str) {
+    #[cfg(windows)]
+    {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<(u32, HashMap<String, u32>)>> = Mutex::new(None);
+        let Some(folder) = dump_folder() else {
+            return;
+        };
+        let Some(words) = title_words(desc) else { return };
+        let n = {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let (total, reasons) = seen.get_or_insert_with(Default::default);
+            let reason = reasons.entry(why.to_owned()).or_default();
+            if *total >= 200 || *reason >= 4 {
+                return;
+            }
+            *reason += 1;
+            *total += 1;
+            *total
+        };
+        let _ = std::fs::create_dir_all(folder);
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let _ = std::fs::write(folder.join(format!("slot218-m{n:03}-desc-{:x}.bin", desc as usize)), bytes);
+        for at in [1, 3, 5, 7] {
+            let (address, size) = (words[at] as usize, words[at + 1] as usize);
+            if address == 0 || size == 0 || size > 1 << 20 {
+                continue;
+            }
+            let mut block = vec![0u8; size];
+            if crate::host::read_into(address as *const u8, &mut block) {
+                let _ = std::fs::write(folder.join(format!("slot218-m{n:03}-d{at:02}-{address:x}-{size:x}.bin")), block);
+            }
+        }
+        if let Some(root) = root_blob(desc) {
+            let _ = std::fs::write(folder.join(format!("slot218-m{n:03}-root.bin")), root);
+        }
+        let _ = std::fs::write(folder.join(format!("slot218-m{n:03}-why.txt")), why);
+    }
+    #[cfg(not(windows))]
+    let _ = (desc, why);
+}
+
+/// The twelve words of a description (0x60 bytes), for the log.
+fn title_words(desc: *const u8) -> Option<[u64; 12]> {
+    #[cfg(windows)]
+    {
+        let mut bytes = [0u8; 0x60];
+        if desc.is_null() || !crate::host::read_into(desc, &mut bytes) {
+            return None;
+        }
+        Some(std::array::from_fn(|k| u64::from_le_bytes(bytes[8 * k..8 * k + 8].try_into().unwrap())))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = desc;
+        None
+    }
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -797,6 +1007,18 @@ pub(crate) fn library_removal_note() -> String {
     library::removal_note()
 }
 
+/// Checks that the same D3D12 device as the game can build translated pipelines.
+#[cfg(windows)]
+pub fn check_preload_device() -> anyhow::Result<()> {
+    use anyhow::Context;
+    let host = crate::host::host().context("Cannot initialize the Direct3D 12 device for shader preload")?;
+    anyhow::ensure!(
+        host.shader_model_6_6(),
+        "The selected Direct3D 12 device does not support Shader Model 6.6"
+    );
+    Ok(())
+}
+
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
@@ -831,6 +1053,46 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_compute_slot_reads_the_description_and_clears_failed_outputs() {
+        type Create = extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT;
+        let device = crate::device::device();
+        let create = slot::<Create>(device, 0x218);
+        let regs = [0u32, 0, 0, 1 << 16 | 1, 1, 0, 0];
+        let code = [0xBF81_0000u32];
+        // Short table header and a terminal hash entry, with no resources.
+        let mut table = [0u32; 12];
+        table[1] = 36;
+        table[4] = 0x43;
+        let mut desc = [0usize; 12];
+        for (at, words) in [(1, regs.as_slice()), (5, &code[..]), (7, &table[..])] {
+            desc[at] = words.as_ptr() as usize;
+            desc[at + 1] = size_of_val(words);
+        }
+        let mut out = std::ptr::null();
+        assert_eq!(create(device, desc.as_ptr().cast(), &PIPELINE_IIDS[0], &mut out), S_OK);
+        let shaders = shaders(out);
+        assert_eq!(shaders.len(), 1);
+        assert_eq!(shaders[0].0, "compute");
+        let c = victory_shader::Container::parse(&shaders[0].1).unwrap();
+        let programs = victory_shader::native_programs(c.part(victory_shader::FourCC::DXIL).unwrap().data).unwrap();
+        assert_eq!(programs[0].code, code[0].to_le_bytes());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(out, 0x10)(out), 0);
+
+        // A program that reads but does not translate (an indirect jump) is refused as one
+        // that does not read: no pipeline whose dispatches would be dropped.
+        let jump = [0xBE80_2000u32, 0xBF81_0000]; // s_setpc_b64 s[0:1]; s_endpgm
+        desc[5] = jump.as_ptr() as usize;
+        desc[6] = size_of_val(&jump);
+        assert_eq!(create(device, desc.as_ptr().cast(), &PIPELINE_IIDS[0], &mut out), crate::object::E_NOTIMPL);
+        assert!(out.is_null());
+
+        desc[6] = 0;
+        assert_eq!(create(device, desc.as_ptr().cast(), &PIPELINE_IIDS[0], &mut out), crate::object::E_NOTIMPL);
+        assert!(out.is_null());
     }
 
     #[test]

@@ -1,0 +1,42 @@
+# Primitive ordering in ten refused pixel shaders
+
+The Windows shader-preload run reported 13 translation refusals. Ten were distinct pixel shaders in one alpha-cutout/tint family. The other three were compute shaders addressed by [PR #35](https://github.com/DexNom/VIctory/pull/35).
+
+The identifiers below are the 16-character BLAKE3 prefixes used in the VIctory log. The instruction offsets are relative to the start of the native shader code.
+
+| Shader container hash | Previously reported branch | POPS setup |
+| --- | --- | --- |
+| `c1dacd75698a5db8` | `0x2dbc` | `0x2d8c` |
+| `f0296ce9fbe481cb` | `0x2dbc` | `0x2d8c` |
+| `a76619e2dcb45652` | `0x2dbc` | `0x2d8c` |
+| `aafcf40b30b9df18` | `0x2dbc` | `0x2d8c` |
+| `8c5ae9ea0f2158eb` | `0x2dbc` | `0x2d8c` |
+| `c94ff21793ffd81e` | `0x2dbc` | `0x2d8c` |
+| `09cee52e3ebbdf51` | `0x3014` | `0x2fe4` |
+| `5ac9e7769a54e90c` | `0x3014` | `0x2fe4` |
+| `1b1bee1ab00a82b5` | `0x3014` | `0x2fe4` |
+| `bb3f113d13bd2788` | `0x3014` | `0x2fe4` |
+
+All ten decode the overlap bit and wave IDs from `s18`, configure `HW_REG_POPS_PACKER`, poll `src_pops_exiting_wave_id`, and send `MSG_ORDERED_PS_DONE` after the ordered section. Those `s18` fields match the documented `COLLISION_WAVEID` input. The ordered section contains texture reads and writes. [AMD RDNA 2 ISA](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) · [Mesa driver documentation](https://docs.mesa3d.org/drivers/amd/hw/pops.html)
+
+The DXIL emitter now reports `primitive-ordered pixel shading (POPS)` at the first recognized ordering instruction, before generic scalar lowering. The detection uses decoded GFX10 instructions and applies to the pixel stage. A synthetic test covers the packer write, volatile wave-ID source, completion message, and ordered termination.
+
+On an RTX 5060 with driver 621.24, a filtered release run matched all ten hashes. The installed preload build reported ten generic SGPR errors. The patched build reported ten POPS errors at the setup offsets in the table. Both emitted zero DXIL for this set. All 11 tests in `emit::barycentric_tests` passed. A D3D12 feature query on the RTX 5060 returned `ROVsSupported = true`.
+
+Supporting the full family requires tracing the UAV accesses inside the ordered section, proving the coordinates and ordering are representable by D3D12 rasterizer-ordered views, and accounting for ordering between lanes of the same guest wave before removing its synchronization. An overlapping-fragment test should verify the order-dependent read/modify/write results. [D3D12 rasterizer-ordered views](https://learn.microsoft.com/en-us/windows/win32/direct3d12/rasterizer-order-views)
+
+## Follow-up after the full preload
+
+With this PR applied to the [PR #47 preload launcher](https://github.com/DexNom/VIctory/pull/47), the cold scan translated 25,745 shaders and created 2,699 compute pipelines in 735 s. It reported ten POPS and three compute translation refusals, plus 32 compute pipeline refusals. The game launched and exited after 7 min 34 s during intro `Prestream`, at frame 1508. The breakpoint was `0x80000003` at `+0x5149aec`. The crash report showed `INSTANCE_LIST` at 45,000/45,000. The game phase contains none of the ten pixel hashes and has no D3D12 device-removal error. [Preload report](https://github.com/DexNom/VIctory/pull/47#issuecomment-7175433123) · [Upstream issue #698](https://github.com/Marvisak/VIctory/issues/698)
+
+The follow-up checks control flow from the POPS packer write to an explicit completion instruction. A filtered rerun found a path to an ordinary exit before explicit completion in every shader in the table. Six diagnostics point to `0x305c` and four to `0x32b4`. This identifies an ordering case a ROV lowering would have to handle. DXIL emission for the ten remains 0/10.
+
+The emitter now accepts an immediate zero that clears the inactive packer enable bit in a pixel shader without ordered operations. A synthetic test compares the emitted DXIL with an otherwise identical shader. The active protocol and the exit that bypasses completion have separate regression coverage.
+
+## D3D12 translation of the ten shaders
+
+The emitter reads the POPS enable flag from pixel-stage metadata and marks heap UAV handles as rasterizer ordered. It uses the guest layout to identify the collision SGPR and seeds distinct synthetic wave IDs so the shader does not wait for a GFX10 wave. D3D12 ROV accesses supply the ordering. The DXIL feature flags reflect the ROV handles that survive optimization. A pixel format without active POPS still uses the previous diagnostic, and direct root UAVs in active POPS shaders remain unsupported. [Upstream ROV work](https://github.com/Marvisak/VIctory/pull/2490) · [Collision seed](https://github.com/Marvisak/VIctory/pull/2395) · [Feature flags](https://github.com/Marvisak/VIctory/pull/2610)
+
+On the RTX 5060, each hash in the table was tested individually. All ten emitted DXIL, declared the ROV feature, passed the Windows SDK validator, and created a D3D12 graphics pipeline with a generated vertex shader. A separate `warm` run with an empty cache translated all ten with zero refusals. All 14 pixel tests passed, including a synthetic ordered texture store. In-game output and overlapping-fragment rendering remain unverified.
+
+A later RTX 5060 integration run combined the POPS change at `64255cf` with the compute builder fixes from [PR #35](https://github.com/DexNom/VIctory/pull/35) and the preload launcher from [PR #47](https://github.com/DexNom/VIctory/pull/47). Preload translated 25,758 shaders with zero translation refusals. D3D12 created 2,704 compute pipelines and refused 30. Those compute pipeline failures are tracked in the preload report on PR #47.

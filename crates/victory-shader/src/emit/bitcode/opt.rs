@@ -67,12 +67,16 @@ pub(crate) struct Usage {
     pub int64: bool,
     /// A typed load of several components from a UAV.
     pub typed_uav_loads: bool,
+    /// A handle annotated as a rasterizer-ordered view.
+    pub rovs: bool,
     /// A handle from the view heap.
     pub heap_views: bool,
     /// A handle from the sampler heap.
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// A 64-bit float, as a result or an operand.
+    pub doubles: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -968,6 +972,7 @@ impl Module {
         let mut u = Usage::default();
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
+        let double = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Double;
         // The first field of a handle's annotation: its kind, with the UAV
         // bit; the second: the component type and count.
         let annotation = |h: V| -> Option<(i64, i64)> {
@@ -996,13 +1001,19 @@ impl Module {
             for &i in blk.phis.iter().chain(&blk.body) {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
+                u.doubles |= double(inst.ty);
+                for_each_operand(&inst.op, |v| {
+                    u.int64 |= wide(self.type_of(v));
+                    u.doubles |= double(self.type_of(v));
+                });
                 let Op::Call(f, args) = &inst.op else {
                     continue;
                 };
                 let name = self.funcs[*f as usize].name.as_str();
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
-                if name.starts_with("wave") || name.starts_with("quad") {
+                if name == "annotateHandle" {
+                    u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
+                } else if name.starts_with("wave") || name.starts_with("quad") {
                     u.wave_ops = true;
                 } else if name == "createHandleFromHeap" {
                     match args.get(2).and_then(|&s| self.int_k(s)) {

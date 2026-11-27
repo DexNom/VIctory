@@ -59,12 +59,17 @@ translation_inputs! {
     "emit/bitcode/census.rs",
     "emit/bitcode/opt.rs",
     "emit/container.rs",
+    "emit/descriptor_data.rs",
+    "emit/float64.rs",
     "emit/guest_address.rs",
+    "emit/idiom.rs",
     "emit/intersect.rs",
+    "emit/link.rs",
     "emit/lower.rs",
     "emit/mod.rs",
     "emit/own_bits.rs",
     "emit/packed_mask.rs",
+    "emit/pops.rs",
     "emit/rect.rs",
     "emit/sampler.rs",
     "emit/shader.rs",
@@ -89,10 +94,13 @@ translation_inputs! {
 mod source_tests {
     use std::path::{Path, PathBuf};
 
-    // host.rs consumes finished DXIL to create or run host pipelines. The
+    // host.rs consumes finished DXIL to create or run host pipelines.
+    // native_build.rs only writes containers: what it writes is hashed as
+    // any container is, so it cannot change a translation kept on disk. The
     // remaining modules are only compiled by the Windows execution tests.
     const OUTSIDE_TRANSLATION: &[&str] = &[
         "emit/cube_lod_tests.rs",
+        "emit/descriptor_tests.rs",
         "emit/diff_tests.rs",
         "emit/helper_lane_tests.rs",
         "emit/host.rs",
@@ -101,6 +109,7 @@ mod source_tests {
         "emit/valu_tests.rs",
         "emit/waterfall_tests.rs",
         "emit/wave64_tests.rs",
+        "native_build.rs",
     ];
 
     #[test]

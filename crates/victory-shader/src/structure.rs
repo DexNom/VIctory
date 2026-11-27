@@ -443,6 +443,10 @@ pub struct Structured {
     /// SCC values a mask operation sets when some lane's bit of its result is set, with that
     /// lane bit: as data such an SCC is "some lane of the wave has it".
     pub scc_some: HashMap<Value, Bool>,
+    /// SCC values of [`Self::scc_some`] whose lane bit holds only in lanes whose EXEC bit is
+    /// set where they are written: the lanes elsewhere add nothing to the console's "some
+    /// lane", so the running lanes alone answer it.
+    pub scc_active: HashSet<Value>,
 }
 
 impl Structured {
@@ -535,6 +539,8 @@ struct Lanes<'a> {
     /// SCC values of [`Self::scc_lane`] that are set when EVERY lane's bit is (`s_cmp_eq` of
     /// two masks: "no lane differs"); the others are set when some lane's is.
     scc_every: HashSet<Value>,
+    /// See [`Structured::scc_active`].
+    scc_active: HashSet<Value>,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
 }
@@ -616,6 +622,7 @@ impl<'a> Lanes<'a> {
             active: HashSet::new(),
             wide: HashSet::new(),
             scc_every: HashSet::new(),
+            scc_active: HashSet::new(),
             wave_any: vec![None; blocks.len()],
         })
     }
@@ -627,6 +634,7 @@ impl<'a> Lanes<'a> {
         self.seen.clear();
         self.scc_lane.clear();
         self.scc_every.clear();
+        self.scc_active.clear();
         self.wave_any.fill(None);
         self.joins.clear();
         self.phi_joins.clear();
@@ -836,6 +844,8 @@ impl<'a> Lanes<'a> {
                 split.insert(lo);
             }
         }
+        // By its pair a split mask is still one: an instruction that reads both dwords asks so.
+        let paired_masks = if self.p.wave64 { self.masks.clone() } else { Map::default() };
         self.masks.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
         Ok(Structured {
@@ -846,7 +856,7 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks,
             active: self.active,
             wide: self.wide,
             wave_any: self.wave_any,
@@ -856,6 +866,7 @@ impl<'a> Lanes<'a> {
                 .filter(|(scc, _)| !self.scc_every.contains(scc))
                 .map(|(&scc, &m)| (scc, m))
                 .collect(),
+            scc_active: self.scc_active,
             phi_masks,
             bools: self.b,
             exits,
@@ -934,7 +945,11 @@ impl<'a> Lanes<'a> {
                 // lowering has no value for the low dword (EXEC, compares)
                 // and refuses. Give the atom both dwords when such code
                 // turns up.
-                let m = m.unwrap_or_else(|| {
+                // A pair whose dwords are both constants the code writes (EXEC set to a fixed
+                // set of lanes by `s_bfm_b64`, `s_bitreplicate_b64_b32` or a move of each half)
+                // is that constant, both dwords of it.
+                let constant = self.constant_pair(k).map(|v| self.constant_mask(v));
+                let m = m.or(constant).unwrap_or_else(|| {
                     let born = self.born(k.0);
                     self.b.atom(Atom::Opaque(k.0), born)
                 });
@@ -948,6 +963,80 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// The mask a constant lane set is: none, all lanes, or [`Atom::Constant`] (wave32: the low
+    /// dword).
+    fn constant_mask(&mut self, v: u64) -> Bool {
+        let v = if self.p.wave64 { v } else { v & 0xFFFF_FFFF };
+        match v {
+            0 => Bool::FALSE,
+            _ if v == u64::MAX >> (32 * u8::from(!self.p.wave64)) => Bool::TRUE,
+            _ => self.b.atom(Atom::Constant(v), 0),
+        }
+    }
+
+    /// The constant a mask register pair holds, where the code writes each of its dwords
+    /// from constants alone (wave32: the low dword, the pair being one register).
+    fn constant_pair(&self, k: Key) -> Option<u64> {
+        let lo = self.constant_word(k.0, 0)?;
+        let hi = if self.p.wave64 { self.constant_word(k.1, 0)? } else { 0 };
+        Some(u64::from(lo) | u64::from(hi) << 32)
+    }
+
+    /// The dword SSA value `v` holds, where the instruction writing it (through scalar moves)
+    /// computes it from constant operands alone: `s_mov_b32` of an integer inline constant or
+    /// a literal, `s_movk_i32`, `s_brev_b32` and `s_pack_*_b32_b16` of such operands,
+    /// `s_mov_b64` of an integer inline constant (sign-extended), and `s_bfm_b64` and
+    /// `s_bitreplicate_b64_b32` of such 32-bit operands. None for anything else (a join, a
+    /// program input, a float inline constant, a 64-bit literal).
+    fn constant_word(&self, v: Value, depth: u32) -> Option<u32> {
+        let &(b, i) = self.defs.get(&v)?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Sop { dst: Some(Operand::Scalar { code: dst, .. }), src, imm } = &inst.fields else {
+            return None;
+        };
+        let half = inst.writes.iter().find(|w| w.1 == v).and_then(|w| match w.0 {
+            Reg::S(c) => c.checked_sub(*dst).filter(|&h| h < 2),
+            _ => None,
+        })?;
+        // a 32-bit operand
+        let word = |op: &Operand| match *op {
+            Operand::Const(c @ 128..=208) => crate::resource::inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        let wide = match (inst.name(), src.as_slice()) {
+            ("s_mov_b32", [Operand::Scalar { code, .. }]) if *code != NULL && half == 0 && depth < 16 => {
+                return self.constant_word(inst.read(Reg::S(*code))?, depth + 1);
+            }
+            ("s_mov_b32", [op]) if half == 0 => return word(op),
+            // the 16-bit immediate, sign-extended
+            ("s_movk_i32", []) if half == 0 => return imm.map(|k| k as i16 as u32),
+            ("s_brev_b32", [a]) if half == 0 => return word(a).map(u32::reverse_bits),
+            // a half of each operand, the first's in the low half
+            ("s_pack_ll_b32_b16", [a, b]) if half == 0 => return Some(word(a)? & 0xFFFF | word(b)? << 16),
+            ("s_pack_lh_b32_b16", [a, b]) if half == 0 => return Some(word(a)? & 0xFFFF | word(b)? & 0xFFFF_0000),
+            ("s_pack_hh_b32_b16", [a, b]) if half == 0 => return Some(word(a)? >> 16 | word(b)? & 0xFFFF_0000),
+            ("s_mov_b64", [Operand::Scalar { code, .. }]) if *code != NULL && depth < 16 => {
+                return self.constant_word(inst.read(Reg::S(code + half))?, depth + 1);
+            }
+            ("s_mov_b64", [Operand::Const(c @ 128..=208)]) => {
+                i64::from(crate::resource::inline(*c)? as i32) as u64
+            }
+            ("s_bfm_b64", [a, b]) => {
+                // a field of a[5:0] ones at bit b[5:0]
+                let (a, b) = (word(a)? & 63, word(b)? & 63);
+                ((1u64 << a) - 1) << b
+            }
+            ("s_bitreplicate_b64_b32", [a]) => {
+                // bit i of the source in bits 2i and 2i + 1
+                let a = word(a)?;
+                (0..32).filter(|n| a >> n & 1 == 1).fold(0u64, |r, n| r | 3 << (2 * n))
+            }
+            _ => return None,
+        };
+        Some((wide >> (32 * half)) as u32)
     }
 
     fn move_source(&self, mut value: Value) -> Value {
@@ -1276,6 +1365,12 @@ impl<'a> Lanes<'a> {
                     {
                         self.scc_lane.insert(scc, own);
                     }
+                }
+                if let Some(scc) = inst.write(Reg::Scc)
+                    && let (Some(&m), Some(e)) = (self.scc_lane.get(&scc), exec)
+                    && self.b.implies(m, e)
+                {
+                    self.scc_active.insert(scc);
                 }
             }
             Fields::Valu(v) => {
@@ -1713,6 +1808,32 @@ mod tests {
                 "{reader:#x}: vcc_hi was zeroed after the compare"
             );
         }
+    }
+
+    /// The other side of the test above (0x218 program `6290a7dbe007d846` at 0x198-0x230): the
+    /// compare's pair read before its high dword is rewritten alone is still the compare,
+    /// by its pair, though its low dword alone also names the pair read after.
+    #[test]
+    fn a_compare_read_before_its_high_dword_is_rewritten_is_the_compare_by_its_pair() {
+        let p = build(
+            &[
+                0xD4C4_0000,
+                0x0001_0B00, // v_cmp_gt_u32 s[0:1], v0, 5
+                0xD501_0001,
+                0x0001_0280, // v_cndmask_b32 v1, 0, 1, s[0:1]
+                0xBE81_0387, // s_mov_b32 s1, 7
+                0x87FE_7E00, // s_and_b64 exec, s[0:1], exec
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let select = &p.blocks[0].insts[1];
+        let (lo, hi) = (select.read(Reg::S(0)).unwrap(), select.read(Reg::S(1)).unwrap());
+        assert_eq!(p.blocks[0].insts[0].write(Reg::S(1)), Some(hi));
+        assert!(!s.masks.contains_key(&lo), "the low dword alone names two pairs");
+        let m = s.mask_bits(lo, Some(hi)).expect("the compare, by its pair");
+        assert_eq!(s.bools.node(m), Some((Atom::Lane(lo), Bool::FALSE, Bool::TRUE)));
     }
 
     #[test]

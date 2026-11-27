@@ -195,6 +195,22 @@ pub(crate) extern "system" fn create(
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
 
+/// The serialized form of the root signature `this`, if it is one of ours
+/// (device method 0x218 names the program's root signature by pointer).
+#[cfg(windows)]
+pub(crate) fn blob_of(this: This) -> Option<Vec<u8>> {
+    let mut head = [0u8; 8];
+    if this.is_null() || !crate::host::read_into(this.cast(), &mut head) {
+        return None;
+    }
+    if usize::from_le_bytes(head) != FUNCTIONS.0.as_ptr() as usize {
+        return None;
+    }
+    // SAFETY: an object with this table is a `RootSignature` of ours, which
+    // the title holds while it passes it.
+    Some(unsafe { &*this.cast::<RootSignature>() }.blob.clone())
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &ROOT_SIGNATURE_IIDS).then_some(this);
     object::answer(ROOT_SIGNATURE, iid, found, out)
@@ -255,6 +271,40 @@ mod tests {
             create(null, 0, data, size, &ROOT_SIGNATURE_IIDS[0], &mut root),
             S_OK
         );
+        // What a 0x218 description names: the blob back, and nothing for
+        // another object or no object.
+        // SAFETY: the blob's `size` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data, size) };
+        assert_eq!(blob_of(root).as_deref(), Some(bytes));
+        assert_eq!(blob_of(blob), None);
+        assert_eq!(blob_of(null), None);
+        // The 0x218 decoder reads the host's serialization: the constant at
+        // dword 4 is the one the table names; a fifth user SGPR is past it.
+        let mut table = Vec::new();
+        for w in [0x403u32, 0, 0, 0, 0, 1 << 16 | 0x440, 0x41, 0x002, 0, 0, 0, 0x404, u32::MAX, 0]
+            .into_iter()
+            .chain([0x43, 1, 2, 3, 4, 0, 0, 0])
+        {
+            table.extend(w.to_le_bytes());
+        }
+        let size = (table.len() - 0x14) as u32;
+        table[4..8].copy_from_slice(&size.to_le_bytes());
+        let mut registers: Vec<u8> = [0u32, 0, 0, 1 << 16 | 64, 1, 3, 5 << 1]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let code = 0xBF81_0000u32.to_le_bytes();
+        let rooted = |registers: &[u8]| {
+            victory_shader::native::console_compute_container_rooted(registers, &table, &code, Some(bytes))
+        };
+        assert_eq!(
+            rooted(&registers),
+            victory_shader::native::console_compute_container(&registers, &table, &code)
+        );
+        // A user SGPR past the parameters is left unnamed, not refused (the
+        // translator refuses a program that reads it).
+        registers[0x18..0x1c].copy_from_slice(&(6u32 << 1).to_le_bytes());
+        assert!(rooted(&registers).is_ok());
         assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
     }

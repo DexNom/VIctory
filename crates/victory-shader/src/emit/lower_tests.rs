@@ -276,6 +276,22 @@ fn a_scalar_carry_chain_reaches_the_select() {
     }
 }
 
+#[test]
+fn a_conditional_move_of_an_immediate_reaches_the_branch() {
+    // 0x218 program `m049` at 0x4e0-0x4fc: `s_cmovk_i32` then a compare on its result.
+    let words = [
+        0xBE80_0380, // s_mov_b32 s0, 0
+        0xBE81_0380, // s_mov_b32 s1, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xB101_1FFD, // s_cmovk_i32 s1, 0x1ffd
+        0xBF07_8001, // s_cmp_lg_u32 s1, 0
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE83_0380, // s_mov_b32 s3, 0
+        S_ENDPGM,
+    ];
+    lowers(&words, 0).unwrap();
+}
+
 fn perm_features(selector: u32) -> u64 {
     // Synthetic compute shader:
     // v0 is the thread ID and can supply a dynamic selector.
