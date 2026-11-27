@@ -1,4 +1,4 @@
-# DexNom RayTime (AMD) Join the efforts: fluxer.gg/p9Y0JR0q
+# DexNom RayTime (AMD)
 
 DexNom RayTime is a community fork of Marvisak's VIctory for Windows x64. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. This is our most complete tested build so far and the source for the FSR Quality 4K baseline. Game files, executables, saves and generated shader caches stay on your own computer.
 
