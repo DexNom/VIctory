@@ -115,8 +115,79 @@ impl Pending {
 
     fn make(&self) {
         let _ = self.begun.set(Instant::now());
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            static BAD_SHADERS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+            let bad = BAD_SHADERS.get_or_init(|| {
+                let mut set = std::collections::HashSet::new();
+                if let Ok(env) = std::env::var("VICTORY_SKIP_PIPELINES") {
+                    for h in env.split(',') {
+                        let h = h.trim().to_ascii_lowercase();
+                        if !h.is_empty() {
+                            set.insert(h);
+                        }
+                    }
+                }
+                if let Some(path) = super::library::bad_shaders_path()
+                    && let Ok(contents) = std::fs::read_to_string(path)
+                {
+                    for line in contents.lines() {
+                        let h = line.trim().to_ascii_lowercase();
+                        if !h.is_empty() {
+                            set.insert(h);
+                        }
+                    }
+                }
+                set
+            });
+            if self
+                .shaders
+                .iter()
+                .any(|s| bad.contains(&s.hash.to_ascii_lowercase()))
+            {
+                tracing::warn!(shaders = ?self.shaders, "skipping host pipeline build (bad_shaders.txt / VICTORY_SKIP_PIPELINES)");
+                return None;
+            }
+            unsafe extern "C" {
+                fn victory_seh_call(
+                    func: unsafe extern "C" fn(*mut std::ffi::c_void),
+                    ctx: *mut std::ffi::c_void,
+                ) -> i32;
+            }
+            struct CallCtx<'a> {
+                shaders: &'a [Arc<Shader>],
+                graphics: Option<&'a GraphicsState>,
+                out: Option<HostPipeline>,
+            }
+            unsafe extern "C" fn run_make(raw: *mut std::ffi::c_void) {
+                let ctx = unsafe { &mut *raw.cast::<CallCtx<'_>>() };
+                ctx.out = HostPipeline::new(ctx.shaders, ctx.graphics);
+            }
+            let mut ctx = CallCtx {
+                shaders: &self.shaders,
+                graphics: self.graphics.as_deref(),
+                out: None,
+            };
+            let ok = unsafe { victory_seh_call(run_make, (&raw mut ctx).cast()) };
+            if ok == 0 {
+                tracing::warn!(
+                    shaders = ?self.shaders,
+                    "host driver raised 0xc0000005 compiling pipeline; skipping and recording in bad_shaders.txt"
+                );
+                if let Some(path) = super::library::bad_shaders_path()
+                    && let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                {
+                    use std::io::Write;
+                    for s in &self.shaders {
+                        let _ = writeln!(f, "{}", s.hash);
+                    }
+                }
+                return None;
+            }
+            ctx.out
+        });
         let (lock, done) = &self.finished;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -530,7 +601,11 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = std::env::var("VICTORY_PIPELINE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)));
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
