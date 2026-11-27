@@ -14,7 +14,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi as gdi;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F11, VK_RETURN};
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
 use windows_sys::core::{PCSTR, PCWSTR, w};
 
@@ -240,12 +242,164 @@ fn hook(hwnd: HWND) {
     }
 }
 
+/// Whether the title's window is showing full screen now.
+static FULL: AtomicBool = AtomicBool::new(false);
+
+/// The style and place the title's window had before it went full screen.
+static BEFORE: Mutex<Option<(isize, wm::WINDOWPLACEMENT)>> = Mutex::new(None);
+
+/// Alt+Enter (and F11) stretch the title's window over the monitor it is on
+/// and put it back: a borderless window, so the swap chain keeps the size the
+/// title made it and stretches to it, and no display mode changes. That is
+/// what a console does with a title that draws 1280x720 on a 4K panel.
+///
+/// `true` when the message was one of those keys and is spent, so the title
+/// never sees half a keystroke and `WM_SYSCHAR` never runs (the system beeps
+/// on it when the window has no menu bar).
+fn full_screen_key(hwnd: HWND, message: u32, wparam: WPARAM) -> bool {
+    // A plain Enter is the title's own A button: eating it would turn every
+    // menu confirmation into a mode switch. Only Alt+Enter (a system key)
+    // and F11 are ours.
+    let alt_enter = wparam == VK_RETURN as usize;
+    let f11 = wparam == VK_F11 as usize;
+    match message {
+        wm::WM_SYSKEYDOWN if alt_enter => {
+            full_screen(hwnd);
+            true
+        }
+        wm::WM_SYSKEYUP if alt_enter => true,
+        wm::WM_SYSCHAR if alt_enter => true,
+        wm::WM_KEYDOWN if f11 => {
+            full_screen(hwnd);
+            true
+        }
+        wm::WM_KEYUP if f11 => true,
+        _ => false,
+    }
+}
+
+/// Switches the title's window between full screen and the size and place it
+/// had. The lock is released before the window is moved: the move sends
+/// messages back to this procedure.
+fn full_screen(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    let mut before = BEFORE.lock().unwrap_or_else(|e| e.into_inner());
+    if FULL.load(Ordering::Relaxed) {
+        let restore = before.take();
+        drop(before);
+        if let Some((style, place)) = restore {
+            // SAFETY: a live window of the title's thread.
+            unsafe {
+                wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, style);
+                wm::SetWindowPlacement(hwnd, &place);
+                wm::SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    wm::SWP_NOMOVE
+                        | wm::SWP_NOSIZE
+                        | wm::SWP_NOZORDER
+                        | wm::SWP_NOOWNERZORDER
+                        | wm::SWP_FRAMECHANGED,
+                );
+            }
+        }
+        FULL.store(false, Ordering::Relaxed);
+        tracing::info!("full screen off");
+        return;
+    }
+    // SAFETY: a live window of the title's thread; the monitor it is on
+    // answers.
+    unsafe {
+        let style = wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE);
+        let mut place: wm::WINDOWPLACEMENT = std::mem::zeroed();
+        place.length = std::mem::size_of::<wm::WINDOWPLACEMENT>() as u32;
+        wm::GetWindowPlacement(hwnd, &mut place);
+        *before = Some((style, place));
+        drop(before);
+        let monitor = gdi::MonitorFromWindow(hwnd, gdi::MONITOR_DEFAULTTONEAREST);
+        let mut info: gdi::MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<gdi::MONITORINFO>() as u32;
+        let area = if gdi::GetMonitorInfoW(monitor, &mut info) != 0 {
+            info.rcMonitor
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: wm::GetSystemMetrics(wm::SM_CXSCREEN),
+                bottom: wm::GetSystemMetrics(wm::SM_CYSCREEN),
+            }
+        };
+        // A popup has no frame, no caption and no thick edges: the client is
+        // the monitor, so the swap chain stretches over every pixel of it.
+        let popup = (style & !(wm::WS_OVERLAPPEDWINDOW as isize))
+            | wm::WS_POPUP as isize
+            | wm::WS_VISIBLE as isize;
+        wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, popup);
+        wm::SetWindowPos(
+            hwnd,
+            wm::HWND_TOP,
+            area.left,
+            area.top,
+            area.right - area.left,
+            area.bottom - area.top,
+            wm::SWP_FRAMECHANGED | wm::SWP_SHOWWINDOW | wm::SWP_NOOWNERZORDER,
+        );
+        FULL.store(true, Ordering::Relaxed);
+        tracing::info!(
+            width = area.right - area.left,
+            height = area.bottom - area.top,
+            "full screen on (Alt+Enter or F11 puts it back)"
+        );
+    }
+}
+
+/// The one-shot timer that applies `VICTORY_FULLSCREEN` on the title's own
+/// thread, a few seconds after its window exists.
+const FULL_SCREEN_TIMER: usize = 0x5C3F;
+
+/// Whether that timer was armed already (once per process).
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Whether `VICTORY_FULLSCREEN` asks for full screen at startup.
+fn full_screen_asked() -> bool {
+    std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v != "0")
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // `VICTORY_FULLSCREEN` stretches the title's window a few seconds in, on
+    // the thread that owns it: the title sets its own client size right after
+    // the chain exists, and a window moved from another thread while it does
+    // that is a crash, not a resize.
+    if message == wm::WM_TIMER && wparam == FULL_SCREEN_TIMER {
+        // SAFETY: a live window of the title's thread.
+        unsafe { wm::KillTimer(hwnd, FULL_SCREEN_TIMER) };
+        if !FULL.load(Ordering::Relaxed) {
+            full_screen(hwnd);
+        }
+        return 0;
+    }
+    if !ARMED.swap(true, Ordering::Relaxed) && full_screen_asked() {
+        // SAFETY: as above; the timer comes back to this procedure.
+        unsafe { wm::SetTimer(hwnd, FULL_SCREEN_TIMER, 5_000, None) };
+    }
+    // Alt+Enter and F11 stretch the title's window over the monitor it is on
+    // and put it back ([`full_screen`]): the console has no window menu, and
+    // DXGI's own Alt+Enter cannot set a mode on a chain that was never made to
+    // switch any.
+    if full_screen_key(hwnd, message, wparam) {
+        return 0;
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {

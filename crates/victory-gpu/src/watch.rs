@@ -56,7 +56,7 @@ fn parts_on() -> bool {
 
 impl Shard {
     const fn new() -> Shard {
-        Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
+        Shard { written: BTreeMap::new(), most: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
     }
 
     /// Page `page` was found written by asking `now`: the parts in `parts`
@@ -69,6 +69,8 @@ impl Shard {
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.get(&page).copied().unwrap_or(0);
         self.written.insert(page, before.max(now));
+        let most = self.most.entry(page >> SHARD_SHIFT).or_insert(0);
+        *most = (*most).max(now);
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -133,6 +135,12 @@ struct Notes([RwLock<Shard>; SHARDS]);
 struct Shard {
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// Per piece of `1 << SHARD_SHIFT` pages, the newest asking that found a
+    /// page of it written: the summary that answers "nothing new here" for a
+    /// whole piece without walking [`written`], which holds every page ever
+    /// written (millions of them in a long session) and pays a cache miss a
+    /// level for every lookup.
+    most: BTreeMap<usize, u64>,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -168,6 +176,19 @@ impl Notes {
     /// See [`Shard::parts_since`].
     fn parts_since(&self, page: usize, taken: u64) -> u16 {
         self.read(shard_of(page)).parts_since(page, taken)
+    }
+
+    /// Whether no page of `[first, last)` was found written by an asking
+    /// after `since`, from the pieces' summary alone: `true` when the answer
+    /// is known, `false` when [`Notes::each`] has to walk the pages.
+    fn nothing_since(&self, first: usize, last: usize, since: u64) -> bool {
+        if first >= last {
+            return true;
+        }
+        ((first >> SHARD_SHIFT)..=((last - 1) >> SHARD_SHIFT)).all(|piece| {
+            let s = self.read(piece % SHARDS);
+            s.most.get(&piece).is_none_or(|&most| most <= since)
+        })
     }
 
     /// The notes of pages `[first, last)` in page order, `each` of them
@@ -1381,8 +1402,19 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+    if ranged == 0 && taken.iter().any(|&at| at == 0) {
+        return false;
+    }
+    // The pieces' summary answers for whole pieces of 4 MiB: a page whose
+    // piece has nothing written after the oldest asking that took a page of
+    // the range is as the copy has it, without walking the journal's every
+    // page ever written (millions of them in a long session). Nearly every
+    // range is one or two pieces, and nearly every one of them copies
+    // nothing, so this is the answer nearly every time.
+    if j.notes.nothing_since(first, last, taken.iter().copied().min().unwrap_or(0).max(ranged)) {
+        return true;
+    }
+    j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
 }
 
 impl Tracked {
@@ -5737,6 +5769,40 @@ mod port7_tests {
         assert_eq!(s.parts_since(3, 10), 0b100);
         assert_eq!(s.parts_since(3, 9), WHOLE);
         assert_eq!(s.written[&3], 12);
+    }
+
+    /// The pieces' summary never says "nothing new" where the walk would
+    /// find a page written after the asking: the fast path in
+    /// [`nothing_new`] leans on it, and a summary that fell behind the notes
+    /// would show the card old bytes (a texture that flickers or goes
+    /// missing).
+    #[test]
+    fn the_pieces_summary_never_says_nothing_new_when_the_walk_would_not() {
+        let notes = Notes::new();
+        let p = 3 << SHARD_SHIFT;
+        let mut held = notes.hold(shards_of_pages([p, p + 5, p + 900]), true);
+        held.note(p, WHOLE, 4);
+        held.note(p + 5, 0b11, 9);
+        held.note(p + 900, WHOLE, 2);
+        drop(held);
+        let mut seed = 11;
+        for _ in 0..2000 {
+            let first = p - 2 + rng(&mut seed, 906);
+            let last = first + 1 + rng(&mut seed, 40);
+            let since = rng(&mut seed, 12) as u64;
+            if notes.nothing_since(first, last, since) {
+                assert!(notes.each(first, last, |_, w| w <= since), "{first}..{last} since {since}: the summary was behind the notes");
+            }
+        }
+        // A piece nothing was ever noted in is nothing new; a page noted
+        // after the asking that took it is new.
+        assert!(notes.nothing_since(p + (1 << SHARD_SHIFT), p + (1 << SHARD_SHIFT) + 1, 0), "a piece with no note");
+        assert!(!notes.nothing_since(p, p + 1, 3), "the page was written at 4");
+        // The summary is per piece, so another page of it noted after the
+        // asking makes it say "look" for this one too; the walk still says
+        // the page itself is as the copy has it. Conservative, never wrong.
+        assert!(!notes.nothing_since(p, p + 1, 4), "another page of the piece was written at 9");
+        assert!(notes.each(p, p + 1, |_, w| w <= 4), "the page itself was written at 4");
     }
 
     /// Many threads note pages (holding their parts for writing, a number

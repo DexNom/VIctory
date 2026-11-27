@@ -64,5 +64,31 @@ GPU, VRAM, RAM e draws. O botão **Jogar com painel** já abre com ele ligado.
 A janela do jogo nasce fora da tela e sem foco. O launcher a traz para frente
 nos primeiros dois minutos e para depois — não fica roubando o foco.
 
+`Alt+Enter` ou `F11` alternam entre janela e **tela cheia**. É uma janela sem
+borda do tamanho do monitor: a imagem que o jogo desenha mantém o tamanho dela e
+é esticada por cima de todos os pixels, como o console faz com um jogo de
+1280x720 numa TV 4K. Nenhum modo de vídeo muda, então não há piscada preta nem
+espera do monitor — e `Alt+Tab` continua sendo do Windows.
+
+O launcher tem a caixa **Tela cheia**, que abre a partida já assim
+(`settings.ini`, `fullscreen=1`).
+
 O console do runtime não abre janela nenhuma. Se precisar do log, ele está em
 `%TEMP%\victory\` ou no `stderr` de quem iniciou o processo.
+
+## Nível de textura
+
+**Desligado nesta build.** O seletor saiu do launcher e o runtime não reduz mais
+nada: toda textura sobe inteira, como antes da opção existir.
+
+O motivo está em `OTIMIZACOES.md`: com **Médio** e com **Baixo** o jogo removia o
+device do host na tela de carregamento (`0x887A0001`, chamada inválida) e morria
+antes do mundo. Com **Alto** o mesmo binário roda estável. Três consertos
+entraram no caminho de cópia (tiled sem piso, twin de profundidade na descrição
+reduzida, `TEXTURE2DARRAY` deslocado, envio limitado ao que a cópia tem), mas
+sobrou pelo menos uma chamada inválida que a camada de depuração do D3D12 não
+nomeia — ela não está instalada nesta máquina.
+
+Se quiser a textura mais macia e menos VRAM de volta, o próximo passo é instalar
+os *Graphics Tools* do Windows e rodar uma build `diagnostics` com
+`VICTORY_D3D12_DEBUG=1`; a mensagem diz o comando exato.

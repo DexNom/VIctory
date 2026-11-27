@@ -75,12 +75,25 @@ use crate::shadow::Shadow;
 /// The landing tells the guards (`crate::watch::landing`), so a texture
 /// made from older bytes is made again. This is why stage 2 is its own.
 pub(super) fn stage() -> u32 {
+    // Diagnostics: stage 1 against stage 2 in one run (`VICTORY_AB=20,VICTORY_CARD_STEPS`).
+    #[cfg(feature = "diagnostics")]
+    if let Some(bit) = ab_bit() {
+        return if crate::ab::on(bit) { 2 } else { 1 };
+    }
     static STAGE: OnceLock<u32> = OnceLock::new();
     *STAGE.get_or_init(|| match std::env::var("VICTORY_CARD_STEPS").ok().as_deref() {
         Some("1") => 1,
         Some("2") => 2,
         _ => 0,
     })
+}
+
+/// [`crate::ab`]'s number for `VICTORY_CARD_STEPS`, looked up once: `stage` is
+/// asked on every submission's every step.
+#[cfg(feature = "diagnostics")]
+fn ab_bit() -> Option<u32> {
+    static BIT: OnceLock<Option<u32>> = OnceLock::new();
+    *BIT.get_or_init(|| crate::ab::bit("VICTORY_CARD_STEPS"))
 }
 
 /// Whether a copy at its place in a list ([`place`]) is only in the way of

@@ -385,6 +385,80 @@ cópia de volta) contra **26,8 ms de placa**, num quadro de 74,9 ms. A placa
 não é o muro; o preparo é, e ele é feito de 3.264 draws traduzidos por quadro
 (8,2 µs de CPU cada) mais 9.749 spans de refresh.
 
+## Rodada 27/11 (2) — nível de textura e tela cheia
+
+Pedido do chef: baixar a qualidade gráfica para ganhar fps, e poder jogar em tela
+cheia. A tela cheia ficou. O nível de textura ficou **desligado**: ele removia o
+device na tela de carregamento e o jogo morria antes do mundo.
+
+### Nível de textura: desligado (removia o device)
+
+A ideia: a cópia do host de uma textura colocada pelo título já começa no
+primeiro nível que as views dela mostram (`VICTORY_HELD_LEVELS`); o nível de
+textura empurrava esse começo para baixo — nível 1 custa 25% dos bytes do nível
+0, nível 2 custa 6%. Nada sumia da tela: a view era deslocada (`from_base`) e
+mostrava o nível 1 no lugar do 0.
+
+O que aconteceu: com `medium` e com `low` o jogo morria na tela de carregamento,
+~56 s depois de abrir, com `0x887A0001` — chamada inválida no device do host — e
+o `awake` relatando `the card is not kept awake`. Três partidas seguidas, sempre
+no mesmo ponto. Com `high` (viés 0) o mesmo binário roda 17,5 fps sem uma única
+ocorrência de `887A`.
+
+Corrigido no caminho, mas não bastou para provar o resto:
+
+- **textura com níveis sob demanda (`crate::tiles`) não aceita piso.** Ela é a
+  cadeia inteira do título, cortada em tiles; `host.base` recebia o piso mesmo
+  assim e o envio pedia `mips = base + d.MipLevels` — um nível a mais do que a
+  textura tem. Agora `base` volta a zero quando a textura é tiled.
+- **o twin de profundidade nasce da descrição reduzida** (`from_level(base)`),
+  senão os dois têm tamanhos diferentes e a cópia entre eles é inválida.
+- **`from_base` passou a deslocar também `TEXTURE2DARRAY`**, que é como o título
+  vê quase toda textura de uma fatia. Antes ele saía fora e a view pedia níveis
+  que a cópia não tinha.
+- **o envio nunca pede um nível que a cópia não tem** (`have`/`count` em
+  `texture.rs`).
+
+Sobrou pelo menos uma chamada inválida em algum ponto do caminho de cópia que
+não foi identificado — a camada de depuração do D3D12 não está instalada nesta
+máquina (`D3D12GetDebugInterface` responde "componente SDK ausente"), então ela
+não nomeia o comando. Enquanto isso, `mip_bias()` devolve 0 e `base_floor`
+devolve 0: **toda textura sobe inteira, exatamente como antes da opção existir**.
+O launcher não oferece mais o seletor.
+
+Para religar, o caminho é: instalar os Graphics Tools do Windows, rodar com
+`VICTORY_D3D12_DEBUG=1` numa build `diagnostics`, e fechar a chamada que sobra.
+
+### Tela cheia: janela sem borda, swap chain esticada
+
+`Alt+Enter` não fazia nada por dois motivos: o `wndproc` do título não trata a
+tecla, e o DXGI tem o próprio Alt+Enter, que chama `SetFullscreenState` numa
+swap chain que nunca foi feita para trocar de modo (sem
+`DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH`) — ele falha calado.
+
+Agora `MakeWindowAssociation(DXGI_MWA_NO_ALT_ENTER)` tira a tecla do DXGI, e o
+`window_proc` do título (e o da janela própria do host, quando é ela) troca o
+estilo para `WS_POPUP` e põe a janela no retângulo do monitor
+(`MonitorFromWindow`). A swap chain não é recriada: ela mantém o tamanho que o
+título fez (1280x720) e o flip model estica para 1920x1080. Nenhum modo de vídeo
+muda, então não há piscada preta, não há espera do monitor e `Alt+Tab` continua
+sendo do Windows.
+
+Duas coisas que a primeira versão errava:
+
+- **quem aplica `VICTORY_FULLSCREEN=1` é a thread dona da janela.** A primeira
+  versão esticava a janela do título de dentro da thread do apresentador, no
+  instante em que a swap chain nascia. O título ainda estava dimensionando a
+  própria janela e levava um `WM_SIZE` de fora: `0xc0000005` escrevendo em
+  `0x0` dentro de um módulo do jogo, 15 s depois de abrir. Agora a janela do
+  título recebe o pedido por um `WM_TIMER` de 5 s na thread dela (o pedido é
+  feito no `window_proc` que o `lifecycle` instala), e a janela própria do host
+  aplica no `make_window`, que é nossa.
+- **Enter sozinho não é nosso.** A primeira versão tratava `WM_KEYDOWN` +
+  `VK_RETURN`, e o Enter do título é o botão A: confirmar qualquer menu viraria
+  troca de tela cheia. Agora só `Alt+Enter` (que chega como `WM_SYSKEYDOWN`) e
+  `F11` trocam; o Enter simples segue para o jogo.
+
 ## Limites conhecidos
 
 - **16 GB é o piso, não o recomendado.** O processo chega a 22 GB privados; o

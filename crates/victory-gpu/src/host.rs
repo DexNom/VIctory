@@ -7831,6 +7831,20 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line: of the refreshes' flushes, the part told
+/// "copies nothing" on the submitting thread (nanoseconds, spans looked at)
+/// and the part done after it (nanoseconds, spans left).
+#[cfg(feature = "diagnostics")]
+static REFRESH_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Adds to [`REFRESH_STATS`]: `serial` is the pair of that part.
+#[cfg(feature = "diagnostics")]
+fn refresh_stat(serial: bool, ns: u64, spans: u64) {
+    let at = if serial { 0 } else { 2 };
+    REFRESH_STATS[at].fetch_add(ns, Ordering::Relaxed);
+    REFRESH_STATS[at + 1].fetch_add(spans, Ordering::Relaxed);
+}
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -7924,6 +7938,17 @@ fn split_line(frames: f64) {
         h[1],
         h[2],
         aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
+    );
+    let r: Vec<f64> = REFRESH_STATS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "refreshes split per frame: told 'copies nothing' on the submitting thread {:.1} ms for {:.0} spans, then {:.1} ms for the {:.0} \
+         left (VICTORY_REFRESH_FEW={:.0}, VICTORY_WIDE_REFRESH is {})",
+        r[0] / 1e6,
+        r[1],
+        r[2] / 1e6,
+        r[3],
+        std::env::var("VICTORY_REFRESH_FEW").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(256.0),
+        if wide_refresh() { "on" } else { "off" },
     );
 }
 
@@ -8583,6 +8608,8 @@ impl Batch {
         let mut spans = spans;
         // (Renderer port #6: on the threads beside, whatever their number.)
         let many = spans.len() > few || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
+        #[cfg(feature = "diagnostics")]
+        let serial = (std::time::Instant::now(), spans.len());
         if !many {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]
@@ -8591,6 +8618,8 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        refresh_stat(true, serial.0.elapsed().as_nanos() as u64, if many { 0 } else { serial.1 as u64 });
         let ahead = spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
@@ -8598,6 +8627,8 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let wide = (std::time::Instant::now(), spans.len());
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -8612,6 +8643,8 @@ impl Batch {
             }
             Self::update(shadow, *from, *to);
         });
+        #[cfg(feature = "diagnostics")]
+        refresh_stat(false, wide.0.elapsed().as_nanos() as u64, wide.1 as u64);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -8750,7 +8783,10 @@ impl Batch {
             self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+            {
+                FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+                refresh_stat(true, started.elapsed().as_nanos() as u64, all as u64);
+            }
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -8766,6 +8802,8 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        let wide = (std::time::Instant::now(), self.refreshes.len());
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
@@ -8801,6 +8839,8 @@ impl Batch {
                 Self::update(&shadow, from, to);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        refresh_stat(false, wide.0.elapsed().as_nanos() as u64, wide.1 as u64);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -9874,9 +9914,20 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            // DXGI's own Alt+Enter calls SetFullscreenState on a chain that
+            // was never made to change display modes (no
+            // ALLOW_MODE_SWITCH): it fails, and the key does nothing.
+            // [`crate::screen`] stretches the window instead, so DXGI is told
+            // to leave the key alone.
+            let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
+            // `VICTORY_FULLSCREEN` is applied by whoever owns the window: the
+            // title's own thread ([`victory_hle`]) when the window is the
+            // title's, and `make_window` when it is ours. Moving the title's
+            // window from this thread while the title is still sizing it is a
+            // crash, not a resize.
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
@@ -10366,6 +10417,11 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Alt+Enter and F11 stretch the window over the monitor it is on and put
+    // it back ([`crate::screen`]).
+    if crate::screen::key(hwnd, message, wparam.0) {
+        return LRESULT(0);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
@@ -10391,7 +10447,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
@@ -10404,7 +10460,11 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             None,
             Some(instance.into()),
             None,
-        )
+        )?;
+        // Our own window: `VICTORY_FULLSCREEN` is safe to apply from here,
+        // a few seconds in, since nothing else sizes it.
+        crate::screen::start(hwnd);
+        Ok(hwnd)
     }
 }
 

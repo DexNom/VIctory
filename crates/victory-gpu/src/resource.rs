@@ -1316,11 +1316,35 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     base
 }
 
+/// The level a host copy may not start below: the texture quality setting
+/// ([`crate::quality`]) as a level of this texture, or 0 when it is high.
+///
+/// Asked for every slot looked at and every view written, so the answer is
+/// remembered per description: a texture's layout is built from the
+/// description each time otherwise.
+#[cfg(windows)]
+pub(crate) fn base_floor(desc: &ResourceDesc) -> u32 {
+    let bias = crate::quality::mip_bias();
+    if bias == 0 {
+        return 0;
+    }
+    type Known = std::collections::HashMap<[u32; 14], u32>;
+    thread_local! {
+        static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let key: [u32; 14] = unsafe { std::ptr::read_unaligned(std::ptr::from_ref(desc).cast()) };
+    KNOWN.with(|known| *known.borrow_mut().entry(key).or_insert_with(|| base_level(desc, bias)))
+}
+
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
 #[cfg(windows)]
 pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
+    // SAFETY: 56 bytes in the description's layout.
+    let floor = base_floor(&unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() });
+    let first = first.max(floor);
     if first == 0 || !held_only() {
         return placed_bytes(desc);
     }
@@ -1373,7 +1397,12 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    // A copy that already begins at or below the level the view wants, and
+    // at or below the texture quality setting's level, has it: the picture
+    // is soft where the setting says so, and that is not a reason to make
+    // the whole texture again.
+    let wanted = base_level(&r.desc, first).max(base_floor(&r.desc));
+    if host.base == 0 || host.base <= wanted {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1652,6 +1681,19 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
             }
+            // The texture quality setting ([`crate::quality`]): the copy
+            // begins at its level even where every view of the texture
+            // starts at 0. What the picture loses is the largest level, and
+            // with it three quarters of the bytes read from title memory, of
+            // the card's memory for the copy, and of what a refresh walks.
+            base = base.max(base_floor(&r.desc));
+        }
+        // A texture with levels on demand is the title's whole chain, cut into
+        // tiles and given memory level by level: a copy that began below level
+        // 0 would neither match its tiles nor its level count, and the upload
+        // that fills it would ask the card for a level it does not have.
+        if tiled.is_some() {
+            base = 0;
         }
         let texture = match texture {
             Some(texture) => Some(texture),
@@ -1661,7 +1703,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             r.host.refused.store(true, Relaxed);
             return None;
         };
-        let twin = twin_texture(&r.desc, &texture);
+        let twin = twin_texture(&r.desc.from_level(base), &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
         // name.
@@ -4766,6 +4808,24 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// O piso do nivel de textura e um nivel que a textura tem: um nivel
+    /// inteiro de blocos do formato, nunca o ultimo da cadeia, e zero numa
+    /// textura de um nivel so.
+    #[cfg(windows)]
+    #[test]
+    fn a_quality_floor_is_a_level_the_texture_has() {
+        // 256x256 BC7, nove niveis, blocos de 4 KiB.
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        // SAFETY: 56 bytes no layout da descricao.
+        let d = unsafe { std::ptr::read_unaligned(desc.as_ptr().cast::<ResourceDesc>()) };
+        assert_eq!(base_level(&d, 1), 1);
+        assert_eq!(base_level(&d, 2), 2);
+        assert!(base_level(&d, 9) < 9, "past the chain it stops at the last level");
+        let mut flat = d;
+        flat.mip_levels = 1;
+        assert_eq!(base_level(&flat, 2), 0, "a texture of one level keeps it");
     }
 
     #[test]

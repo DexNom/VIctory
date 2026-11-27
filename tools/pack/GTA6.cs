@@ -22,6 +22,10 @@ static class GTA6
     // Mover a pasta inteira nao quebra nada.
     static readonly string Runtime = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
     static readonly string GamePathFile = Path.Combine(Runtime, "game-path.txt");
+    // As opcoes do jogo, como as de um jogo instalado: ficam num arquivo ao
+    // lado do GTA6.exe e valem para toda partida, inclusive as de linha de
+    // comando. `fullscreen=0|1`.
+    static readonly string SettingsFile = Path.Combine(Runtime, "settings.ini");
 
     static Form window;
     static Label status;
@@ -29,6 +33,7 @@ static class GTA6
     static Button play1080;
     static Button playPanel;
     static Button prepare;
+    static CheckBox fullScreenBox;
     static Process running;
     static Timer focus;
     static int focusTicks;
@@ -178,6 +183,74 @@ static class GTA6
         File.WriteAllText(GamePathFile, Path.Combine(folder, GameExe), new UTF8Encoding(false));
     }
 
+    static string Setting(string key, string fallback)
+    {
+        try
+        {
+            if (File.Exists(SettingsFile))
+            {
+                foreach (string line in File.ReadAllLines(SettingsFile))
+                {
+                    int at = line.IndexOf('=');
+                    if (at <= 0)
+                    {
+                        continue;
+                    }
+                    if (string.Equals(line.Substring(0, at).Trim(), key, StringComparison.OrdinalIgnoreCase))
+                    {
+                        string value = line.Substring(at + 1).Trim();
+                        if (value.Length > 0)
+                        {
+                            return value;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception)
+        {
+        }
+        return fallback;
+    }
+
+    static void SaveSetting(string key, string value)
+    {
+        try
+        {
+            System.Collections.Generic.List<string> lines = new System.Collections.Generic.List<string>();
+            bool wrote = false;
+            if (File.Exists(SettingsFile))
+            {
+                foreach (string line in File.ReadAllLines(SettingsFile))
+                {
+                    int at = line.IndexOf('=');
+                    if (at > 0 && string.Equals(line.Substring(0, at).Trim(), key, StringComparison.OrdinalIgnoreCase))
+                    {
+                        lines.Add(key + "=" + value);
+                        wrote = true;
+                    }
+                    else
+                    {
+                        lines.Add(line);
+                    }
+                }
+            }
+            if (!wrote)
+            {
+                lines.Add(key + "=" + value);
+            }
+            File.WriteAllLines(SettingsFile, lines.ToArray(), new UTF8Encoding(false));
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    static bool FullScreen()
+    {
+        return Setting("fullscreen", "0").Trim() == "1";
+    }
+
     static string FindGame()
     {
         string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -310,6 +383,13 @@ static class GTA6
         // mundo a CPU e a parede (41-50 ms de preparo contra 30-37 de GPU),
         // entao a placa tem folga para desenhar 720p inteiro.
         start.EnvironmentVariables["VICTORY_RENDER_SCALE"] = "1.0";
+        // O nivel de textura fica em `high`: a reducao por mip bias removia o
+        // device na tela de carregamento, entao ela esta desligada no runtime
+        // e o launcher nao a oferece.
+        // Janela sem borda do tamanho do monitor. Alt+Enter e F11 alternam
+        // dentro do jogo; a swap chain mantem o tamanho que o titulo fez e
+        // estica, entao nada e recriado e nenhum modo de video muda.
+        start.EnvironmentVariables["VICTORY_FULLSCREEN"] = FullScreen() ? "1" : "0";
         // A biblioteca de pipelines: 200 e poucos MB de disco que valem a fila
         // inteira. STORE_LATER entrega a pipeline na hora e a grava com o save,
         // em vez de segurar o quadro esperando o disco.
@@ -598,7 +678,7 @@ static class GTA6
     {
         window = new Form();
         window.Text = "GTA6";
-        window.ClientSize = new Size(560, 360);
+        window.ClientSize = new Size(560, 420);
         window.FormBorderStyle = FormBorderStyle.FixedSingle;
         window.MaximizeBox = false;
         window.StartPosition = FormStartPosition.CenterScreen;
@@ -644,14 +724,25 @@ static class GTA6
         // Compilar antes de jogar: as pipelines que os quadros desenham ja
         // feitas no cache do driver. Sem isso elas sao feitas no meio do
         // quadro, e cada uma custa um congelamento.
-        prepare = MakeButton("Preparar (compilar)", 30, 208, 240);
+        fullScreenBox = new CheckBox();
+        fullScreenBox.Text = "Tela cheia";
+        fullScreenBox.ForeColor = Color.FromArgb(220, 220, 226);
+        fullScreenBox.SetBounds(30, 204, 240, 26);
+        fullScreenBox.Checked = FullScreen();
+        fullScreenBox.CheckedChanged += delegate
+        {
+            SaveSetting("fullscreen", fullScreenBox.Checked ? "1" : "0");
+        };
+        window.Controls.Add(fullScreenBox);
+
+        prepare = MakeButton("Preparar (compilar)", 30, 262, 240);
         prepare.Click += delegate { Prepare(); };
         window.Controls.Add(prepare);
 
         status = new Label();
         status.Text = "Jogo: " + (ReadGamePath().Length > 0 ? ReadGamePath() : "nao encontrado");
         status.ForeColor = Color.FromArgb(150, 150, 160);
-        status.SetBounds(30, 264, 500, 80);
+        status.SetBounds(30, 312, 500, 80);
         window.Controls.Add(status);
 
         focus = new Timer();

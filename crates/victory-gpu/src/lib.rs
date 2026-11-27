@@ -62,6 +62,8 @@ mod pool;
 mod popwatch;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod quality;
 pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -75,6 +77,8 @@ pub mod root;
 mod safecopy;
 #[cfg(windows)]
 mod sampler;
+#[cfg(windows)]
+mod screen;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]

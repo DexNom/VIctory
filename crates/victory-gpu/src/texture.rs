@@ -1921,6 +1921,17 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     } else {
         (mips - first) * u32::from(d.DepthOrArraySize)
     };
+    // A copy that begins at `level0` has `d.MipLevels` levels from there on,
+    // and the card is asked for `count` subresources starting at
+    // `first - level0`. Asking past the last one is an invalid call, and an
+    // invalid call removes the device: the title dies with it.
+    let have = u32::from(d.MipLevels).saturating_sub(first - level0);
+    let per_level = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(d.DepthOrArraySize)
+    };
+    let count = count.min(have * per_level);
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;

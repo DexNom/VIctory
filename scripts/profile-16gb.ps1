@@ -51,6 +51,9 @@ $settings = @{
     VICTORY_UNDER_THREADS = '3'         # was 6
     VICTORY_VIEW_THREADS = '3'          # was 4 views + 6 records
     # ---- card: 8 GB, DXGI budget ~7.1 GB ------------------------------------
+    # Nivel de textura: desligado. A reducao por mip bias removia o device na
+    # tela de carregamento (0x887A0001, chamada invalida no caminho de copia),
+    # entao toda textura sobe inteira, como antes da opcao existir.
     # At 95 % the queue filled the card to its line and every render target or
     # buffer copy the host made after that was refused: textures were evicted
     # and uploaded again (15,462 waiting, 5,655 MB uploaded). 86 % leaves ~1 GB.
@@ -103,6 +106,9 @@ $settings = @{
     # The mouse looks while the right button is held (the fork's own port).
     VICTORY_MOUSE_LOOK = '1'
     VICTORY_MOUSE_SENSITIVITY = '0.05'
+    # Janela sem borda do tamanho do monitor. Alt+Enter ou F11 alternam dentro
+    # do jogo (a swap chain mantem o tamanho e estica; nenhum modo muda).
+    VICTORY_FULLSCREEN = '0'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 return $settings
