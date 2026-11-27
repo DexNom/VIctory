@@ -5,14 +5,14 @@ A GPU counter on one of the game's traversal shaders recorded finite triangle
 intersections inside the rays' requested distances. This verifies traversal
 against in-game geometry. The lighting result of each pass and the total
 number of bounces still need validation. The normal launcher leaves the
-dynamic structure builder off. [Setup and launch instructions](../README.md)
+dynamic structure builder off. [Graphics modes](graphics.md)
 
 ## What the title does
 
-The title's indirect light (probes, bounce, reflections) and the
-shadows of its lamps and sun are ray traced. Without them, anything the sun
-does not hit directly is black: interiors, the shadowed side of a face, rooms
-lit only by lamps.
+The title ray traces indirect light, reflections, and shadows from lamps
+and the sun. Incomplete ray tracing can leave interiors and shaded
+surfaces very dark. The RT-off mode adds ambient fill to supported
+material shaders.
 
 The title does not use a ray-tracing API:
 

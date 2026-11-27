@@ -1,9 +1,8 @@
-//! Rule #1, statically: the repository only ever contains small text files
-//! that we wrote. See docs/asset-policy.md.
+//! Rule #1, statically: small text files we wrote and the approved README banner.
+//! See docs/asset-policy.md.
 //!
-//! This is an allowlist, not a blocklist: a file passes only if its name is
-//! on the list, it is not too big, it is text, and it does not smuggle data
-//! inside text (long hex/base64 runs).
+//! Source files must have an approved name or extension, fit the size limit,
+//! and contain text without long runs of encoded data.
 
 use std::path::Path;
 use std::process::Command;
@@ -12,6 +11,8 @@ use anyhow::{Context, Result, bail};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
+const README_BANNER_PATH: &str = ".github/assets/raytime-banner.png";
+const README_BANNER_HASH: &str = "c86a2ee39eeffd1c0393188b71260ce92ccf949601d595105365186cbfd6479b";
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
@@ -135,6 +136,14 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
 
 /// All problems with one file. Pure, for testing.
 pub fn check(path: &str, content: &[u8]) -> Vec<String> {
+    if path == README_BANNER_PATH {
+        let hash = blake3::hash(content).to_hex();
+        if hash.as_str() == README_BANNER_HASH {
+            return Vec::new();
+        }
+        return vec![format!("unapproved README banner (BLAKE3 {hash})")];
+    }
+
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
@@ -191,6 +200,8 @@ mod tests {
 
     #[test]
     fn rejects_game_like_files() {
+        assert!(!check(".github/assets/other.png", b"\x89PNG\r\n\x1a\n").is_empty());
+        assert!(!check(super::README_BANNER_PATH, b"\x89PNG\r\n\x1a\n").is_empty());
         assert!(!check("assets/tex.dds", b"DDS \x7c\0\0\0").is_empty());
         assert!(
             !check("notes.txt", b"MZ\x90\0").is_empty(),
