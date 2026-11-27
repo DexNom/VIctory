@@ -82,6 +82,25 @@ fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
 /// Ported from trustno1-coder/VIctory-NVIDIA (GPL-3.0-or-later, same licence).
 const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
 
+/// Shader hashes whose pipelines are left out, from
+/// `VICTORY_LEAVE_OUT=<16 hex digits>[,..]`. Empty by default, so nothing
+/// changes unless it is asked for; `VICTORY_SKIP_PIPELINES` does the same in
+/// diagnostics builds only. Ported from Amdavea/onlycheat (GPL-3.0-or-later),
+/// where `02384a60fda6f2d0` (`CS_DefragHeap_ComputeRelocations`, the decal
+/// heap's defrag) took 11.85 ms of the card a frame in the first gameplay area
+/// and `731a39171b568298` is the heat haze.
+fn leave_out() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    })
+}
+
 fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
     static ASKED: OnceLock<bool> = OnceLock::new();
     let asked = *ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"));
@@ -89,6 +108,9 @@ fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
+        return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
     if water_light_left_out(shaders) {
         static SAID: std::sync::Once = std::sync::Once::new();
         SAID.call_once(|| {

@@ -144,6 +144,14 @@ de GPU. Ficam de fora por padrão — água mais escura e azulada, blocos fora,
 GPU ~10 ms mais leve. `VICTORY_WATER_LIGHT=1` religa os dois (e os blocos).
 Portado de `trustno1-coder/VIctory-NVIDIA`.
 
+**Deixar de fora qualquer pipeline, por hash:** `VICTORY_LEAVE_OUT` recebe uma
+lista de hashes de 16 dígitos separados por vírgula, e os pipelines deles não
+são criados. Vazio por padrão. O `onlycheat` usa
+`VICTORY_LEAVE_OUT=02384a60fda6f2d0,731a39171b568298` — o defrag do heap de
+decalques (`CS_DefragHeap_ComputeRelocations`, 11,85 ms de placa por quadro na
+primeira área de jogo) e a névoa de calor. Efeito colateral: o que aquele
+pipeline desenhava some. Portado de `Amdavea/onlycheat`.
+
 O que `balanced` corta: sombra por ray tracing, reflexo da água por SSR,
 motion blur, sombra de partícula, duas amostras de SSRO para uma, UI de 4K para
 720p, VSync, o limite de 30 quadros e o LOD de geometria de 1.0 para 0.8.
