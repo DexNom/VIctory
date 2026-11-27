@@ -129,6 +129,17 @@ struct List {
     gate: Vec<ValueWait>,
 }
 
+impl Drop for List {
+    fn drop(&mut self) {
+        // An unsubmitted recording may still have waits in the non-cut path.
+        let this = std::ptr::from_ref::<List>(self) as usize;
+        VALUE_WAITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(list, _)| list != this);
+    }
+}
+
 /// One part of a title list cut at its waits: the waits the queue stands
 /// at, then the host list that runs once they are met.
 #[cfg(windows)]
@@ -2176,6 +2187,42 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn released_lists_discard_only_their_own_unsubmitted_waits() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut discarded = null;
+        let mut kept = null;
+        for list in [&mut discarded, &mut kept] {
+            assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[0], list), S_OK);
+        }
+        // The non-cut recording path keeps its waits outside the list.
+        let wait = ValueWait { address: 0, comparison: 1, reference: 0x6c65_616b, wide: false };
+        VALUE_WAITS.lock().unwrap().extend([
+            (discarded as usize, wait),
+            (discarded as usize, ValueWait { wide: true, ..wait }),
+            (kept as usize, wait),
+        ]);
+        let count = |list: This| {
+            VALUE_WAITS.lock().unwrap().iter().filter(|&&(owner, pending)| {
+                owner == list as usize && pending.reference == wait.reference
+            }).count()
+        };
+        object::add_ref(discarded);
+        assert_eq!(list_release(discarded), 1);
+        assert_eq!(count(discarded), 2, "another reference still owns the recording");
+        assert_eq!(list_release(discarded), 0);
+        let discarded_waits = count(discarded);
+        let kept_waits = count(kept);
+        assert_eq!(reset(kept, allocator, null), S_OK);
+        assert_eq!(count(kept), 0, "reset still discards the recording");
+        assert_eq!(list_release(kept), 0);
+        assert_eq!(allocator_release(allocator), 0);
+        assert_eq!(discarded_waits, 0, "final release discards the recording");
+        assert_eq!(kept_waits, 1, "another list keeps its wait");
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
