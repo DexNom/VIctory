@@ -1,0 +1,152 @@
+name: Release
+
+# A pushed tag v* builds everything a release holds from this repository's code, with a provenance attestation
+# for each program (anyone can check a download came from this code: gh attestation verify "<file>" -R <repo>),
+# then publishes it: the release signer (server/release-signer, a Cloudflare Worker that holds the release key
+# and the Discord webhook as secrets) signs manifest.json for this run only, after checking GitHub's OIDC token
+# says it is this workflow, for this tag, in edupode/cold-project-vi or felicienradio/cold-project-vi. The key
+# and the webhook never reach GitHub. Every launcher installs the release within 5 minutes, and the
+# announcement (docs/ANNOUNCEMENT.md) goes to the Discord channel. scripts\sign-release.ps1 still signs by hand.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: New-Item -ItemType Directory -Force dist
+        shell: pwsh
+      - name: VIctory
+        run: cargo build --locked --profile diag -p victory --features diagnostics
+      - name: Launcher
+        shell: cmd
+        run: launcher\build-launcher.cmd "%CD%\dist\Julia's Launcher.exe"
+      - name: NVSmooth30 (RTX 30, experimental; MIT, github.com/ItsAdeline/NVSmooth30)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/ItsAdeline/NVSmooth30 nvsmooth30
+          cmake -S nvsmooth30 -B nvsmooth30/build -A x64
+          cmake --build nvsmooth30/build --config Release
+          Copy-Item nvsmooth30/build/Release/version.dll dist/nvsmooth30-version.dll
+          Copy-Item nvsmooth30/LICENSE dist/nvsmooth30-LICENSE.txt
+      - name: D3D12 Agility SDK (Microsoft's redistributable; Windows 10 needs it)
+        shell: pwsh
+        run: |
+          # The version apps/victory/src/agility.rs asks for, and the SHA-256 launcher/Agility.cs checks.
+          $version = '1.620.2'; $sha = '70a6d47d335b4a15180544c01a35b84474522a369dc582d85fe057313a3aeaa0'
+          Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/$version/microsoft.direct3d.d3d12.$version.nupkg" -OutFile agility.zip
+          Expand-Archive agility.zip agility -Force
+          Copy-Item agility/build/native/bin/x64/D3D12Core.dll dist/D3D12Core.dll
+          if ((Get-FileHash dist/D3D12Core.dll -Algorithm SHA256).Hash.ToLower() -ne $sha) { throw "D3D12Core.dll is not the one the launcher expects" }
+      - name: Files of the release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/diag/victory.exe dist/victory.exe
+          Compress-Archive -Path launcher/*.cs, launcher/build-launcher.cmd, launcher/icon.ico -DestinationPath dist/launcher-source.zip
+          $version = (Select-String -Path launcher/Updater.cs -Pattern 'Version = "([^"]+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}" -and "${{ github.event_name }}" -eq 'push') { throw "Updater.Version ($version) is not the tag (${{ github.ref_name }})" }
+          Get-ChildItem dist -File | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } | Set-Content dist/SHA256SUMS.txt
+          "VI_VERSION=$($version -replace '-.*','')" | Out-File -Append $env:GITHUB_ENV
+      - name: Installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) { choco install innosetup -y --no-progress }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$env:VI_VERSION installer\VI.iss
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/Julia's Launcher.exe
+            dist/victory.exe
+            dist/VI-Setup-*.exe
+            dist/nvsmooth30-version.dll
+      - name: Draft release
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Copy-Item "dist/Julia's Launcher.exe" dist/Julias-Launcher.exe
+          $files = Get-ChildItem dist -File | Where-Object { $_.Name -ne "Julia's Launcher.exe" } | ForEach-Object { $_.FullName }
+          gh release create "${{ github.ref_name }}" --draft --target "${{ github.sha }}" -R "${{ github.repository }}" --title "Julia's Launcher ${{ github.ref_name }}" --notes-file docs/RELEASE-NOTES.md $files
+      - name: Sign, publish and announce
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'; $repo = '${{ github.repository }}'
+          $signer = 'https://vi-release-signer.edupodept.workers.dev'
+          # Where each download goes beside the launcher (Updater.Allowed), as scripts\sign-release.ps1 writes it.
+          $map = [ordered]@{ 'Julias-Launcher.exe' = "Julia's Launcher.exe"; 'victory.exe' = 'victory.exe'; 'nvsmooth30-version.dll' = 'tools/nvsmooth30/version.dll' }
+          $files = foreach ($asset in $map.Keys) {
+            $f = Join-Path dist $asset
+            if (-not (Test-Path $f)) { continue }
+            [ordered]@{ name = $map[$asset]; url = "https://github.com/$repo/releases/download/$tag/$asset"; sha256 = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower(); size = (Get-Item $f).Length }
+          }
+          $notes = [IO.File]::ReadAllText('docs/RELEASE-NOTES.md'); $notesPt = [IO.File]::ReadAllText('docs/RELEASE-NOTES.pt.md')
+          $manifest = [ordered]@{ version = $tag.TrimStart('v'); notes = $notes; notes_pt = $notesPt; files = @($files) } | ConvertTo-Json -Depth 4
+          New-Item -ItemType Directory -Force signed | Out-Null
+          [IO.File]::WriteAllText("$PWD/signed/manifest.json", $manifest, (New-Object Text.UTF8Encoding $false))
+          $bytes = [IO.File]::ReadAllBytes("$PWD/signed/manifest.json")
+          # This run's identity, signed by GitHub, for the signer only (audience vi-release-signer).
+          $token = (Invoke-RestMethod -Headers @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" } -Uri "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=vi-release-signer").value
+          $sig = (Invoke-RestMethod -Method Post -Uri "$signer/v1/sign" -Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json' -Body $bytes).signature
+          # Checked against the keys the launcher trusts before anything is published.
+          $ok = $false
+          foreach ($k in ([regex]::Matches((Get-Content launcher/ReleaseKey.cs -Raw), '"(<RSAKeyValue>.*?</RSAKeyValue>)"') | ForEach-Object { $_.Groups[1].Value })) {
+            $rsa = [System.Security.Cryptography.RSA]::Create(); $rsa.FromXmlString($k)
+            if ($rsa.VerifyData($bytes, [Convert]::FromBase64String($sig), 'SHA256', [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)) { $ok = $true }
+          }
+          if (-not $ok) { throw 'The signature does not match a key the launcher trusts: not publishing.' }
+          [IO.File]::WriteAllText("$PWD/signed/manifest.sig", $sig)
+          gh release upload $tag -R $repo --clobber signed/manifest.json signed/manifest.sig
+          gh release edit $tag -R $repo --draft=false --latest
+          "Published $tag."
+          # One announcement per version: from felicienradio's repository, the channel every launcher from 0.3.3 on
+          # follows. A release on edupode's repository only carries its launchers (0.3.2-edupode and older) over.
+          if ('${{ github.repository }}' -eq 'felicienradio/cold-project-vi' -and (Test-Path docs/ANNOUNCEMENT.md)) {
+            $version = $tag.TrimStart('v') -replace '-.*$', ''
+            $text = [IO.File]::ReadAllText('docs/ANNOUNCEMENT.md').Replace('{tag}', $tag).Replace('{version}', $version).Trim()
+            # Discord keeps the preview of a link it has seen: /releases/latest showed the version before (0.3.7's post
+            # carried 0.3.6's card). The release's own page is a new link each time.
+            $text = $text.Replace("https://github.com/$repo/releases/latest", "https://github.com/$repo/releases/tag/$tag")
+            # No @everyone for now (it pinged every member at each release): the signer pings only what its
+            # ANNOUNCE_MENTION allows (later, the role players pick with a reaction).
+            $text = ($text -replace '(?m)^\s*@everyone\s*$', '').TrimEnd()
+            # Every announcement ends with docs/ANNOUNCEMENT-FOOTER.md, before the @everyone line.
+            if (Test-Path docs/ANNOUNCEMENT-FOOTER.md) {
+              $footer = [IO.File]::ReadAllText('docs/ANNOUNCEMENT-FOOTER.md').Trim()
+              if ($text.EndsWith('@everyone')) { $text = $text.Substring(0, $text.Length - 9).TrimEnd() + "`n`n" + $footer + "`n`n@everyone" } else { $text = $text + "`n`n" + $footer }
+            }
+            $token = (Invoke-RestMethod -Headers @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" } -Uri "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=vi-release-signer").value
+            # Translations as link buttons under the message: docs/ANNOUNCEMENT.<lang>.md of this tag, on GitHub.
+            # Only once the signer that takes buttons is deployed (repository variable ANNOUNCE_BUTTONS = 1): an
+            # older signer would post the JSON as the message's text.
+            $buttons = @()
+            if ('${{ vars.ANNOUNCE_BUTTONS }}' -eq '1') {
+              foreach ($b in @(@{ file = 'docs/ANNOUNCEMENT.fr.md'; label = '🇫🇷 Français' }, @{ file = 'docs/ANNOUNCEMENT.pt.md'; label = '🇵🇹 Português' })) {
+                if (Test-Path $b.file) { $buttons += [ordered]@{ label = $b.label; url = "https://github.com/$repo/blob/$tag/$($b.file)" } }
+              }
+            }
+            if ($buttons.Count -gt 0) {
+              $body = [ordered]@{ text = $text; buttons = @($buttons) } | ConvertTo-Json -Depth 4
+              $r = Invoke-RestMethod -Method Post -Uri "$signer/v1/announce" -Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
+            } else {
+              $r = Invoke-RestMethod -Method Post -Uri "$signer/v1/announce" -Headers @{ Authorization = "Bearer $token" } -ContentType 'text/plain; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($text))
+            }
+            "Announcement posted: $($r.posted) (buttons: $($buttons.Count))"
+          }

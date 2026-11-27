@@ -1,0 +1,15 @@
+# The admin Worker (read). Put it on a hostname with a Cloudflare Access application that lets in
+# only edupode's account. See README.md.
+name = "vi-hardware-admin"
+main = "src/admin.js"
+compatibility_date = "2026-11-01"
+workers_dev = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "vi-hardware"
+database_id = "f5666469-a523-4611-a529-36d95f9ca3cc"
+
+[vars]
+ACCESS_TEAM = "PUT-YOUR-ACCESS-TEAM-NAME"
+ACCESS_AUD = "PUT-THE-ACCESS-APPLICATION-AUD-TAG"

@@ -1,0 +1,7 @@
+# The release signer (src/index.js): signs manifests and posts announcements for the release workflows of
+# edupode/cold-project-vi and felicienradio/cold-project-vi. Secrets: SIGNING_KEY and DISCORD_WEBHOOK
+# (scripts\put-signer-secrets.ps1 puts them; they are never in the repository).
+name = "vi-release-signer"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+workers_dev = true

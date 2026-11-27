@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      xcl: ${{ steps.f.outputs.xcl }}
+      engine: ${{ steps.f.outputs.engine }}
+      launcher: ${{ steps.f.outputs.launcher }}
+      scripts: ${{ steps.f.outputs.scripts }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: f
+        with:
+          filters: |
+            xcl:
+              - 'runtime/xcl/**'
+              - '.github/workflows/ci.yml'
+            engine:
+              - 'engine/**'
+              - '.github/workflows/ci.yml'
+            launcher:
+              - 'launcher/**'
+              - '.github/workflows/ci.yml'
+            scripts:
+              - 'scripts/**'
+              - '.github/workflows/ci.yml'
+
+  repo-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: No game files or large files are tracked
+        run: |
+          bad=$(git ls-files | grep -Ei '\.(exe|dll|pdb|rpf)$' || true)
+          if [ -n "$bad" ]; then echo "Tracked binaries / game files:"; echo "$bad"; exit 1; fi
+          big=$(git ls-files -z | xargs -0 -I{} sh -c 'test -f "{}" && [ "$(stat -c %s "{}")" -gt 2097152 ] && echo "{}"' || true)
+          if [ -n "$big" ]; then echo "Files larger than 2 MB:"; echo "$big"; exit 1; fi
+      - name: Commits carry a single author (no Co-Authored-By trailers)
+        if: github.event_name == 'pull_request'
+        run: |
+          range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          if git log --format=%B "$range" | grep -qi '^co-authored-by:'; then
+            echo "A commit message contains a Co-Authored-By trailer. See CONTRIBUTING.md."
+            git log --format='%h %s' --grep='^Co-Authored-By' -i "$range"
+            exit 1
+          fi
+
+  scripts:
+    needs: changes
+    if: needs.changes.outputs.scripts == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse scripts/*.ps1
+        shell: pwsh
+        run: |
+          $fail = $false
+          Get-ChildItem scripts -Filter *.ps1 | ForEach-Object {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errs)
+            if ($errs) { $fail = $true; $errs | ForEach-Object { Write-Host "$($_.Extent.File):$($_.Extent.StartLineNumber): $($_.Message)" } }
+            else { Write-Host "ok  $($_.Name)" }
+          }
+          if ($fail) { exit 1 }
+
+  xcl:
+    needs: changes
+    if: needs.changes.outputs.xcl == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: runtime/xcl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime/xcl
+      - name: Build
+        run: cargo build --release -p xcl --locked
+      # GPU tests print "SKIPPED ..." and pass when the runner has no suitable adapter.
+      - name: Unit tests
+        run: cargo test --release -p xcl --lib --locked -- --test-threads=4 --skip write64_bottom_progress_waits_past_legacy_timeout --skip gpu_flat_ps_draws_with_a_vs_of_other_outputs
+
+  engine:
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      # engine/rust-toolchain.toml pins the toolchain; rustup installs it on first use.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Build
+        run: cargo rustc --release -p scarlett --bin scarlett --features diagnostics --locked -- -C link-arg=/EXPORT:D3D12SDKVersion,DATA -C link-arg=/EXPORT:D3D12SDKPath,DATA
+      # Crates that need no graphics card. scarlett-shader's GPU tests run on WARP (Shader Model 6.6) and skip
+      # the hardware device a hosted runner lacks. scarlett-gpu and scarlett-hle tests need a Shader Model 6.6
+      # device and are not run here.
+      - name: Unit tests (no GPU)
+        run: cargo test --release --locked --lib -p scarlett-core -p scarlett-formats -p scarlett-pe -p scarlett-loader -p scarlett-shader -p scarlett-pipeline -- --test-threads=4
+
+  launcher:
+    needs: changes
+    if: needs.changes.outputs.launcher == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: launcher
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher
+      - name: Build
+        run: cargo build --release --locked
+      - name: Unit tests
+        run: cargo test --release --locked
