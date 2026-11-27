@@ -92,3 +92,42 @@ nomeia — ela não está instalada nesta máquina.
 Se quiser a textura mais macia e menos VRAM de volta, o próximo passo é instalar
 os *Graphics Tools* do Windows e rodar uma build `diagnostics` com
 `VICTORY_D3D12_DEBUG=1`; a mensagem diz o comando exato.
+
+## Ajustes gráficos do próprio jogo
+
+O jogo guarda as configurações gráficas dele em
+`%LOCALAPPDATA%\victory\data\<id>\storage\settings\settings.xml`. Esse arquivo
+tem coisas que nenhuma variável `VICTORY_*` alcança, e o launcher aplica o
+perfil `balanced` antes de cada partida (o título regrava o arquivo ao sair,
+por isso é antes e não uma vez só).
+
+Para aplicar à mão:
+
+```powershell
+cd C:\GTA6-PC
+# ou, no repo:
+.\scripts\tweak-game-settings.ps1 -Profile balanced -DryRun   # ver o que muda
+.\scripts\tweak-game-settings.ps1 -Profile balanced           # aplicar
+.\scripts\tweak-game-settings.ps1 -Profile maxfps             # mais agressivo
+.\scripts\tweak-game-settings.ps1 -Profile sharp              # desfaz o LOD
+.\scripts\tweak-game-settings.ps1 -Profile restore            # volta o backup
+```
+
+Perfis:
+
+| perfil | UI | LOD de textura | para quem |
+|---|---|---|---|
+| `balanced` | 1280x720 | 1.0, mip bias -1.5 | padrão: toda textura presente, menos nítida |
+| `maxfps` | 640x480 | 2.0 | quem quer quadros e aceita imagem macia |
+| `sharp` | 1920x1080 | 1.0, mip bias 0 | quem tem folga e quer nitidez |
+
+O que `balanced` corta: sombra por ray tracing, reflexo da água por SSR,
+motion blur, sombra de partícula, duas amostras de SSRO para uma, UI de 4K para
+720p, VSync, o limite de 30 quadros e o LOD de geometria de 1.0 para 0.8.
+
+A sombra por ray tracing é o corte mais importante: o builder da estrutura de
+ray tracing **não roda** aqui (`VICTORY_BVH_BUILDER` desligado), e o
+`VICTORY_AMBIENT` põe a luz indireta no lugar. Com `rtDynamicShadows` ligado
+o título monta e despacha trabalho de RT que a gente descarta — trabalho puro.
+
+No `settings.ini` do launcher, `gamecuts=0` desliga tudo isso.

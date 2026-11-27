@@ -1,10 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using Timer = System.Windows.Forms.Timer;
@@ -512,6 +514,110 @@ static class GTA6
         }
     }
 
+    // O settings.xml do proprio titulo tem alavancas que o runtime nao tem:
+    // sombra por ray tracing, a UI desenhada em 3840x2160 num jogo que sai em
+    // 1280x720, VSync, limite de 30 quadros, SSR da agua, motion blur. O perfil
+    // corta o trabalho de pixel caro e mantem TODA textura presente: o mip bias
+    // de -1.5 e do proprio titulo, aplicado no lugar dele, entao nada some e a
+    // imagem so fica menos nitida (a nitidez volta com sharpen ligado).
+    // `gamecuts=0` no settings.ini desliga. O arquivo e do jogo: o titulo o
+    // regrava ao sair, entao isto roda antes de cada partida.
+    static readonly string[] GameCuts = new string[]
+    {
+        "frameRateLimit=0", "vSync=0", "desiredFPS=120",
+        "uiResolution.width=1280", "uiResolution.height=720",
+        "resolutionFullscreen.width=1280", "resolutionFullscreen.height=720",
+        "anisotropicFiltering=0", "graphicsQualityPreset=0.000000",
+        "motionBlur=false", "rtDynamicShadows=false", "shadowParticleShadows=false",
+        "ssroSampleCount=1", "waterReflectionSSR=false",
+        "waterReflectionResX=384", "waterReflectionResY=192",
+        "grassLod=0.400000", "lodScale=0.800000", "smallCullThreshold=1.500000",
+        "decorationResolutionShift=1", "maxTexUpgradesPerFrame=5",
+        "manualMipBias=-1.500000", "sharpenEnabled=true", "fsrSharpen=0.200000",
+        "texLodScale_Global=1.000000", "texLodScale_Buildings=1.000000",
+        "texLodScale_Objects=1.000000", "texLodScale_HD=1.000000",
+    };
+
+    static string TitleSettings()
+    {
+        try
+        {
+            string root = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "victory", "data");
+            if (!Directory.Exists(root))
+            {
+                return null;
+            }
+            string best = null;
+            DateTime newest = DateTime.MinValue;
+            foreach (string dir in Directory.GetDirectories(root))
+            {
+                string file = Path.Combine(dir, "storage", "settings", "settings.xml");
+                if (!File.Exists(file))
+                {
+                    continue;
+                }
+                DateTime when = File.GetLastWriteTimeUtc(file);
+                if (when > newest)
+                {
+                    newest = when;
+                    best = file;
+                }
+            }
+            return best;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    static void TweakGame()
+    {
+        if (Setting("gamecuts", "1") == "0")
+        {
+            return;
+        }
+        try
+        {
+            string file = TitleSettings();
+            if (file == null)
+            {
+                // O titulo ainda nao rodou uma vez: ele cria o arquivo sozinho.
+                return;
+            }
+            string text = File.ReadAllText(file);
+            int changed = 0;
+            foreach (string cut in GameCuts)
+            {
+                int at = cut.IndexOf('=');
+                string tag = cut.Substring(0, at);
+                string value = cut.Substring(at + 1);
+                Match match = Regex.Match(text, "<" + tag + "\\s+value=\"([^\"]*)\"");
+                if (!match.Success || match.Groups[1].Value == value)
+                {
+                    continue;
+                }
+                text = text.Substring(0, match.Groups[1].Index) + value + text.Substring(match.Groups[1].Index + match.Groups[1].Length);
+                changed++;
+            }
+            if (changed == 0)
+            {
+                return;
+            }
+            string backup = file + ".bak-gta6";
+            if (!File.Exists(backup))
+            {
+                File.Copy(file, backup);
+            }
+            File.WriteAllText(file, text, new UTF8Encoding(false));
+        }
+        catch (Exception)
+        {
+            // O jogo cuida das proprias configuracoes se isto falhar.
+        }
+    }
+
     static Process StartGame(bool high, bool panel, bool headless)
     {
         string game = ReadGamePath();
@@ -525,6 +631,7 @@ static class GTA6
         }
 
         string exe = Path.Combine(Runtime, "victory.exe");
+        TweakGame();
         ProcessStartInfo start = new ProcessStartInfo(exe);
         start.WorkingDirectory = Runtime;
         start.UseShellExecute = false;

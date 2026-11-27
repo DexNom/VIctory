@@ -459,6 +459,41 @@ Duas coisas que a primeira versão errava:
   troca de tela cheia. Agora só `Alt+Enter` (que chega como `WM_SYSKEYDOWN`) e
   `F11` trocam; o Enter simples segue para o jogo.
 
+## O `settings.xml` do próprio título — a alavanca que não é nossa
+
+O jogo guarda as configurações gráficas dele em
+`%LOCALAPPDATA%\victory\data\<id>\storage\settings\settings.xml`, e esse arquivo
+tem coisas que nenhuma variável `VICTORY_*` alcança. O que estava lá antes de a
+gente mexer:
+
+| campo | valor | por que importa |
+|---|---|---|
+| `rtDynamicShadows` | `true` | sombra por ray tracing ligada num 3060 Ti de 8 GB |
+| `uiResolution` | 3840x2160 | a UI (HUD, mapa, legendas) desenhada em 4K num jogo que sai em 720p |
+| `vSync` | `2` | swap presa no vsync |
+| `frameRateLimit` | 30 | o título se limita a 30 quadros |
+| `desiredFPS` | 30 | idem, pelo lado do jogo |
+| `waterReflectionSSR` | `true` | reflexo da água por SSR, tela cheia |
+| `motionBlur` | `true` | passe de motion blur |
+| `ssroSampleCount` | `2` | duas amostras de sombra em espaço de tela |
+| `manualMipBias` | `-1.500000` | **o próprio título já reduz o mip em 1,5 nível** |
+
+Esse último é o achado: o "menos nítido, nada sumido" que a gente tentou fazer no
+caminho de cópia (e que removia o device, ver acima) **o título já faz sozinho**,
+no lugar dele, com o `manualMipBias`. É por isso que a imagem já estava macia sem
+a gente pedir nada, e é por isso que a nossa redução de mip era redundante *e*
+perigosa: ela agia num lugar onde o título não esperava.
+
+`scripts/tweak-game-settings.ps1` aplica o perfil `balanced`: corta o trabalho de
+pixel caro (RT, SSR, motion blur, 4K de UI, vsync, limite de 30) e **mantém** o
+`manualMipBias=-1.5`, o `sharpenEnabled=true` e todos os `texLodScale` em 1.0.
+Toda textura continua presente; a nitidez volta pelo sharpen, que é barato.
+
+Perfis: `balanced` (padrão), `maxfps` (LOD de textura em 2.0 e saída em 640x480),
+`sharp` (desfaz LOD e mip bias, mantém só os cortes de pixel), `restore`.
+O launcher aplica o `balanced` antes de cada partida (`gamecuts=0` no
+`settings.ini` desliga), porque o título regrava o arquivo ao sair.
+
 ## Limites conhecidos
 
 - **16 GB é o piso, não o recomendado.** O processo chega a 22 GB privados; o
