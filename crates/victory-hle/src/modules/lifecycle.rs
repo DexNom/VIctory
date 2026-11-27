@@ -73,7 +73,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, style, ex_style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -99,7 +99,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, style, ex_style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -112,23 +112,60 @@ pub extern "system" fn CreateWindowExA(
 
 /// A console title sizes its window to its render target (
 /// the title: 3840x2160 on a Series X), which can exceed the host's screen.
-/// A top-level window larger than the work area is shrunk to fit, keeping
-/// its proportions, and centred; what it shows is scaled to it (the swap
-/// chain stretches).
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+/// That size is what the picture needs, so it becomes the window's client
+/// area: the frame (title bar, borders) goes around it rather than eating into
+/// it, or the swap chain, which stretches to the client area, squashes the
+/// picture. A top-level window larger than the work area is shrunk to fit,
+/// keeping the client area's proportions, and centred.
+fn fit(
+    parent: HWND,
+    style: u32,
+    ex_style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (i32, i32, i32, i32) {
+    if !parent.is_null() || width <= 0 || height <= 0 {
+        return (x, y, width, height);
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
-    let fitted = fit_into(&area, width, height);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
-        return (x, y, width, height);
+    let mut frame = RECT::default();
+    // SAFETY: `frame` is a plain rectangle the call grows by the frame's size.
+    let framed = unsafe { wm::AdjustWindowRectEx(&mut frame, style, 0, ex_style) };
+    let frame = if framed == 0 {
+        (0, 0)
+    } else {
+        (frame.right - frame.left, frame.bottom - frame.top)
+    };
+    if known == 0 {
+        return (x, y, width + frame.0, height + frame.1);
     }
-    tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
-    let (w, h) = fitted;
+    let (fits, w, h) = framed_fit(&area, frame, width, height);
+    if fits {
+        return (x, y, w, h);
+    }
+    tracing::info!(width, height, to = ?(w - frame.0, h - frame.1), "title window fitted to the screen");
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// The outer size of a window whose client area is `width` x `height`
+/// (scaled down, proportions kept, until the window with its `frame` fits
+/// `area`), and whether it fitted unscaled.
+fn framed_fit(area: &RECT, frame: (i32, i32), width: i32, height: i32) -> (bool, i32, i32) {
+    let inner = RECT {
+        left: area.left,
+        top: area.top,
+        right: area.right - frame.0,
+        bottom: area.bottom - frame.1,
+    };
+    let (w, h) = fit_into(&inner, width, height);
+    ((w, h) == (width, height), w + frame.0, h + frame.1)
 }
 
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits
@@ -345,6 +382,23 @@ mod tests {
             fit_into(&area, wm::CW_USEDEFAULT, 0),
             (wm::CW_USEDEFAULT, 0)
         );
+    }
+
+    #[test]
+    fn the_frame_goes_around_the_picture_not_into_it() {
+        // 1536x816 is a 1080p work area at 125% scaling; 16x39 an overlapped frame.
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 1536,
+            bottom: 816,
+        };
+        let (fits, w, h) = framed_fit(&area, (16, 39), 3840, 2160);
+        assert!(!fits);
+        let (cw, ch) = (w - 16, h - 39);
+        assert!(h <= 816 && w <= 1536);
+        assert!(((cw as f64 / ch as f64) - 16.0 / 9.0).abs() < 0.01, "{cw}x{ch}");
+        assert_eq!(framed_fit(&area, (16, 39), 1280, 720), (true, 1296, 759));
     }
 
     #[test]
