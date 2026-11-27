@@ -60,6 +60,30 @@ The City interior can render with an overexposed doorway and a silhouetted chara
 - One fixed-camera waterfront capture showed dark materials while thousands of texture slots waited for upload. The queue regression test verifies that new textures get service alongside retries even when the per-pass limit is one. An interior lighting defect persisted after the queue drained.
 - In a CPU-only release benchmark of 28,279 small upload reads batched 512 at a time, four workers took 11.67 ms compared with 17.64 ms for one. A separate WARP regression submitted eight interdependent command lists and verified all 128 intermediate texture readbacks with and without parallel prelude recording. These tests measure CPU work and command ordering. Gameplay FPS depends on the scene.
 
+## Reproducing CPU upload-fill scaling without game data
+
+On Windows, after preparing the format tables, run the benchmark by itself:
+
+```powershell
+cargo test --release --locked -p victory-gpu host::fill_tests::upload_fill_throughput -- --ignored --exact --nocapture --test-threads=1
+```
+
+The synthetic workload uses 28,279 independent 448-byte reads through the real
+`run_fills` and `copy_mapped` paths. It compares requested worker counts of
+1, 2, 4 and 6 with batches of 128, 512 and 2,048 fills. The 128-fill case stays
+serial at every worker count, providing a control for the scheduling threshold.
+Each configuration is warmed before seven samples; measurement order rotates,
+and the output is reset and checked outside each timed interval. The report
+includes the median, minimum, maximum, the number of batches that actually used
+parallel jobs, and the scheduled job counts. Requested workers are an upper
+bound: a 512-fill batch can schedule at most four jobs even when six are
+requested. No timing threshold is asserted.
+
+These are host-memory preparation measurements, not PCIe bandwidth, GPU execution
+or gameplay FPS. Record the commit, Rust version, target ABI, CPU and power mode
+when comparing results. This is a reproducible synthetic case, not a replay of
+the earlier City capture or a promise that its reported timings will match.
+
 ## City save reload and dark objects
 
 During a City save reload, the waterfront house, dock and trees gained detail over 18 seconds. The number of texture views due for upload fell from 10,577 to 5,916 to 36. At the middle sample, shader pipeline creation had already caught up and uploads still averaged 391 MB per frame. The translation cache was cold after a translator change. These measurements include diagnostic captures.

@@ -7100,6 +7100,83 @@ mod fill_tests {
         }
     }
 
+    /// CPU submission preparation only: no game files, GPU upload or present.
+    /// Run this test alone, in release mode, with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "CPU upload-fill benchmark; run in release mode"]
+    fn upload_fill_throughput() -> Result<(), &'static str> {
+        if cfg!(debug_assertions) {
+            return Err("run upload_fill_throughput with --release");
+        }
+        const READS: usize = 28_279;
+        const BYTES: usize = 448;
+        const SAMPLES: usize = 7;
+        const WORKERS: [usize; 4] = [1, 2, 4, 6];
+        let input: Vec<u8> = (0..READS * BYTES).map(|i| (i % 251) as u8).collect();
+        let mut output = vec![0xff; input.len()];
+        let jobs = fills(&input, &mut output, BYTES);
+        println!("CPU-only upload fills: reads={READS}, bytes_per_read={BYTES}, samples={SAMPLES}; no GPU transfer or gameplay FPS is measured");
+        for batch in [128, 512, 2048] {
+            let run = |workers| {
+                let mut parallel = 0;
+                let mut scheduled = 0;
+                let mut largest = 0;
+                for chunk in jobs.chunks(batch) {
+                    let count = run_fills(chunk, workers);
+                    parallel += usize::from(count > 1);
+                    scheduled += count;
+                    largest = largest.max(count);
+                }
+                (parallel, scheduled, largest)
+            };
+            // Fault in both buffers and start the kept worker pool before timing.
+            for workers in WORKERS {
+                output.fill(0xff);
+                run(workers);
+                assert_eq!(output, input, "warm-up: batch={batch}, workers={workers}");
+            }
+            let mut samples: [Vec<std::time::Duration>; 4] =
+                std::array::from_fn(|_| Vec::with_capacity(SAMPLES));
+            let mut scheduling = [(0, 0, 0); 4];
+            for sample in 0..SAMPLES {
+                // Rotate the order so the serial case is not always measured first.
+                for order in 0..WORKERS.len() {
+                    let index = (sample + order) % WORKERS.len();
+                    let workers = WORKERS[index];
+                    // A missed or stale copy must not inherit a correct result.
+                    output.fill(0xff);
+                    let started = std::time::Instant::now();
+                    scheduling[index] = run(workers);
+                    samples[index].push(started.elapsed());
+                    assert_eq!(
+                        output, input,
+                        "sample={sample}, batch={batch}, workers={workers}"
+                    );
+                }
+            }
+            for times in &mut samples {
+                times.sort_unstable();
+            }
+            let serial = samples[0][SAMPLES / 2].as_secs_f64();
+            for (index, workers) in WORKERS.into_iter().enumerate() {
+                let times = &samples[index];
+                let median = times[SAMPLES / 2].as_secs_f64();
+                println!(
+                    "batch_fills={batch} requested_workers={workers} parallel_batches={} scheduled_jobs={} max_jobs_per_batch={} median_ms={:.3} min_ms={:.3} max_ms={:.3} serial_speedup={:.3} host_MiB_per_s={:.1}",
+                    scheduling[index].0,
+                    scheduling[index].1,
+                    scheduling[index].2,
+                    median * 1e3,
+                    times[0].as_secs_f64() * 1e3,
+                    times[SAMPLES - 1].as_secs_f64() * 1e3,
+                    serial / median,
+                    input.len() as f64 / (1 << 20) as f64 / median,
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn overlapping_fills_keep_the_last_write_and_source_aliases_remain_ordered() {
         let source: Vec<u8> = (0..256).map(|n| n as u8).collect();
