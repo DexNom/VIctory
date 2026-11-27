@@ -1612,8 +1612,20 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 /// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
 /// (a texture streams in whole mips; the small ones lie first). Read
 /// through the kernel, so pages not there count as zeros.
+///
+/// The windows were 16 KiB each (48 KiB a look). They stay 16 KiB: a texture
+/// the title fills late is filled whole, and the three windows are what tell
+/// of it, but victory-fork #956 has a case of a mutation that fell outside
+/// them (missing HUD glyphs) — narrower windows would only widen that hole.
+/// `VICTORY_FINGERPRINT_KB` is here to measure the trade, not to change it:
+/// 570 slots x 48 KiB is 27 MB a frame read to find 81 changes a session, so
+/// the look is worth measuring before it is trusted smaller.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
-    const WINDOW: usize = 16 << 10;
+    static WINDOW_KB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let window = *WINDOW_KB.get_or_init(|| {
+        std::env::var("VICTORY_FINGERPRINT_KB").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&kb| (4..=64).contains(&kb)).unwrap_or(16)
+    });
+    let window = window << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
@@ -1621,18 +1633,18 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     let mut print = 0u128;
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        read.resize(3 * WINDOW, 0);
+        read.resize(3 * window, 0);
         let mut take = |from: usize, bytes: usize| {
             read[..bytes].fill(0);
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
             print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
         };
-        if len <= 3 * WINDOW {
+        if len <= 3 * window {
             take(0, len);
         } else {
-            take(0, WINDOW);
-            take((len / 2) & !0xfff, WINDOW);
-            take(len - WINDOW, WINDOW);
+            take(0, window);
+            take((len / 2) & !0xfff, window);
+            take(len - window, window);
         }
     });
     let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
