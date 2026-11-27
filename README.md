@@ -33,7 +33,7 @@ To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** 
 
 To warm the shader cache, open `victory-warm.exe` in the installed runtime directory. The log lists translated and refused shaders. Graphics pipelines also depend on draw state encountered during play. If you see a missing `VCRUNTIME140.dll` error, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 
-For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
+For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml) · [Cross-compiling from WSL](docs/build-windows-wsl.md)
 
 ## FSR Quality 4K baseline
 
