@@ -2064,12 +2064,8 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
-    /// Textures read back (texture to buffer copies), done once the list
-    /// has run: the host buffer the list copies the texels into, the title
-    /// memory they go to, the bytes of a row, the rows, the title's row
-    /// pitch; and, for the walls trace only, the title texture read and
-    /// the frame the copy was recorded in.
-    backs: Vec<(ID3D12Resource, usize, [usize; 3], usize, u64)>,
+    /// Texture-to-buffer copies to land in recording order after the fence.
+    backs: Vec<BufferReadback>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
     back_wanted: Vec<crate::resource::ResourceRef>,
@@ -2467,14 +2463,15 @@ mod relay_tests {
 
         // A later pitched readback covers the wait's word in its last row,
         // even after the first flight's ordinary write was published.
-        let later = pitched_readback_span(0x3fc0, [4, 3, 32]).unwrap();
+        let geometry = crate::resource::ReadbackRows { row: 4, rows: 3, depth: 1, pitch: 32, slice_rows: 3 };
+        let later = pitched_readback_span(0x3fc0, geometry).unwrap();
         assert_eq!(later, (0x3fc0, 0x4004));
         line.written.textures = vec![later];
         line.written.buffers.clear();
         assert!(pending_value_write(&line, 0x4000, 0x4004));
         line.written.textures.clear();
         assert!(!pending_value_write(&line, 0x4000, 0x4004));
-        assert_eq!(pitched_readback_span(usize::MAX - 3, [4, 3, 32]), None);
+        assert_eq!(pitched_readback_span(usize::MAX - 3, geometry), None);
         line.written.opaque_completion = true;
         assert!(pending_value_write(&line, 0x4000, 0x4004));
     }
@@ -2909,8 +2906,8 @@ struct PendingWrites {
     opaque_completion: bool,
 }
 
-fn pitched_readback_span(at: usize, [row, rows, pitch]: [usize; 3]) -> Option<(usize, usize)> {
-    let extent = rows.checked_sub(1)?.checked_mul(pitch)?.checked_add(row)?;
+fn pitched_readback_span(at: usize, geometry: crate::resource::ReadbackRows) -> Option<(usize, usize)> {
+    let extent = geometry.extent()?;
     Some((at, at.checked_add(extent)?))
 }
 
@@ -3743,7 +3740,10 @@ fn read_backs(list: &HostList) {
     for work in &list.deferred().after {
         work();
     }
-    for (buffer, at, [row, rows, pitch], source, recorded) in &list.deferred().backs {
+    for back in &list.deferred().backs {
+        let BufferReadback { buffer, at, geometry, src, mapping, recorded, .. } = back;
+        let Some(_writing) = mapping.for_write() else { continue };
+        let crate::resource::ReadbackRows { row, rows, depth, pitch, slice_rows } = *geometry;
         let mut landed = false;
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -3752,19 +3752,23 @@ fn read_backs(list: &HostList) {
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
-                for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                for z in 0..depth {
+                    for y in 0..rows {
+                        let src = from.add((z * rows + y) * row.next_multiple_of(256));
+                        let dst = (*at as *mut u8).add((z * slice_rows + y) * pitch);
+                        std::ptr::copy_nonoverlapping(src, dst, row);
+                    }
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
-                if walls_trace() && *rows == 1 && *row <= 96 {
+                if walls_trace() && rows == 1 && depth == 1 && row <= 96 {
                     let mut values = [0f32; 24];
-                    std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), *row & !3);
+                    std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), row & !3);
                     tracing::info!(
                         frame = crate::frame::current(),
                         to = format_args!("{:#x}", *at),
-                        bytes = *row,
-                        values = ?&values[..*row / 4],
+                        bytes = row,
+                        values = ?&values[..row / 4],
                         "walls trace: a read-back lands in title memory"
                     );
                 }
@@ -3772,9 +3776,20 @@ fn read_backs(list: &HostList) {
                 landed = true;
             }
         }
-        let bytes = row * rows;
-        walls_landed(READ_BACK, *at, pitch * (rows - 1) + row, bytes, if landed { bytes } else { 0 }, *source, Some(*recorded));
+        let bytes = row * rows * depth;
+        walls_landed(READ_BACK, *at, geometry.extent().expect("validated at recording"), bytes, if landed { bytes } else { 0 }, src.as_ptr() as usize, Some(*recorded));
     }
+}
+
+/// Own the title resources and the host staging buffer through list replay.
+struct BufferReadback {
+    buffer: ID3D12Resource,
+    at: usize,
+    geometry: crate::resource::ReadbackRows,
+    _dst: crate::resource::ResourceRef,
+    src: crate::resource::ResourceRef,
+    mapping: crate::inplace::ReadbackMapping,
+    recorded: u64,
 }
 
 /// The walls trace's kinds of what reaches title memory from the card.
@@ -5582,8 +5597,8 @@ impl Host {
             for list in runs {
                 let deferred = list.deferred();
                 texture_writes.extend(deferred.texture_backs.iter().map(crate::texback::Back::destination));
-                for (_, at, geometry, _, _) in &deferred.backs {
-                    match pitched_readback_span(*at, *geometry) {
+                for back in &deferred.backs {
+                    match pitched_readback_span(back.at, back.geometry) {
                         Some(span) => texture_writes.push(span),
                         None => opaque_completion = true,
                     }
@@ -6633,13 +6648,16 @@ impl HostList {
         }
     }
 
-    /// A read back: once the list has run, `rows` rows of `row` bytes go
-    /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
-    /// to title memory at `dst`, pitched `pitch`. The buffer lives until
-    /// the list is reset.
-    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3], source: crate::object::This) {
-        let recorded = crate::frame::current();
-        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch], source as usize, recorded));
+    /// Land the selected rows and slices after execution. The staging buffer
+    /// stays alive until the list resets.
+    pub(crate) fn defer_read_back(
+        &self, buffer: ID3D12Resource, at: *mut u8, geometry: crate::resource::ReadbackRows,
+        dst: crate::object::This, src: crate::object::This, mapping: crate::inplace::ReadbackMapping,
+    ) {
+        self.deferred().backs.push(BufferReadback {
+            buffer, at: at as usize, geometry, mapping, _dst: crate::resource::ResourceRef::new(dst),
+            src: crate::resource::ResourceRef::new(src), recorded: crate::frame::current(),
+        });
     }
 
     /// Runs `work` once the list has run, with its read-backs
