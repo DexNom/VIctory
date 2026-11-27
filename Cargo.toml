@@ -12,6 +12,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]
+once_cell = "1.21"
 # Internal crates
 victory-core = { path = "crates/victory-core" }
 victory-pe = { path = "crates/victory-pe" }

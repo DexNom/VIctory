@@ -15,8 +15,9 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
+use once_cell::sync::OnceCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
@@ -38,7 +39,7 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
-    inline: OnceLock<upload::Upload>,
+    inline: OnceCell<upload::Upload>,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     total: u64,
@@ -838,12 +839,15 @@ fn upload_texture(list: &HostList, resource: This, texture: &ID3D12Resource, fir
     true
 }
 
+/// Recording threads share one staging allocation per texture. An allocation
+/// failure leaves the slot empty so a later command list can try again.
+fn get_or_allocate<T>(slot: &OnceCell<T>, allocate: impl FnOnce() -> Option<T>) -> Option<&T> {
+    slot.get_or_try_init(|| allocate().ok_or(())).ok()
+}
+
 impl Staging {
     fn inline_upload(&self) -> Option<&upload::Upload> {
-        if self.inline.get().is_none() {
-            let _ = self.inline.set(upload::Upload::new(host()?, self.bytes)?);
-        }
-        self.inline.get()
+        get_or_allocate(&self.inline, || upload::Upload::new(host()?, self.bytes))
     }
 
     fn mark_uploaded(&self) {
@@ -1602,7 +1606,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
-        inline: OnceLock::new(),
+        inline: OnceCell::new(),
         #[cfg(feature = "diagnostics")]
         total,
         footprints,
@@ -1736,6 +1740,32 @@ mod title_memory_tests {
             assert_eq!(super::mapped_bytes(start, end.offset_from(start) as usize), (4 * BLOCK - 21 + 117) as u64);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
+    }
+
+    #[test]
+    fn recording_threads_share_the_first_successful_staging_allocation() {
+        use std::sync::{Barrier, atomic::{AtomicUsize, Ordering::Relaxed}};
+
+        let slot = super::OnceCell::new();
+        assert_eq!(super::get_or_allocate(&slot, || None), None);
+
+        let ready = Barrier::new(8);
+        let attempts = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    ready.wait();
+                    let value = super::get_or_allocate(&slot, || {
+                        let allocation = attempts.fetch_add(1, Relaxed);
+                        // Give the other recorders time to enter while allocation is in progress.
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        Some(allocation)
+                    });
+                    assert_eq!(value, Some(&0));
+                });
+            }
+        });
+        assert_eq!(attempts.load(Relaxed), 1);
     }
 
     #[test]
