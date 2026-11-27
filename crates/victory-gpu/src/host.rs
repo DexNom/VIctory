@@ -46,6 +46,7 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) small_textures: crate::resource::SmallTextures,
+    pub(crate) wave_lanes: Option<std::ops::RangeInclusive<u32>>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -652,12 +653,14 @@ fn create() -> windows::core::Result<Host> {
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        if device
+        let wave_lanes = device
             .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
             .is_ok()
-        {
-            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            .then_some(o1.WaveLaneCountMin..=o1.WaveLaneCountMax)
+            .filter(|lanes| *lanes.start() != 0 && !lanes.is_empty());
+        if let Some(lanes) = &wave_lanes {
+            tracing::info!(min = lanes.start(), max = lanes.end(), "host wave lanes");
+            victory_shader::emit::set_host_max_wave(*lanes.end());
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -698,10 +701,16 @@ fn create() -> windows::core::Result<Host> {
         } else {
             None
         };
+        if let Some(desc) = adapter.as_ref().and_then(|adapter| adapter.GetDesc1().ok()) {
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..end]);
+            tracing::info!(%name, vendor = format_args!("{:#06x}", desc.VendorId), device = format_args!("{:#06x}", desc.DeviceId), "host D3D12 adapter");
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
             small_textures: Default::default(),
+            wave_lanes,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -4001,16 +4010,31 @@ fn hand_back(back: &[Declared], owners: &crate::writeback::Owners) {
 }
 
 impl Host {
+    pub(crate) fn shader_model_6_6(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            };
+            // SAFETY: writes the feature's structure of the given size.
+            let query = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut model).cast(),
+                    size_of_val(&model) as u32,
+                )
+            };
+            query.is_ok() && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0
+        })
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
         static MESH: OnceLock<bool> = OnceLock::new();
         *MESH.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-            let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            // SAFETY: each query writes its own structure of the given size.
+            // SAFETY: writes the feature's structure of the given size.
             let ok = unsafe {
                 self.device
                     .CheckFeatureSupport(
@@ -4019,18 +4043,10 @@ impl Host {
                         size_of_val(&options) as u32,
                     )
                     .is_ok()
-                    && self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_SHADER_MODEL,
-                            (&raw mut model).cast(),
-                            size_of_val(&model) as u32,
-                        )
-                        .is_ok()
             };
             let mesh = ok
                 && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+                && self.shader_model_6_6();
             tracing::info!(mesh, "host mesh shader support");
             mesh
         })

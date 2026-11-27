@@ -421,6 +421,19 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        if let Some(cs) = compute
+            && let Some(lanes) = &host.wave_lanes
+            && let Some(required) = cs.translated()?.host.incompatible_wave_size(lanes)
+        {
+            tracing::warn!(
+                ?shaders,
+                required,
+                min = lanes.start(),
+                max = lanes.end(),
+                "host compute pipeline requires a wave size outside the adapter range"
+            );
+            return None;
+        }
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();

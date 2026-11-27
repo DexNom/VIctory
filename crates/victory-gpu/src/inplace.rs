@@ -1333,6 +1333,23 @@ mod tests {
         }
     }
 
+    /// Tries `free` (a `VirtualFree` of pages a heap was opened on) until
+    /// it succeeds, for two seconds at most: when the heap's last reference
+    /// goes, the runtime may destroy it, and unlock its pages, a moment
+    /// later. Whether it succeeded.
+    fn once_released(mut free: impl FnMut() -> bool) -> bool {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if free() {
+                return true;
+            }
+            if std::time::Instant::now() > until {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     pub(crate) fn warp() -> Option<ID3D12Device> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
@@ -1356,6 +1373,7 @@ mod tests {
     /// driver is what a run with `VICTORY_INPLACE_PROBE=1` adds.
     #[test]
     fn warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
+        let _turn = crate::indirect::tests::warp_turn();
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             eprintln!("no ID3D12Device13 here: parts of an allocation cannot be opened");
@@ -1379,6 +1397,7 @@ mod tests {
     /// whole is turned down without asking the host.
     #[test]
     fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
+        let _turn = crate::indirect::tests::warp_turn();
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             return;
@@ -1398,10 +1417,13 @@ mod tests {
             rig.store(&placed.buffer, placed.bias + 16, &[0xa5; 64]).unwrap();
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
             drop(placed);
-            // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            // Half of it decommitted: turned down, the host not asked. The
+            // heap's pages stay locked until the runtime has destroyed it,
+            // which may come a moment after the last reference goes.
+            assert!(once_released(|| mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT) != 0), "the pages are given back once the heap goes");
             assert!(matches!(place_part(&device, start, len), Err(None)));
-            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+            drop(rig);
+            assert_ne!(mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE), 0);
         }
     }
 

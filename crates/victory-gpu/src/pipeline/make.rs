@@ -23,7 +23,7 @@
 //! Ported from the sibling fork `joshuu/victory-amd`'s 4436f8f1 (its
 //! loading waits only).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -338,14 +338,22 @@ struct FrameWait {
     /// The waiting counted against the budget so far (the window: time in
     /// which some thread waited, up to `since`).
     spent: Duration,
-    /// The window: threads waiting now, and since when one has been.
+    /// Actual wait time, excluding any unspent reservations.
+    completed: Duration,
+    /// Threads waiting now, and when the current shared interval began.
     waiting: u32,
     since: Option<Instant>,
 }
 
 impl FrameWait {
     const fn new() -> FrameWait {
-        FrameWait { frame: u64::MAX, spent: Duration::ZERO, waiting: 0, since: None }
+        FrameWait {
+            frame: u64::MAX,
+            spent: Duration::ZERO,
+            completed: Duration::ZERO,
+            waiting: 0,
+            since: None,
+        }
     }
 
     /// A thread is to wait in `frame` at `now`: how long it may.
@@ -365,8 +373,11 @@ impl FrameWait {
             return left;
         }
         let left = budget.saturating_sub(self.spent);
-        if sharing == Sharing::Reserve {
-            self.spent += left;
+        if !left.is_zero() {
+            self.waiting += 1;
+            if sharing == Sharing::Reserve {
+                self.spent += left;
+            }
         }
         left
     }
@@ -378,17 +389,51 @@ impl FrameWait {
         if self.frame != frame {
             return;
         }
-        match sharing {
+        self.waiting = self.waiting.saturating_sub(1);
+        let elapsed = match sharing {
             Sharing::Window => {
-                self.waiting = self.waiting.saturating_sub(1);
-                if self.waiting == 0
-                    && let Some(at) = self.since.take()
-                {
-                    self.spent += now.saturating_duration_since(at);
-                }
+                let interval = self.since.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+                self.since = (self.waiting != 0).then_some(now);
+                self.spent += interval;
+                interval
             }
-            Sharing::Reserve => self.spent = self.spent.saturating_sub(left - waited),
-            Sharing::PerThread => self.spent += waited,
+            Sharing::Reserve => {
+                self.spent = self.spent.saturating_sub(left.saturating_sub(waited));
+                waited
+            }
+            Sharing::PerThread => {
+                self.spent += waited;
+                waited
+            }
+        };
+        self.completed += elapsed;
+    }
+}
+
+/// Waits by frame and the run's cumulative loading allowance used by one pipeline kind.
+#[derive(Default)]
+struct WaitBudgets {
+    frames: BTreeMap<u64, FrameWait>,
+    past_base: Duration,
+}
+
+impl WaitBudgets {
+    fn budget(&self, frame: u64, base: Duration, compute: bool, allowance: Duration) -> Duration {
+        // This frame's extra wait already reduces its remaining frame window.
+        let current_extra = self.frames.get(&frame).map_or(Duration::ZERO, |wait| wait.completed.saturating_sub(base));
+        frame_budget(base, compute, allowance, self.past_base.saturating_sub(current_extra))
+    }
+
+    fn begin(&mut self, sharing: Sharing, frame: u64, budget: Duration, now: Instant) -> Duration {
+        self.frames.retain(|&number, wait| number >= frame || wait.waiting != 0);
+        self.frames.entry(frame).or_insert_with(FrameWait::new).begin(sharing, frame, budget, now)
+    }
+
+    fn end(&mut self, sharing: Sharing, frame: u64, base: Duration, left: Duration, waited: Duration, now: Instant) {
+        if let Some(wait) = self.frames.get_mut(&frame) {
+            let before = wait.completed.saturating_sub(base);
+            wait.end(sharing, frame, left, waited, now);
+            self.past_base += wait.completed.saturating_sub(base).saturating_sub(before);
         }
     }
 }
@@ -399,19 +444,17 @@ fn wait(p: &Pending, frame: u64) {
     if base.is_zero() || p.slow() {
         return;
     }
-    // What was waited past the base budget since the start, in
-    // milliseconds, by kind (others, compute).
-    static PAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static BUDGETS: [std::sync::LazyLock<Mutex<WaitBudgets>>; 2] =
+        [const { std::sync::LazyLock::new(|| Mutex::new(WaitBudgets::default())) }; 2];
     let compute = p.computes();
-    let past = &PAST[usize::from(compute)];
-    let budget = frame_budget(base, compute, loading_allowance(), Duration::from_millis(past.load(Ordering::Relaxed)));
-    // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now), by kind.
-    static FRAMES: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
-    let frame_wait = &FRAMES[usize::from(compute)];
+    let budgets = &BUDGETS[usize::from(compute)];
     let sharing = shared_budget();
-    let started = Instant::now();
-    let left = frame_wait.lock().unwrap_or_else(|e| e.into_inner()).begin(sharing, frame, budget, started);
+    let (started, left) = {
+        let mut budgets = budgets.lock().unwrap_or_else(|e| e.into_inner());
+        let budget = budgets.budget(frame, base, compute, loading_allowance());
+        let started = Instant::now();
+        (started, budgets.begin(sharing, frame, budget, started))
+    };
     if left.is_zero() {
         return;
     }
@@ -427,9 +470,11 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
-    let waited = started.elapsed().min(left);
-    past.fetch_add(waited.saturating_sub(base).as_millis() as u64, Ordering::Relaxed);
-    frame_wait.lock().unwrap_or_else(|e| e.into_inner()).end(sharing, frame, left, waited, Instant::now());
+    let mut budgets = budgets.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let waited = now.saturating_duration_since(started).min(left);
+    budgets.end(sharing, frame, base, left, waited, now);
+    drop(budgets);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -581,7 +626,7 @@ fn drained() {
 
 #[cfg(test)]
 mod loading_tests {
-    use super::{FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, Sharing, frame_budget, held_too_long, sharing_from};
+    use super::{FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, Sharing, WaitBudgets, frame_budget, held_too_long, sharing_from};
     use std::time::{Duration, Instant};
 
     /// Two threads ask for pipelines still being made in one frame, the
@@ -642,6 +687,40 @@ mod loading_tests {
         assert_eq!(frame_budget(base, true, allowance, Duration::from_secs(130)), base);
         assert_eq!(frame_budget(base, false, Duration::ZERO, Duration::ZERO), base, "VICTORY_PIPELINE_GATE_S=0");
         assert_eq!(frame_budget(Duration::from_secs(20), true, allowance, Duration::ZERO), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn successive_waits_in_a_frame_charge_one_base_budget() {
+        let base = Duration::from_millis(500);
+        let allowance = Duration::from_secs(2);
+        let mut budgets = WaitBudgets::default();
+        let mut now = Instant::now();
+        for waited in [400, 400, 200].map(Duration::from_millis) {
+            let budget = budgets.budget(7, base, true, allowance);
+            let left = budgets.begin(Sharing::Window, 7, budget, now);
+            now += waited;
+            budgets.end(Sharing::Window, 7, base, left, waited, now);
+        }
+        assert_eq!(budgets.past_base, Duration::from_millis(500));
+        assert_eq!(budgets.budget(7, base, true, allowance), allowance);
+        assert_eq!(budgets.budget(8, base, true, allowance), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn overlapping_waits_charge_once_even_if_a_new_frame_starts() {
+        let base = Duration::from_millis(500);
+        let budget = Duration::from_secs(2);
+        let waited = Duration::from_millis(800);
+        let start = Instant::now();
+        let mut budgets = WaitBudgets::default();
+        let a = budgets.begin(Sharing::Window, 7, budget, start);
+        let b = budgets.begin(Sharing::Window, 7, budget, start);
+        budgets.end(Sharing::Window, 7, base, a, waited, start + waited);
+        assert_eq!(budgets.past_base, Duration::from_millis(300));
+        let later = Duration::from_millis(900);
+        budgets.begin(Sharing::Window, 8, budget, start + waited);
+        budgets.end(Sharing::Window, 7, base, b, later, start + later);
+        assert_eq!(budgets.past_base, Duration::from_millis(400));
     }
 
     /// No frame waits for a pipeline the driver has held past 10 s

@@ -289,6 +289,9 @@ struct Lower<'a> {
     /// With `exchange`: VGPR values every lane holds alike ([`lane_uniform`]); a first-lane
     /// read of one needs nothing from the other host wave.
     uniform: HashSet<Value>,
+    /// With `exchange`: VGPR values built from scalars alone, and those a guarded write went
+    /// into ([`scalar_built`]).
+    built: (HashSet<Value>, HashSet<Value>),
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
@@ -533,6 +536,113 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// VGPR values built from scalars alone (`all` is [`all_lane_blocks`]): VALU results, LDS and
+/// buffer loads whose every VGPR input is such a value, and phis of them at a loop header or
+/// where every predecessor is a block all lanes run. Guards are allowed, which [`lane_uniform`]
+/// refuses: a lane that wrote the value holds what every other writing lane does. With them,
+/// the values a guarded write (or one of its inputs) made, which a lane outside that guard may
+/// still hold from before.
+///
+/// A first-lane read of such a value in a branch only some lanes take is the console
+/// compiler's scalar copy of a value it proved the same in every active lane (a prefix of
+/// per-wave totals read back from LDS in a loop, say): the host wave's own first lane is
+/// exact, with nothing asked of the other half.
+fn scalar_built(p: &Program, st: &Structured, all: &[bool]) -> (HashSet<Value>, HashSet<Value>) {
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut rank = vec![usize::MAX; p.blocks.len()];
+    for (i, &b) in order.iter().enumerate() {
+        rank[b] = i;
+    }
+    // each candidate value with the VGPR values it is made of
+    let mut deps: HashMap<Value, Vec<Value>> = HashMap::new();
+    let mut guarded: HashSet<Value> = HashSet::new();
+    for &b in &order {
+        let block = &p.blocks[b];
+        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
+        let header = block.preds.iter().any(|&q| rank[q] >= rank[b]);
+        for phi in &block.phis {
+            if matches!(phi.reg, Reg::V(_)) && (whole || header) {
+                deps.insert(phi.value, phi.args.clone());
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            let name = inst.name();
+            // the operands read (not the old value a guarded write keeps outside its lanes)
+            let ops: Vec<Operand> = match &inst.fields {
+                Fields::Valu(v)
+                    if v.dpp.is_none()
+                        && v.sdwa.is_none()
+                        && !name.starts_with("v_mbcnt")
+                        && !name.starts_with("v_cmpx")
+                        && !name.contains("lane") =>
+                {
+                    v.src.clone()
+                }
+                Fields::Ds { addr, data, .. } if name.starts_with("ds_read") || name.starts_with("ds_load") => {
+                    addr.iter().chain(data).copied().collect()
+                }
+                _ => continue,
+            };
+            let mut inputs = Vec::new();
+            let mut mask_read = false;
+            for op in &ops {
+                match *op {
+                    Operand::Vector { reg, dwords } => {
+                        for r in reg..reg.saturating_add(dwords.max(1)) {
+                            match inst.read(Reg::V(r)) {
+                                Some(x) => inputs.push(x),
+                                None => mask_read = true,
+                            }
+                        }
+                    }
+                    Operand::Scalar { code, .. } if code != NULL => {
+                        mask_read |= inst.read(Reg::S(code)).is_some_and(is_mask);
+                    }
+                    _ => {}
+                }
+            }
+            if mask_read {
+                continue;
+            }
+            for &(r, x) in &inst.writes {
+                if matches!(r, Reg::V(_)) {
+                    deps.insert(x, inputs.clone());
+                    if st.guards[b][i].is_some() {
+                        guarded.insert(x);
+                    }
+                }
+            }
+        }
+    }
+    // the largest set closed under its inputs (loop-carried values need it)
+    let mut built: HashSet<Value> = deps.keys().copied().collect();
+    loop {
+        let out: Vec<Value> =
+            built.iter().copied().filter(|v| !deps[v].iter().all(|d| built.contains(d))).collect();
+        if out.is_empty() {
+            break;
+        }
+        for v in out {
+            built.remove(&v);
+        }
+    }
+    // a guarded write anywhere in a value's making
+    loop {
+        let more: Vec<Value> = built
+            .iter()
+            .copied()
+            .filter(|v| !guarded.contains(v) && deps[v].iter().any(|d| guarded.contains(d)))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        guarded.extend(more);
+    }
+    guarded.retain(|v| built.contains(v));
+    (built, guarded)
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -1099,12 +1209,6 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
 /// signature packs a short element into the free columns of an earlier
 /// register) is NOT in that row's halves: it follows in the first
 /// parameter, in row order, that has whole dwords left.
-/// The title's packed pedestrian shaders show both cases: TEXCOORD7 (register 1,
-/// columns 2-3, behind the two columns of TEXCOORD0) is exported in dword 3
-/// of parameter 0, after TEXCOORD1's two dwords; TEXCOORD6 (register 4,
-/// column 3, behind the three columns of TEXCOORD4) in dword 3 of
-/// parameter 3, after TEXCOORD5 and TEXCOORD7, while the high half of
-/// TEXCOORD4's second dword stays zero.
 type PackedLayout = Vec<(u8, Vec<(u8, u8, u8, u8)>)>;
 
 fn packed_layout(elements: &[SigElement], packs: &[(u8, Option<u8>)]) -> PackedLayout {
@@ -1568,6 +1672,10 @@ impl<'a> Lower<'a> {
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
                 _ => HashSet::new(),
+            },
+            built: match &exchange {
+                Some((_, false, all)) if !LOCAL_WAVES.get() => scalar_built(p, x.st, all),
+                _ => Default::default(),
             },
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
@@ -2328,11 +2436,10 @@ impl<'a> Lower<'a> {
                 }
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
-                    // Above the SGPRs the hardware initializes, a register
-                    // holds what the last wave left, so no program depends
-                    // on it: a read the paths only seem to allow (a branch
-                    // past the write, taken only with one past the read)
-                    // reads zero, as VGPRs do.
+                    None if super::pops::collision_register(self.x.native) == Some(n) => {
+                        Val::I32(self.s.m.i32(super::pops::NO_COLLISION))
+                    }
+                    // Treat SGPRs above the hardware inputs like unset VGPRs.
                     None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
                         Val::I32(self.s.m.i32(0))
                     }
@@ -3309,6 +3416,7 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            super::pops::EXITING_WAVE_ID if super::pops::active(self.x.native) => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -4791,10 +4899,20 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let at = self.begin_guarded(guard);
-        let r = match rmw {
-            Some(op) => self.s.m.atomic(self.cur, op, p, v0),
+        // A subtraction, or an addition of a negated value (which host compilers turn into
+        // one): group-shared memory has no atomic subtraction in DXIL, and the D3D12 drivers
+        // refuse such a pipeline (E_OUTOFMEMORY from NVIDIA's and from WARP), so it is a
+        // compare-exchange loop.
+        let subtract = match rmw {
+            Some(Rmw::Sub) => Some(v0),
+            Some(Rmw::Add) => self.s.m.negated(v0),
+            _ => None,
+        };
+        let r = match (rmw, subtract) {
+            (Some(_), Some(x)) => self.lds_subtract(p, x),
+            (Some(op), None) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
-            None => self
+            (None, _) => self
                 .s
                 .m
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
@@ -4817,6 +4935,24 @@ impl<'a> Lower<'a> {
     /// numbers compare as floats with -0 below +0.
     // shortcut: f32 denormals compare as kept; with the console's MODE
     // flushing them they would order as ±0 first (MODE is not modelled).
+    /// Subtracts `x` from the LDS dword at `p` atomically, with a compare-exchange loop; the
+    /// old value returns (`ds_sub_u32`, see the caller).
+    fn lds_subtract(&mut self, p: V, x: V) -> V {
+        let pre = self.cur;
+        let init = self.s.m.load(pre, p);
+        let (lp, exit) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(pre, Term::Br(lp));
+        let i32t = self.s.t.i32;
+        let old = self.s.m.phi(lp, i32t);
+        let new = self.s.m.bin(lp, Bin::Sub, old, x);
+        let prev = self.s.m.cmpxchg(lp, p, old, new);
+        let done = self.s.m.cmp(lp, pred::EQ, prev, old);
+        self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
+        self.s.m.terminate(lp, Term::CondBr(done, exit, lp));
+        self.cur = exit;
+        old
+    }
+
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
         let pre = self.cur;
         let init = self.s.m.load(pre, p);
@@ -5096,6 +5232,9 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if self.x.native.stage == HwStage::Ps && super::pops::skip_setreg(self.x.native, inst) {
+            return Ok(());
+        }
         let scc = inst.write(Reg::Scc);
         let dst_code = match dst {
             Some(Operand::Scalar { code, .. }) => Some(*code),
@@ -6342,6 +6481,11 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        let ordered = super::pops::active(self.x.native) && props.0 & 0x1000 != 0;
+        let props = (props.0 | (u32::from(ordered) << 13), props.1);
+        if ordered {
+            self.s.flags |= flags::ROVS;
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);
@@ -6403,7 +6547,9 @@ impl<'a> Lower<'a> {
                     // (11) or writes (11 with the UAV bit). Indexed
                     // accesses reach here as raw ones at index times the
                     // entry's stride (`buffer`).
-                    (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) => {
+                    (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b)
+                        if !super::pops::active(self.x.native) =>
+                    {
                         Ok(self.s.root_uav_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 0x100b) => {
@@ -7681,6 +7827,16 @@ impl<'a> Lower<'a> {
                         // scalars this way, inside a loop whose exit is per console wave).
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
+                            return int(self, mine);
+                        }
+                        // A value built from scalars alone, the same in every lane that holds
+                        // it ([`scalar_built`]); one a guarded write made only inside a branch
+                        // (lanes past its end may hold an older one).
+                        if let Some(&Operand::Vector { reg, .. }) = v.src.first()
+                            && let Some(x) = inst.read(Reg::V(reg))
+                            && self.built.0.contains(&x)
+                            && (guard.is_some() || !self.built.1.contains(&x))
+                        {
                             return int(self, mine);
                         }
                         need(self.cur_ir);

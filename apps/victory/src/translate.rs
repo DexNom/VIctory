@@ -175,7 +175,13 @@ pub fn run(
         );
     }
     if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        if emit::host_max_wave() == 0
+            && let Some(max) = host.max_wave_lanes()
+        {
+            emit::set_host_max_wave(max);
+            println!("host waves   at most {max} lanes");
+        }
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -309,12 +315,17 @@ pub fn run(
 /// `victory warm`: fills the caches a run reads (`Command::Warm`).
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, rays: crate::RayOptions) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    if pipelines {
+        victory_hle::modules::d3d12x::check_preload_device()?;
+    }
     let cfg = victory_core::Config::load()?;
     rays.apply(&cfg);
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let [done, refused, made, unmade, omitted] = [const { AtomicUsize::new(0) }; 5];
+    let completed = AtomicUsize::new(0);
+    let last_interval = AtomicUsize::new(0);
     let started = std::time::Instant::now();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
@@ -355,14 +366,24 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, rays: cra
                                 continue;
                             };
                             let count = if translated { &done } else { &refused };
-                            let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+                            count.fetch_add(1, Ordering::Relaxed);
                             match pipeline {
                                 Some(true) => made.fetch_add(1, Ordering::Relaxed),
                                 Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
                                 None => 0,
                             };
-                            if n.is_multiple_of(2000) {
-                                println!("{:6.0} s  {n} shaders", started.elapsed().as_secs_f64());
+                            let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            let elapsed = started.elapsed().as_secs();
+                            let interval = (elapsed / 15) as usize;
+                            let periodic =
+                                last_interval.fetch_max(interval, Ordering::Relaxed) < interval;
+                            if n.is_multiple_of(2000) || periodic {
+                                let translated = done.load(Ordering::Relaxed);
+                                let checked = translated + refused.load(Ordering::Relaxed);
+                                let pipelines = made.load(Ordering::Relaxed);
+                                println!(
+                                    "progress {elapsed} s  {checked} shaders checked  {translated} translated  {pipelines} compute pipelines"
+                                );
                             }
                         }
                     });

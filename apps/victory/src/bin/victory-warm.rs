@@ -10,7 +10,7 @@ mod windows_launcher;
 #[cfg(windows)]
 fn main() {
     if let Err(error) = windows_launcher::run(true) {
-        eprintln!("Shader preload failed\n{error:#}");
+        eprintln!("DexNom Runtime failed\n{error:#}");
         std::process::exit(1);
     }
 }

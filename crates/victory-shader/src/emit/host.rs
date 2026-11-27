@@ -2,6 +2,7 @@
 //! tests, drawing a full-screen triangle and reading the target back.
 
 use std::ffi::CString;
+use std::ops::RangeInclusive;
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -15,6 +16,7 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    wave_lanes: Option<RangeInclusive<u32>>,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -131,13 +133,28 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
-            Ok(Host { device })
+            let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            let wave_lanes = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut caps).cast(),
+                    size_of_val(&caps) as u32,
+                )
+                .is_ok()
+                .then_some(caps.WaveLaneCountMin..=caps.WaveLaneCountMax)
+                .filter(|lanes| *lanes.start() != 0 && !lanes.is_empty());
+            Ok(Host { device, wave_lanes })
         }
     }
 
     /// Whether the device is on the software adapter: asked of the device itself, the one a test runs on.
     pub fn is_software(&self) -> bool {
         software(&self.device)
+    }
+
+    /// The widest wave supported by this D3D12 device.
+    pub fn max_wave_lanes(&self) -> Option<u32> {
+        self.wave_lanes.as_ref().map(|lanes| *lanes.end())
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -257,6 +274,15 @@ impl Host {
         &self,
         cs: &HostShader,
     ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        if let Some(lanes) = &self.wave_lanes
+            && let Some(required) = cs.incompatible_wave_size(lanes)
+        {
+            return Err(format!(
+                "shader requires wave{required}, host supports {}..={} lanes",
+                lanes.start(),
+                lanes.end()
+            ));
+        }
         let root = self.root_signature_for(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])?;
         let pso = self.compute_pipeline_with(&root, &cs.dxil)?;
         Ok((root, pso))

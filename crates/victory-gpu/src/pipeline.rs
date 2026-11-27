@@ -797,6 +797,18 @@ pub(crate) fn library_removal_note() -> String {
     library::removal_note()
 }
 
+/// Checks that the same D3D12 device as the game can build translated pipelines.
+#[cfg(windows)]
+pub fn check_preload_device() -> anyhow::Result<()> {
+    use anyhow::Context;
+    let host = crate::host::host().context("Cannot initialize the Direct3D 12 device for shader preload")?;
+    anyhow::ensure!(
+        host.shader_model_6_6(),
+        "The selected Direct3D 12 device does not support Shader Model 6.6"
+    );
+    Ok(())
+}
+
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]

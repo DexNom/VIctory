@@ -27,6 +27,7 @@ struct LaunchOptions {
     rt_write_stats: bool,
     rt_store_trace: bool,
     lighting_trace: bool,
+    play: bool,
 }
 
 fn launcher_options(
@@ -47,6 +48,7 @@ fn launcher_options(
         rt_write_stats: false,
         rt_store_trace: false,
         lighting_trace: false,
+        play: false,
     };
     while let Some(option) = args.peek() {
         if option == "--warp" {
@@ -87,6 +89,8 @@ fn launcher_options(
             options.rt_store_trace = true;
         } else if option == "--lighting-trace" {
             options.lighting_trace = true;
+        } else if option == "--play" {
+            options.play = true;
         } else if option == "--console" {
             args.next();
             options.console = match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
@@ -119,8 +123,12 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
     let LaunchOptions {
         warp, ray_tracing, static_bvh, console, local_gpu_memory, native_1440p, render_1080p, fsr,
-        sparse_textures, upload_ahead, capture_readbacks, rt_write_stats, rt_store_trace, lighting_trace,
+        sparse_textures, upload_ahead, capture_readbacks, rt_write_stats, rt_store_trace, lighting_trace, play,
     } = launcher_options(&mut args)?;
+    if play && !warm {
+        bail!("--play is only accepted by victory-warm");
+    }
+    let play = play || !warm;
     let game = match args.next() {
         Some(path) => PathBuf::from(path),
         None => {
@@ -132,8 +140,9 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     };
     if args.next().is_some() {
         bail!(
-            "Usage\n{} [--rt | --no-rt | --rt-static-bvh] [--warp] [--console series-x|series-s] [--local-gpu-memory] [--native-1440p | --1080p-to-1440p | --fsr-quality | --fsr-balanced | --fsr-performance] [--sparse-textures] [--upload-ahead | --no-upload-ahead] [--capture-readbacks] [--rt-write-stats] [--rt-store-trace] [--lighting-trace] [game executable]",
-            launcher.display()
+            "Usage\n{}{} [--rt | --no-rt | --rt-static-bvh] [--warp] [--console series-x|series-s] [--local-gpu-memory] [--native-1440p | --1080p-to-1440p | --fsr-quality | --fsr-balanced | --fsr-performance] [--sparse-textures] [--upload-ahead | --no-upload-ahead] [--capture-readbacks] [--rt-write-stats] [--rt-store-trace] [--lighting-trace] [game executable]",
+            launcher.display(),
+            if warm { " [--play]" } else { "" }
         );
     }
     if !game.is_file() || !runtime.is_file() {
@@ -172,97 +181,105 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         runtime.display(),
         game.display()
     )?;
-    let latest = if warm {
-        "latest-warm.txt"
-    } else {
-        "latest.txt"
+    let new_child = |log: &mut File| -> anyhow::Result<Command> {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut child = Command::new(&runtime);
+        if let Some(on) = ray_tracing {
+            child.env("VICTORY_RAY_TRACING", if on { "1" } else { "0" });
+            writeln!(log, "Ray tracing requested: {}", if on { "on" } else { "off" })?;
+        } else if static_bvh {
+            child.env("VICTORY_RAY_TRACING", "static-bvh");
+            writeln!(log, "Ray tracing requested: static BVH traversal")?;
+        }
+        if warp {
+            child.env("VICTORY_D3D12_WARP", "1");
+        }
+        if local_gpu_memory {
+            child.env("VICTORY_LOCAL_GPU_INPUTS", "1");
+        }
+        if native_1440p {
+            child
+                .env("VICTORY_NATIVE_1440P", "1")
+                .env("VICTORY_RENDER_1080P", if render_1080p { "1" } else { "0" })
+                .env("VICTORY_FSR_4K", "0");
+            let expected_render = if render_1080p { "1920x1080" } else { "2560x1440" };
+            writeln!(log, "Expected scene rendering {expected_render}, output 2560x1440")?;
+        }
+        if let Some(preset) = fsr {
+            child.env("VICTORY_FSR_4K", preset.name());
+            let provider = folder.join("fidelityfx");
+            if std::env::var_os("VICTORY_FIDELITYFX_DIR").is_none()
+                && provider.join("amd_fidelityfx_upscaler_dx12.dll").is_file()
+            {
+                child.env("VICTORY_FIDELITYFX_DIR", provider);
+            }
+            let [width, height] = preset.render_size();
+            writeln!(log, "FSR {} (SDK mode {}) requested at {width}x{height} scene, 3840x2160 output", preset.name(), preset.mode())?;
+        }
+        if (fsr.is_some() || upload_ahead == Some(true)) && std::env::var_os("VICTORY_LOG").is_none() {
+            let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into());
+            child.env("VICTORY_LOG", format!(
+                "{filter},victory::run::native_1440p=info,victory_hle::modules::fidelityfx=info,victory_gpu::host=info,victory_gpu::texture::ahead=info"
+            ));
+        }
+        if let Some(enabled) = upload_ahead {
+            let value = if enabled { "1" } else { "0" };
+            child.env("VICTORY_UPLOAD_AHEAD", value);
+            writeln!(log, "Texture copy queue requested: {}", if enabled { "on" } else { "off" })?;
+        }
+        for (enabled, key, message) in [
+            (sparse_textures, "VICTORY_LEVELS_ON_DEMAND", "Sparse texture mips requested"),
+            (capture_readbacks, "VICTORY_CAPTURE_READBACKS", "Dirty-page readback capture requested"),
+            (rt_write_stats, "VICTORY_RT_WRITE_STATS", "Ray-tracing write statistics requested"),
+        ] {
+            if enabled {
+                child.env(key, "1");
+                writeln!(log, "{message}")?;
+            }
+        }
+        if rt_store_trace {
+            child.env("VICTORY_CAPTURE_RAW_STORES", victory_shader::emit::RAW_STORE_PROBE_HASH);
+            writeln!(log, "InitHeaders store trace requested")?;
+        }
+        if lighting_trace {
+            let trace = folder.join("lighting-trace").join(format!("{started}-{}", std::process::id()));
+            fs::create_dir_all(&trace)?;
+            let request = trace.join("request.txt");
+            // Lighting using the shadow mask, RT resolve, auto-exposure, and the final composite.
+            child
+                .env("VICTORY_CAPTURE", &trace)
+                .env("VICTORY_CAPTURE_REQUEST", &request)
+                .env("VICTORY_DUMP_AFTER", "2bf91065944bcff4,7f05ddab771799a9,e622b718b6d9b057,6318f669e4f17d65")
+                .env("VICTORY_DUMP_INPUT", "e622b718b6d9b057:s1+0");
+            writeln!(log, "Lighting trace request file {}", request.display())?;
+        }
+        if std::env::var_os("VICTORY_DEBUG_HUD").is_none() {
+            child.env("VICTORY_DEBUG_HUD", "1");
+        }
+        child
+            .current_dir(folder)
+            .env("VICTORY_DATA_DIR", &state)
+            .env("VICTORY_CACHE_DIR", &cache)
+            .stdin(Stdio::null())
+            .stderr(log.try_clone()?)
+            .creation_flags(CREATE_NO_WINDOW);
+        Ok(child)
     };
-    fs::write(logs.join(latest), path.display().to_string())?;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut child = Command::new(&runtime);
-    if let Some(on) = ray_tracing {
-        child.env("VICTORY_RAY_TRACING", if on { "1" } else { "0" });
-        writeln!(log, "Ray tracing requested: {}", if on { "on" } else { "off" })?;
-    } else if static_bvh {
-        child.env("VICTORY_RAY_TRACING", "static-bvh");
-        writeln!(log, "Ray tracing requested: static BVH traversal")?;
-    }
-    if warp {
-        child.env("VICTORY_D3D12_WARP", "1");
-    }
-    if local_gpu_memory {
-        child.env("VICTORY_LOCAL_GPU_INPUTS", "1");
-    }
-    if native_1440p {
-        child
-            .env("VICTORY_NATIVE_1440P", "1")
-            .env("VICTORY_RENDER_1080P", if render_1080p { "1" } else { "0" })
-            .env("VICTORY_FSR_4K", "0");
-        let expected_render = if render_1080p { "1920x1080" } else { "2560x1440" };
-        writeln!(log, "Expected scene rendering {expected_render}, output 2560x1440")?;
-    }
-    if let Some(preset) = fsr {
-        child.env("VICTORY_FSR_4K", preset.name());
-        let provider = folder.join("fidelityfx");
-        if std::env::var_os("VICTORY_FIDELITYFX_DIR").is_none()
-            && provider.join("amd_fidelityfx_upscaler_dx12.dll").is_file()
-        {
-            child.env("VICTORY_FIDELITYFX_DIR", provider);
-        }
-        let [width, height] = preset.render_size();
-        writeln!(log, "FSR {} (SDK mode {}) requested at {width}x{height} scene, 3840x2160 output", preset.name(), preset.mode())?;
-    }
-    if (fsr.is_some() || upload_ahead == Some(true)) && std::env::var_os("VICTORY_LOG").is_none() {
-        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into());
-        child.env("VICTORY_LOG", format!(
-            "{filter},victory::run::native_1440p=info,victory_hle::modules::fidelityfx=info,victory_gpu::host=info,victory_gpu::texture::ahead=info"
-        ));
-    }
-    if let Some(enabled) = upload_ahead {
-        let value = if enabled { "1" } else { "0" };
-        child.env("VICTORY_UPLOAD_AHEAD", value);
-        writeln!(log, "Texture copy queue requested: {}", if enabled { "on" } else { "off" })?;
-    }
-    for (enabled, key, message) in [
-        (sparse_textures, "VICTORY_LEVELS_ON_DEMAND", "Sparse texture mips requested"),
-        (capture_readbacks, "VICTORY_CAPTURE_READBACKS", "Dirty-page readback capture requested"),
-        (rt_write_stats, "VICTORY_RT_WRITE_STATS", "Ray-tracing write statistics requested"),
-    ] {
-        if enabled {
-            child.env(key, "1");
-            writeln!(log, "{message}")?;
+    if warm {
+        fs::write(logs.join("latest-warm.txt"), path.display().to_string())?;
+        let mut child = new_child(&mut log)?;
+        let status = preload(&mut child, &game, &cache, &path, &mut log)?;
+        if !status.success() {
+            bail!("Shader preload exited with {status}.\n\nLog file\n{}", path.display());
         }
     }
-    if rt_store_trace {
-        child.env("VICTORY_CAPTURE_RAW_STORES", victory_shader::emit::RAW_STORE_PROBE_HASH);
-        writeln!(log, "InitHeaders store trace requested")?;
-    }
-    if lighting_trace {
-        let trace = folder.join("lighting-trace").join(format!("{started}-{}", std::process::id()));
-        fs::create_dir_all(&trace)?;
-        let request = trace.join("request.txt");
-        // Lighting using the shadow mask, RT resolve, auto-exposure, and the final composite.
-        child
-            .env("VICTORY_CAPTURE", &trace)
-            .env("VICTORY_CAPTURE_REQUEST", &request)
-            .env("VICTORY_DUMP_AFTER", "2bf91065944bcff4,7f05ddab771799a9,e622b718b6d9b057,6318f669e4f17d65")
-            .env("VICTORY_DUMP_INPUT", "e622b718b6d9b057:s1+0");
-        writeln!(log, "Lighting trace request file {}", request.display())?;
-    }
-    if std::env::var_os("VICTORY_DEBUG_HUD").is_none() {
-        child.env("VICTORY_DEBUG_HUD", "1");
-    }
-    child
-        .current_dir(folder)
-        .env("VICTORY_DATA_DIR", &state)
-        .env("VICTORY_CACHE_DIR", &cache)
-        .stdin(Stdio::null())
-        .stderr(log.try_clone()?)
-        .creation_flags(CREATE_NO_WINDOW);
-    let status = if warm {
-        preload(&mut child, &game, &cache, &path, &mut log)?
-    } else {
-        let status = child
+    if play {
+        if warm {
+            writeln!(log, "Shader preload finished. Starting the game.")?;
+            println!("Shader preload finished. Starting the game.");
+        }
+        fs::write(logs.join("latest.txt"), path.display().to_string())?;
+        let status = new_child(&mut log)?
             .arg("run")
             .arg(&game)
             .args([
@@ -276,13 +293,9 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
             .status()
             .with_context(|| format!("Could not start {}", runtime.display()))?;
         writeln!(log, "VIctory exited with {status}")?;
-        status
-    };
-    if !status.success() {
-        bail!(
-            "VIctory exited with {status}.\n\nLog file\n{}",
-            path.display()
-        );
+        if !status.success() {
+            bail!("VIctory exited with {status}.\n\nLog file\n{}", path.display());
+        }
     }
     Ok(())
 }
@@ -476,6 +489,9 @@ mod tests {
     #[test]
     fn empty_and_incomplete_scans_are_reported() {
         assert!(check_warm_summary(None).is_err());
+        assert!(check_warm_summary(Some(
+            "progress 15 s  2000 shaders checked  1990 translated  100 compute pipelines"
+        )).is_err());
         assert!(
             check_warm_summary(Some(
                 "warm  0 translated, 0 refused; 0 compute pipelines, 0 refused; 0 s"

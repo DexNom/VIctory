@@ -79,19 +79,19 @@ try {
     [IO.File]::WriteAllText($config, $game.FullName, [Text.UTF8Encoding]::new($false))
 } finally { $lock.Dispose() }
 
-$launcher = Join-Path $InstallDir 'victory-play.exe'
 Write-Host "Installed DexNom RayTime in $InstallDir"
 [IO.Directory]::CreateDirectory($ShortcutDirectory) | Out-Null
 $shell = New-Object -ComObject WScript.Shell
 foreach ($entry in @(
-    @{ Name = 'DexNom RayTime'; Arguments = '' }
-    @{ Name = 'DexNom RayTime (Experimental RT)'; Arguments = '--rt' }
-    @{ Name = 'DexNom RayTime (FSR Quality 4K)'; Arguments = '--rt --console series-x --local-gpu-memory --fsr-quality --sparse-textures --no-upload-ahead --capture-readbacks --rt-write-stats' }
+    @{ Name = 'DexNom RayTime'; Program = 'victory-play.exe'; Arguments = '' }
+    @{ Name = 'DexNom RayTime (Experimental RT)'; Program = 'victory-play.exe'; Arguments = '--rt' }
+    @{ Name = 'DexNom RayTime (FSR Quality 4K)'; Program = 'victory-play.exe'; Arguments = '--rt --console series-x --local-gpu-memory --fsr-quality --sparse-textures --no-upload-ahead --capture-readbacks --rt-write-stats' }
+    @{ Name = 'DexNom RayTime (Preload and Play)'; Program = 'victory-warm.exe'; Arguments = '--play' }
 )) {
     $shortcut = $shell.CreateShortcut((Join-Path $ShortcutDirectory ($entry.Name + '.lnk')))
-    $shortcut.TargetPath = $launcher
+    $shortcut.TargetPath = Join-Path $InstallDir $entry.Program
     $shortcut.Arguments = $entry.Arguments
     $shortcut.WorkingDirectory = $InstallDir
     $shortcut.Save()
 }
-Write-Host "Open DexNom RayTime from $ShortcutDirectory. The FSR Quality 4K shortcut uses the tested ray-tracing profile."
+Write-Host "Open DexNom RayTime from $ShortcutDirectory. The FSR Quality 4K shortcut uses the tested ray-tracing profile. The Preload and Play shortcut finishes shader preloading before launch."
