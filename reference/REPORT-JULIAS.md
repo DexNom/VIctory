@@ -368,6 +368,13 @@ chaves que o nosso runtime honra — não as 20 mortas.
 | `VRAM_RESERVE` | documentar | sem equivalente |
 | `WAVE_WIDE_DIGESTS` | documentar | hash de shader específico da build deles |
 | `AMBIENT_MOST` / `BAKE_NO_WAIT` | documentar | cosmético / específico da build deles |
+| Tarefas administrativas | **implementar** | plano de energia + preferência de GPU; pagefile só relatado |
+| Detecção de hardware | **implementar** | registro + `GlobalMemoryStatusEx`, sem WMI |
+| Código de perfil compartilhável | **implementar** | `s=;b=;t=;m=;w=;p=;r=;g=;c=`, validado inteiro |
+| Presets de modo | **implementar** | seis modos; só dois medidos nesta máquina |
+| Download/atualização do runtime | não | o runtime vem embutido no `GTA6.exe` |
+| Perfil de driver NVIDIA | não | ganho de driver, não de runtime; não é necessário |
+| Telemetria de hardware | não | o nosso launcher não envia nada |
 
 O que a paridade entrega: a mesma janela, os mesmos presets, o mesmo código de perfil
 compartilhável, a mesma detecção de hardware, o mesmo assistente de preparação — com o

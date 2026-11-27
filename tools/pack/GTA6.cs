@@ -6,6 +6,7 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -53,6 +54,7 @@ static class GTA6
         bool book = args.Length > 0 && args[0] == "--book";
         bool headless = args.Length > 0 && (args[0].StartsWith("--play", StringComparison.Ordinal) || book);
         bool installOnly = args.Length > 0 && args[0] == "--install";
+        bool adminOnly = args.Length > 0 && args[0] == "--admin";
         bool codeOnly = args.Length > 0 && args[0].StartsWith("--code", StringComparison.Ordinal);
 
         try
@@ -73,6 +75,16 @@ static class GTA6
 
         if (installOnly)
         {
+            Environment.Exit(0);
+            return;
+        }
+
+        // Os ajustes que pedem elevacao: plano de energia e a preferencia de
+        // placa do Windows para o victory.exe. O proprio processo se relanca
+        // com runas; o que nao subir, a linha de status diz.
+        if (adminOnly)
+        {
+            AdminSetup();
             Environment.Exit(0);
             return;
         }
@@ -1257,6 +1269,10 @@ static class GTA6
         prepare.Click += delegate { Prepare(); };
         window.Controls.Add(prepare);
 
+        Button setup = MakeButton("Ajustes do Windows", 308, 336, 262);
+        setup.Click += delegate { AdminSetup(); };
+        window.Controls.Add(setup);
+
         status = new Label();
         status.Text = "Jogo: " + (ReadGamePath().Length > 0 ? ReadGamePath() : "nao encontrado");
         status.ForeColor = Color.FromArgb(150, 150, 160);
@@ -1523,6 +1539,112 @@ static class GTA6
     }
 
     // --------------------------------------------------------------- extras
+
+    // O "Setup" do launcher da Julia, sem tocar no pagefile. O plano de energia
+    // e a preferencia de placa sao reversiveis e nao pedem reinicio; o pagefile
+    // desta maquina ja esta fixo em 40 GB, entao ele so e relatado.
+    static void AdminSetup()
+    {
+        if (!IsAdmin())
+        {
+            try
+            {
+                ProcessStartInfo again = new ProcessStartInfo(Application.ExecutablePath, "--admin");
+                again.UseShellExecute = true;
+                again.Verb = "runas";
+                Process.Start(again);
+            }
+            catch (Exception)
+            {
+                Say("Sem elevacao: os ajustes do Windows nao foram aplicados.");
+            }
+            return;
+        }
+
+        List<string> lines = new List<string>();
+
+        try
+        {
+            ProcessStartInfo power = new ProcessStartInfo(
+                "powercfg", "/overlaysetactive ded574b5-45a0-4f42-8737-46345c09c238");
+            power.UseShellExecute = false;
+            power.CreateNoWindow = true;
+            using (Process process = Process.Start(power))
+            {
+                process.WaitForExit(30000);
+                lines.Add("energia: " + (process.ExitCode == 0
+                    ? "ultimate performance"
+                    : "codigo " + process.ExitCode));
+            }
+        }
+        catch (Exception error)
+        {
+            lines.Add("energia: " + error.Message);
+        }
+
+        // GpuPreference=2 e "alto desempenho". Num portatil com duas placas e o
+        // que impede o Windows de dar a integrada ao runtime.
+        try
+        {
+            using (RegistryKey key = Registry.CurrentUser.CreateSubKey(
+                @"Software\Microsoft\DirectX\UserGpuPreferences"))
+            {
+                key.SetValue(Path.Combine(Runtime, "victory.exe"), "GpuPreference=2;");
+                lines.Add("placa: alto desempenho para victory.exe");
+            }
+        }
+        catch (Exception error)
+        {
+            lines.Add("placa: " + error.Message);
+        }
+
+        lines.Add("pagefile: " + PagefileLine());
+        Say(string.Join("  |  ", lines.ToArray()));
+    }
+
+    static bool IsAdmin()
+    {
+        try
+        {
+            using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+            {
+                return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+            }
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    static string PagefileLine()
+    {
+        try
+        {
+            using (RegistryKey key = Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"))
+            {
+                string[] files = key == null ? null : key.GetValue("PagingFiles") as string[];
+                if (files == null)
+                {
+                    return "gerenciado pelo Windows";
+                }
+                List<string> parts = new List<string>();
+                foreach (string file in files)
+                {
+                    if (!string.IsNullOrEmpty(file.Trim()))
+                    {
+                        parts.Add(file.Trim());
+                    }
+                }
+                return parts.Count == 0 ? "gerenciado pelo Windows" : string.Join("; ", parts.ToArray());
+            }
+        }
+        catch (Exception)
+        {
+            return "nao lido";
+        }
+    }
 
     static void OpenFile(string name)
     {

@@ -841,3 +841,22 @@ oferece, para nao vender um botao que nao faz nada.
 
 O relatorio completo esta em `reference/REPORT-JULIAS.md`, com o binario e os 45
 arquivos descompilados em `reference/`. Nada disso entra no build.
+
+### O "Setup" do Windows
+
+O botao **Ajustes do Windows** faz o que o `AdminTasks.cs` da Julia faz, menos o
+pagefile: plano de energia Ultimate Performance (`powercfg /overlaysetactive`) e
+`GpuPreference=2` para o `victory.exe` em `HKCU\Software\Microsoft\DirectX\
+UserGpuPreferences`. O proprio processo se relanca com `runas`; sem elevacao ele
+diz na linha de status. O pagefile nao e alterado — o desta maquina ja esta fixo
+em 40 GB, e mexer nele pede reinicio e pode deixar o sistema sem swap se a conta
+sair errada. Ele so e relatado.
+
+### Um teste que ja estava vermelho
+
+`pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws` falha
+nesta maquina com `E_INVALIDARG` na serializacao da root signature. Nao e
+regressao: `pipeline/host.rs` esta byte-identico ao commit anterior, e o binario
+de teste roda sem o `D3D12Core.dll` do Agility SDK ao lado, entao cai no
+`d3d12.dll` do Windows 10, que recusa os flags de acesso direto a heap. O teste
+que depende de dispositivo real continua vermelho aqui; os outros 372 passam.
