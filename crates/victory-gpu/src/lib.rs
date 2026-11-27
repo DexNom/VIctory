@@ -15,6 +15,10 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// Off Windows this crate is built for `cargo check` only: the host, texture and descriptor paths
+// that use D3D12 are `cfg(windows)`, which leaves their helpers and parameters unused here.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports, unused_mut, unused_variables))]
+
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
