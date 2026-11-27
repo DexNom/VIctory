@@ -3099,6 +3099,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn addressable_render_xor_texture_uploads_from_guest_memory() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = crate::host::host() else {
             assert!(
                 std::env::var_os("VICTORY_D3D12_WARP").is_none(),
@@ -4254,6 +4255,7 @@ float4 lit() : SV_Target { return 1.0; }
     #[cfg(windows)]
     #[test]
     fn texture_copyback_preserves_padding_and_owns_the_destination() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {
             assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "requested WARP device could not be created");

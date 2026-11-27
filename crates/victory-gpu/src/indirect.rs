@@ -705,6 +705,7 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut warp) = WarpHarness::new() else {
             assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "requested WARP device could not be created");
             eprintln!("WARP D3D12 adapter unavailable; skipped card compare test");
@@ -849,6 +850,7 @@ void main() {
 
     #[test]
     fn warp_card_fetch_preserves_gaps_and_resource_boundaries() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut warp) = WarpHarness::new() else {
             assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "requested WARP device could not be created");
             return;
@@ -921,6 +923,7 @@ void main() {
     ///     records into `dst_args` at offset `0`.
     #[test]
     fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1129,6 +1132,7 @@ void main() {
     /// clamped, or empty.
     #[test]
     fn warp_large_dispatch_is_made_in_parts() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1178,6 +1182,7 @@ void main() {
     /// to the most and spend the budget.
     #[test]
     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1261,6 +1266,7 @@ void main() {
 
     #[test]
     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
