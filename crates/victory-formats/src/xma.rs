@@ -279,23 +279,52 @@ fn log2(v: usize) -> u32 {
 
 // The inverse transform.
 
+struct ImdctRotations {
+    pre: Vec<(f64, f64)>,
+    post: Vec<(f64, f64)>,
+}
+
+/// The three block sizes share fixed rotations across channels and streams.
+fn imdct_rotations(n: usize) -> &'static ImdctRotations {
+    static ROTATIONS: OnceLock<[ImdctRotations; BLOCK_SIZES]> = OnceLock::new();
+    let rotations = ROTATIONS.get_or_init(|| {
+        std::array::from_fn(|i| {
+            let n = MIN_SUBFRAME << i;
+            ImdctRotations {
+                pre: (0..n / 2)
+                    .map(|k| (-std::f64::consts::PI * k as f64 / n as f64).sin_cos())
+                    .collect(),
+                post: (0..n / 2)
+                    .map(|k| (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos())
+                    .collect(),
+            }
+        })
+    });
+    &rotations[log2(n) as usize - log2(MIN_SUBFRAME) as usize]
+}
+
 /// Half-length inverse MDCT as FFmpeg defines it (`av_tx` MDCT, inverse):
 /// `n` coefficients to the middle `n` samples of the 2n-sample window,
 /// negated and scaled by `scale`. Computed as a DCT-IV through an
 /// n/2-point complex FFT.
 fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
     let n = input.len();
+    debug_assert!(n.is_power_of_two() && (MIN_SUBFRAME..=FRAME_SAMPLES).contains(&n));
     let m = n / 2;
-    let mut re = vec![0f64; m];
-    let mut im = vec![0f64; m];
+    let rotations = imdct_rotations(n);
+    // Even the largest transform needs only 4 KiB of scratch; keep it local
+    // rather than allocating two buffers for every channel and subframe.
+    let mut re = [0f64; FRAME_SAMPLES / 2];
+    let mut im = [0f64; FRAME_SAMPLES / 2];
+    let (re, im) = (&mut re[..m], &mut im[..m]);
     for k in 0..m {
         let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
-        let (s, c) = (-std::f64::consts::PI * k as f64 / n as f64).sin_cos();
+        let (s, c) = rotations.pre[k];
         (re[k], im[k]) = (a * c - b * s, a * s + b * c);
     }
-    fft(&mut re, &mut im);
+    fft(re, im);
     for k in 0..m {
-        let (s, c) = (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos();
+        let (s, c) = rotations.post[k];
         let (wr, wi) = (re[k] * c - im[k] * s, re[k] * s + im[k] * c);
         // DCT-IV: c[2k] = Re, c[n-1-2k] = -Im; output j is c[n-1-j].
         out[n - 1 - 2 * k] = (wr as f32) * scale;
@@ -1073,6 +1102,63 @@ mod tests {
             for (a, b) in fast.iter().zip(&reference) {
                 assert!((a - b).abs() < 1e-2 * (1.0 + b.abs()), "n {n}: {a} vs {b}");
             }
+        }
+    }
+
+    #[test]
+    fn imdct_handles_silence_impulses_and_scaling() {
+        for n in [128usize, 256, 512] {
+            for impulse in [None, Some(0), Some(n / 2), Some(n - 1)] {
+                let mut input = vec![0f32; n];
+                if let Some(at) = impulse {
+                    input[at] = 1.0;
+                }
+                let reference = imdct_reference(&input);
+                let mut out = vec![f32::NAN; n];
+                for scale in [1.0, -0.5, 2.0 / n as f32 / 32768.0] {
+                    imdct_half(&input, &mut out, scale);
+                    for (&actual, &expected) in out.iter().zip(&reference) {
+                        let expected = expected * scale;
+                        assert!(
+                            (actual - expected).abs() < 1e-6 * scale.abs(),
+                            "n {n}, impulse {impulse:?}, scale {scale}: {actual} vs {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// CPU-only transform timing; run this test in release mode with
+    /// `--ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "CPU microbenchmark; run in release mode"]
+    fn imdct_throughput() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: usize = 10_000;
+        for n in [128usize, 256, 512] {
+            let input: Vec<f32> = (0..n).map(|i| ((i * 7919) % 97) as f32 - 48.0).collect();
+            let mut out = vec![0f32; n];
+            let scale = 2.0 / n as f32 / 32768.0;
+            for _ in 0..16 {
+                imdct_half(black_box(&input), black_box(&mut out), black_box(scale));
+            }
+            let mut times = [0f64; 5];
+            for time in &mut times {
+                let started = Instant::now();
+                for _ in 0..ITERATIONS {
+                    imdct_half(black_box(&input), black_box(&mut out), black_box(scale));
+                    black_box(&out);
+                }
+                *time = started.elapsed().as_secs_f64() * 1e9 / ITERATIONS as f64;
+            }
+            times.sort_by(f64::total_cmp);
+            println!(
+                "XMA IMDCT n={n}: median {:.1} ns/transform ({ITERATIONS} transforms/sample, 5 samples)",
+                times[2]
+            );
         }
     }
 
