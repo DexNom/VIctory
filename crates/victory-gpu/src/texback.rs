@@ -53,6 +53,31 @@ pub(crate) fn wanted(resource: This) -> bool {
         && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
 }
 
+/// The guest destination as it was when the list first recorded a writer.
+pub(crate) struct Target {
+    resource: crate::resource::ResourceRef,
+    mapping: crate::inplace::ReadbackMapping,
+    layout: victory_formats::texture::Layout,
+    at: usize,
+    size: usize,
+}
+
+impl Target {
+    pub(crate) fn new(resource: This) -> Option<Self> {
+        let resource = crate::resource::ResourceRef::new(resource);
+        let (layout, at, size) = crate::resource::title_texture(resource.as_ptr())?;
+        let end = at.checked_add(size)?;
+        // Register before a remap can replace this writer's destination.
+        let _reading = crate::watch::title_memory_reading_range(at..end);
+        let mapping = crate::inplace::ReadbackMapping::record(at, size)?;
+        Some(Self { resource, mapping, layout, at, size })
+    }
+
+    pub(crate) fn resource(&self) -> This {
+        self.resource.as_ptr()
+    }
+}
+
 /// A texture's copy into a read-back buffer, recorded into a list, and where
 /// its texels go once the list has run.
 pub(crate) struct Back {
@@ -107,13 +132,10 @@ pub(crate) fn add_destination_aliases(ranges: &mut Vec<(usize, usize)>) {
     }
 }
 
-/// Records into `list` the copy of `texture` (title resource `resource`'s
-/// host copy, in the copy-source state) into a read-back buffer.
-pub(crate) fn record(list: &ID3D12GraphicsCommandList, retained: crate::resource::ResourceRef, texture: &ID3D12Resource) -> Option<Back> {
+/// Records a copy of the target's host texture, in copy-source state.
+pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target, texture: &ID3D12Resource) -> Option<Back> {
     let host = crate::host::host()?;
-    let resource = retained.as_ptr();
-    let (layout, at, size) = crate::resource::title_texture(resource)?;
-    at.checked_add(size)?;
+    let Target { resource, mapping, layout, at, size } = target;
     // SAFETY: a live texture.
     let desc = unsafe { texture.GetDesc() };
     let mips = u32::from(desc.MipLevels);
@@ -136,10 +158,9 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, retained: crate::resource
         )
     };
     let buffer_bytes = usize::try_from(total).ok()?;
-    if buffer_bytes == 0 || buffer_bytes > isize::MAX as usize || at == 0 || size == 0 {
+    if buffer_bytes == 0 || buffer_bytes > isize::MAX as usize {
         return None;
     }
-    let mapping = crate::inplace::ReadbackMapping::record(at, size)?;
     let buffer = host.read_back_buffer(total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -158,8 +179,8 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, retained: crate::resource
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
     COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let kind = crate::resource::texture_kind(resource);
-    Some(Back { _resource: retained, mapping, buffer, buffer_bytes, footprints, rows, mips, layout, at, size, kind })
+    let kind = crate::resource::texture_kind(resource.as_ptr());
+    Some(Back { _resource: resource, mapping, buffer, buffer_bytes, footprints, rows, mips, layout, at, size, kind })
 }
 
 /// Textures copied back since the start.

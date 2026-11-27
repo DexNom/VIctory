@@ -4364,6 +4364,110 @@ float4 lit() : SV_Target { return 1.0; }
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn texture_copyback_rejects_a_remap_between_the_writer_and_list_close() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows_sys::Win32::System::Memory::*;
+
+        let Some(host) = crate::host::host() else {
+            assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "requested WARP unavailable");
+            return;
+        };
+        let desc = ResourceDesc { flags: 4, ..texture(64, 64, 16, 1) };
+        let extent = footprint(&desc).unwrap().size as usize;
+        // SAFETY: the fixture reserves and owns this range until cleanup.
+        let memory = unsafe {
+            VirtualAlloc(std::ptr::null(), extent, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!memory.is_null());
+        let at = memory as usize;
+        let mut title = std::ptr::null();
+        assert_eq!(
+            create_at_address(std::ptr::null(), at as u64, &desc, 0, std::ptr::null(), &PAGEABLE_IIDS[0], &mut title),
+            S_OK
+        );
+        if !crate::texback::wanted(title) {
+            resource_release(title);
+            // SAFETY: no list or resource refers to the private reservation.
+            assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+            return;
+        }
+        let (layout, _, size) = title_texture(title).unwrap();
+        let (upload, data) = host.upload_buffer(64 * 512).unwrap();
+        // SAFETY: this upload is private to the fixture and all bytes will be initialized.
+        unsafe { data.write_bytes(0x37, 64 * 512) };
+        let host_copy = host_copy(title).unwrap();
+        let readback_at = layout.offset(0, 17, 29, 0).unwrap() as usize;
+
+        // The same resource can publish a later writer to the new mapping.
+        for remap_before_close in [false, true, false] {
+            // SAFETY: no earlier list remains in flight. The destination is committed.
+            unsafe { memory.cast::<u8>().write_bytes(0x9b, size) };
+            let list = host.new_list().unwrap();
+            crate::list::ensure_state(&list, title, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: the upload outlives every list.
+                pResource: unsafe { std::mem::transmute_copy(&upload) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT,
+                            Width: 64,
+                            Height: 64,
+                            Depth: 1,
+                            RowPitch: 512,
+                        },
+                    },
+                },
+            };
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: the retained host texture outlives every list.
+                pResource: unsafe { std::mem::transmute_copy(&host_copy.texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.texture_written(title);
+            // SAFETY: a live command list and resources with the requested copy states.
+            unsafe { list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None) };
+            if remap_before_close {
+                let _writer = crate::watch::title_memory_remapping_range(at..at + extent);
+                crate::watch::title_memory_remapped(at, extent);
+                // SAFETY: replace the committed pages in the same owned reservation.
+                unsafe {
+                    assert_ne!(VirtualFree(memory, extent, MEM_DECOMMIT), 0);
+                    assert_eq!(VirtualAlloc(memory, extent, MEM_COMMIT, PAGE_READWRITE), memory);
+                    memory.cast::<u8>().write_bytes(0x9b, size);
+                }
+            }
+            list.close();
+            if crate::host::late() {
+                let producer = crate::list::Detached::for_test(list);
+                host.execute_late(vec![producer], vec![0]);
+                crate::host::settle_for_fence();
+            } else {
+                host.execute(&[&list]);
+            }
+            // SAFETY: the host queue completed and the fixture still owns the destination.
+            let bytes = unsafe { std::slice::from_raw_parts(memory.cast::<u8>(), size) };
+            if remap_before_close {
+                assert!(
+                    bytes.iter().all(|&byte| byte == 0x9b),
+                    "the old list overwrote replacement pages"
+                );
+            } else {
+                assert_eq!(&bytes[readback_at..readback_at + 8], &[0x37; 8]);
+            }
+        }
+        resource_release(title);
+        drop(host_copy);
+        crate::watch::title_memory_remapped(at, extent);
+        // SAFETY: no fixture list or resource holds the reservation now.
+        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+    }
+
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();
