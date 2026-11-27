@@ -70,6 +70,17 @@ shaders and emulates the one instruction.
   the measured frame time. See the [benchmark report](../BENCHMARK.md).
 - Five formerly refused shadow compute shaders now create pipelines on the
   test card. Their visual output still needs verification in the affected scenes.
+- Linux/Proton only (Windows unaffected): three shadow compute shaders never
+  get host pipelines under GE-Proton11-14 (vkd3d-proton v3.1-83-gcae8353,
+  RADV): `CS_RTDistantShadowTraceLeakPlug32_Tiled` (e8c962358d862e3f),
+  `CS_RTDistantShadowTrace32_Tiled` (a1b20bc47e3c9597) and
+  `CS_TraceShadowRays_Checkerboard` (559d9f0184e15fe3). They stay "being made"
+  in every frame and their dispatches are dropped. The dxil-spirv that build
+  bundles (34f0ff8) crashes with a segmentation fault on each of their DXIL
+  (`dxil-spirv <file>.dxil --bindless --ssbo-uav --ssbo-srv`, run on the files
+  `VKD3D_SHADER_DUMP_PATH` writes); dxil-spirv b540c8a converts all three.
+  The same vkd3d-proton commit built with dxil-spirv b540c8a makes all three
+  pipelines in game, and no dispatch is dropped as "being made" any more.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
