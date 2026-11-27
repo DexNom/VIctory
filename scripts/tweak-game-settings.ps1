@@ -16,6 +16,10 @@
       maxfps             mais agressivo: LOD de textura em 2.0, resolução de
                          saída em 640x480, culling maior. Some detalhe, não
                          textura.
+      fps                textura menos nítida e mais nada: mip bias em -2.5,
+                         texLodScale em 2.0, upgrades por frame em 2. Mesma
+                         resolução e mesma geometria do balanced. Nenhuma
+                         textura some, todas ficam mais macias.
       potato             o piso: LOD de geometria em 0.4, culling em 3.0,
                          veículos no último LOD, modelos de dano desligados.
                          Geometria some, textura não.
@@ -24,7 +28,7 @@
       restore            devolve o backup mais recente.
 
 .PARAMETER Profile
-    balanced | maxfps | potato | sharp | restore
+    balanced | fps | maxfps | potato | sharp | restore
 
 .PARAMETER Set
     Sobrescreve um ajuste: -Set advancedGraphics.lodScale=1.0
@@ -42,7 +46,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('balanced', 'maxfps', 'potato', 'sharp', 'restore')]
+    [ValidateSet('balanced', 'fps', 'maxfps', 'potato', 'sharp', 'restore')]
     [string]$Profile = 'balanced',
     [string[]]$Set = @(),
     [switch]$DryRun,
@@ -111,6 +115,23 @@ $profiles = @{
         'advancedGraphics.grassLod'                     = '0.400000'
         'advancedGraphics.lodScale'                     = '0.800000'
         'advancedGraphics.smallCullThreshold'           = '1.500000'
+    })
+    fps = New-Profile $pixelCuts $textureSoften ([ordered]@{
+        'video.uiResolution.width'                      = '1280'
+        'video.uiResolution.height'                     = '720'
+        'video.resolutionFullscreen.width'              = '1280'
+        'video.resolutionFullscreen.height'             = '720'
+        'graphics.anisotropicFiltering'                 = '0'
+        'advancedGraphics.decorationResolutionShift'    = '1'
+        'advancedGraphics.grassLod'                     = '0.400000'
+        'advancedGraphics.lodScale'                     = '0.800000'
+        'advancedGraphics.smallCullThreshold'           = '1.500000'
+        'advancedGraphics.manualMipBias'                = '-2.500000'
+        'advancedGraphics.texLodScale_Global'           = '2.000000'
+        'advancedGraphics.texLodScale_Buildings'        = '2.000000'
+        'advancedGraphics.texLodScale_Objects'          = '2.000000'
+        'advancedGraphics.texLodScale_HD'               = '2.000000'
+        'advancedGraphics.maxTexUpgradesPerFrame'       = '2'
     })
     maxfps = New-Profile $pixelCuts $textureSoften ([ordered]@{
         'video.uiResolution.width'                      = '640'

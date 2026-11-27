@@ -513,6 +513,7 @@ perfil, cenas diferentes (é o mundo aberto, a câmera muda):
 | soak10 | 7,88 (mediana 8,00) | 136,9 | ~4.000 | — | `potato` (640x480, LOD 0,4, culling 3,0) |
 | soak11 | 8,35 (mediana 8,00) | 124,9 | ~4.700 | — | `balanced` com **300 s** de assentamento (controle) |
 | soak12 | 7,84 (mediana 8,00) | 158,8 | ~4.900 | — | `balanced` + `VICTORY_UPLOAD_AHEAD=1` |
+| soak13 | 8,41 (mediana 9,00) | 121,5 | ~4.000 | ~30,4 | perfil `fps` (textura a um quarto) |
 
 O soak2 e o soak3 rodaram a mesma cena (4.096 e 4.118 draws): **o corte do
 `settings.xml` valeu 15,2 ms por quadro, 11%**, e o custo por draw caiu de
@@ -620,13 +621,23 @@ de textura, lidos/detilados/copiados por threads nossas): 7,84 fps, mediana
 amostra de 4.078 draws. A fila extra disputa banda e cores com o resto, e o
 trabalho que ela tira da frente volta como espera no `copying back`. **Recusado.**
 
+**Textura a um quarto (perfil `fps`)**: `manualMipBias` -1,5 → -2,5,
+`texLodScale_*` 1,0 → 2,0, `maxTexUpgradesPerFrame` 5 → 2, com a geometria e a
+resolução do `balanced` intactas. Deu 8,41 fps de média e **mediana 9,00** —
+a melhor mediana junto com o soak6 — mas 121,5 ms/frame e ~30,4 µs/draw contra
+os 115,5 ms e 28,0 µs/draw do soak3. **Empata dentro do ruído, não ganha.** O
+motivo é o mesmo de sempre: o custo é por draw, e mip não muda draw. O perfil
+fica no script como opção de gosto, não como alavanca; o padrão continua
+`balanced`.
+
 ### O chão é 115 ms, e ele não se move
 
 Cinco perfis e sete knobs depois, todo caminho que não morre para em
-**~115 ms por quadro (8,7 fps)**: `balanced` 115,5; `potato` 115,8; `maxfps`
-126,9; `balanced` com 300 s de assentamento 124,9 (cena mais pesada);
-`SUBMIT_FRAMES=0` 142,9; `UPLOAD_AHEAD=1` 158,8; `RAW_VIEWS=0` 186,4. O que
-muda entre eles é o quão longe do chão o run fica, não o chão.
+**~115 ms por quadro (8,7 fps)**: `balanced` 115,5; `potato` 115,8; `fps`
+(textura a um quarto) 121,5; `balanced` com 300 s de assentamento 124,9 (cena
+mais pesada); `maxfps` 126,9; `SUBMIT_FRAMES=0` 142,9; `UPLOAD_AHEAD=1` 158,8;
+`RAW_VIEWS=0` 186,4. O que muda entre eles é o quão longe do chão o run fica,
+não o chão.
 
 O quadro é `preparing` ~70 ms + GPU ~30 ms + `copying back` ~20 ms, **em
 série**. Sobrepô-los vale 30 ms (11,8 fps), e é a única coisa grande que
