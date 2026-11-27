@@ -226,10 +226,15 @@ impl Memory {
     }
 
     fn table(dwords: u64, what: &str) -> Option<(ID3D12Resource, *mut u32, u64)> {
+        let table = Self::allocate_table(dwords, what)?;
+        // SAFETY: a fresh mapped buffer of the requested length.
+        unsafe { std::ptr::write_bytes(table.1, 0, dwords as usize) };
+        Some(table)
+    }
+
+    fn allocate_table(dwords: u64, what: &str) -> Option<(ID3D12Resource, *mut u32, u64)> {
         let (buffer, data) = host()?.shared_buffer(dwords * 4)?;
         crate::host::name(&buffer, || format!("title memory by address: {what}"));
-        // SAFETY: a fresh mapped buffer of the requested length.
-        unsafe { std::ptr::write_bytes(data, 0, (dwords * 4) as usize) };
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         Some((buffer, data.cast(), gpu))
     }
@@ -310,7 +315,7 @@ impl Memory {
                 continue;
             }
             if !replaced {
-                let next = Self::table(u64::from(MEMORY_PAGES) * 2, "directory")?;
+                let next = Self::allocate_table(u64::from(MEMORY_PAGES) * 2, "directory")?;
                 // SAFETY: equal-sized disjoint tables. The CPU records under
                 // the memory mutex and all GPU directory accesses are reads.
                 unsafe { std::ptr::copy_nonoverlapping(self.directory.1, next.1, MEMORY_PAGES as usize * 2) };
