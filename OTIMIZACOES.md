@@ -514,6 +514,9 @@ perfil, cenas diferentes (é o mundo aberto, a câmera muda):
 | soak11 | 8,35 (mediana 8,00) | 124,9 | ~4.700 | — | `balanced` com **300 s** de assentamento (controle) |
 | soak12 | 7,84 (mediana 8,00) | 158,8 | ~4.900 | — | `balanced` + `VICTORY_UPLOAD_AHEAD=1` |
 | soak13 | 8,41 (mediana 9,00) | 121,5 | ~4.000 | ~30,4 | perfil `fps` (textura a um quarto) |
+| soak14 | 7,22 (mediana 7,00) | 140,7 | ~3.900 | — | `balanced` + `VIEW_THREADS=5` **e** `RECORD_THREADS=3` |
+| soak15 | 10,76 (mediana 11,00) | **97,3** | ~3.800 | 26,2 | `balanced` + `VIEW_THREADS=5` |
+| soak16 | **11,36 (mediana 12,00)** | **90,0** | ~5.400 | **16,7** | `balanced` + `VIEW_THREADS=5` (réplica) |
 
 O soak2 e o soak3 rodaram a mesma cena (4.096 e 4.118 draws): **o corte do
 `settings.xml` valeu 15,2 ms por quadro, 11%**, e o custo por draw caiu de
@@ -589,10 +592,11 @@ pura num quadro de 115** — 37%. Não há knob que conserte espera; só sobrepo
 conserta, e as três tentativas de sobrepor (`SUBMIT_FRAMES=0`, `LATE_WAIT=3`,
 `RELAY=2`) ou morreram ou não mudaram nada.
 
-**O passe do heap de views é uma thread só** (`victory-aside`, 30,9 ms), e a
-primeira lista que precisa dele espera. É o único alvo de código que sobrou com
-tamanho: paralelizar o passe, ou começá-lo antes da primeira lista, devolve até
-12,5 ms.
+**O passe do heap de views era uma thread só** (`victory-aside`, 30,9 ms), e a
+primeira lista que precisa dele espera. Era o único alvo de código com tamanho:
+paralelizar o passe devolvia até 12,5 ms. **Feito:** `VIEW_THREADS` 3 → 5 no
+`profile-16gb.ps1` (soak15/soak16, 97,3 e 90,0 ms). O passe roda em pool desde
+antes; o que faltava era tamanho de pool.
 
 **`VICTORY_SUBMIT_FRAMES=0`** (dois presentes na fila em vez de um: o quadro
 seguinte pode ser preparado enquanto a GPU roda o atual) mediu 7,48 fps de
@@ -630,26 +634,49 @@ motivo é o mesmo de sempre: o custo é por draw, e mip não muda draw. O perfil
 fica no script como opção de gosto, não como alavanca; o padrão continua
 `balanced`.
 
-### O chão é 115 ms, e ele não se move
+### O chão é 90 ms desde 27/11 — e ele caiu por thread, não por knob
 
-Cinco perfis e sete knobs depois, todo caminho que não morre para em
-**~115 ms por quadro (8,7 fps)**: `balanced` 115,5; `potato` 115,8; `fps`
-(textura a um quarto) 121,5; `balanced` com 300 s de assentamento 124,9 (cena
-mais pesada); `maxfps` 126,9; `SUBMIT_FRAMES=0` 142,9; `UPLOAD_AHEAD=1` 158,8;
-`RAW_VIEWS=0` 186,4. O que muda entre eles é o quão longe do chão o run fica,
-não o chão.
+Até o soak13, cinco perfis e sete knobs paravam em **~115 ms por quadro
+(8,7 fps)**: `balanced` 115,5; `potato` 115,8; `fps` (textura a um quarto)
+121,5; `balanced` com 300 s de assentamento 124,9 (cena mais pesada); `maxfps`
+126,9; `SUBMIT_FRAMES=0` 142,9; `UPLOAD_AHEAD=1` 158,8; `RAW_VIEWS=0` 186,4.
 
-O quadro é `preparing` ~70 ms + GPU ~30 ms + `copying back` ~20 ms, **em
-série**. Sobrepô-los vale 30 ms (11,8 fps), e é a única coisa grande que
-sobrou. As três tentativas morreram: `SUBMIT_FRAMES=0` piorou, `LATE_WAIT=3`
-derruba o processo antes do mundo, `RELAY=2` fica em 9,0. Não é knob: é o
-desenho do runtime, e mexer nele é reescrever o caminho de submissão.
+O **soak15** e o **soak16** mudaram o chão com uma linha: `VICTORY_VIEW_THREADS`
+de 3 para 5. **97,3 ms** e **90,0 ms** (mediana 12,00 fps), com o mesmo perfil,
+o mesmo jogo, `887A: 0` e o processo vivo no fim. O soak16 rodou uma cena
+**mais pesada** (5.400 draws contra 4.100 do soak3) e ainda assim ficou 22% mais
+rápido — **16,7 µs/draw**, contra 28,0 do melhor run anterior.
 
-**20 fps (50 ms) não é alcançável nesta máquina.** A conta: 4.000 draws a
-28 µs dão 112 ms só de tradução; 50 ms exigiria 1.780 draws (o título não
-desenha isso) ou 12,5 µs/draw — melhor que um 9800X3D faz neste runtime.
-Para referência, a máquina dos docs (i7-14700KF + RTX 4070 12 GB + 32 GB)
-roda este mesmo título a **2–5 fps**. Aqui está em 8,7–9,1.
+O que caiu, do log do soak15:
+
+| pedaço | antes | depois |
+|---|---|---|
+| `preparing` | ~70 ms | 41–48 ms |
+| refreshes de textura (todas as threads) | 23,7 ms | 9,6 ms |
+| `copying back` | 23–37 ms | 13–15 ms |
+| espera da thread que submete pela placa | 26,4 ms | 45–52 ms (maior em proporção, mesmo absoluto) |
+
+O passe do heap de views era o único item de 30,9 ms numa thread só e 12,5 ms de
+espera no fecho das listas. Com 5 threads ele engole o passe, a espera do fecho
+some, e o resto do `preparing` encolhe junto.
+
+**A lição do soak14, que vale mais que o número:** ele subiu as views para 5
+**e** baixou os records para 3 ao mesmo tempo, e deu 140,7 ms — pior que tudo.
+As duas variáveis brigaram pelos mesmos núcleos. Isolar uma por vez não é
+capricho de método: é o que separa um ganho de 22% de um retrocesso de 22% com o
+mesmo código.
+
+**O que sobrou:** a thread que submete ainda passa 45–52 ms por quadro parada
+esperando a placa sem ter o que aterrissar, e a GPU fica em ~40 ms. Sobrepor os
+dois vale outros ~30 ms (para ~60 ms, 16 fps), e continua sendo o desenho do
+caminho de submissão, não um knob. As três tentativas (`SUBMIT_FRAMES=0`,
+`LATE_WAIT=3`, `RELAY=2`) morreram.
+
+**20 fps (50 ms) continua fora de alcance.** A 16,7 µs/draw seriam precisos
+3.000 draws; o título desenha 4.000–5.700. Chegar lá exigiria ~8,8 µs/draw, que
+nem um 9800X3D faz neste runtime. Para referência, a máquina dos docs
+(i7-14700KF + RTX 4070 12 GB + 32 GB) roda este mesmo título a **2–5 fps**.
+Aqui está em **10,8–11,4**.
 
 ## Limites conhecidos
 

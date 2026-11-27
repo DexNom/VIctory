@@ -479,7 +479,11 @@ static class GTA6
         start.EnvironmentVariables["VICTORY_PIPELINE_WORKERS"] = "4";
         start.EnvironmentVariables["VICTORY_LAND_THREADS"] = "2";
         start.EnvironmentVariables["VICTORY_UNDER_THREADS"] = "3";
-        start.EnvironmentVariables["VICTORY_VIEW_THREADS"] = "3";
+        // 5, nao 3: o passe do heap de views era 30,9 ms numa thread e 12,5 ms
+        // de espera no fecho das listas. soak15 = 97,3 ms e soak16 = 90,0 ms,
+        // contra os 115,5 ms do soak3. Os records ficam em 4: o soak14 baixou
+        // para 3 junto com as views e as duas brigaram (140,7 ms).
+        start.EnvironmentVariables["VICTORY_VIEW_THREADS"] = "5";
     }
 
     // Entrada, painel e o quanto o runtime fala.

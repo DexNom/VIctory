@@ -133,6 +133,10 @@ não por texel: `potato` com textura a um dezesseis avos roda no mesmo 115,8 ms
 da textura cheia. O `fps` existe para quem prefere a imagem mais macia; não é
 alavanca de desempenho.
 
+**O que ganhou fps de verdade foi thread, não textura:** `VICTORY_VIEW_THREADS`
+de 3 para 5 levou o quadro de 115,5 ms para **90,0 ms** (soak15/soak16), sem
+mexer em imagem nenhuma. É o padrão do perfil desde 27/11.
+
 O que `balanced` corta: sombra por ray tracing, reflexo da água por SSR,
 motion blur, sombra de partícula, duas amostras de SSRO para uma, UI de 4K para
 720p, VSync, o limite de 30 quadros e o LOD de geometria de 1.0 para 0.8.

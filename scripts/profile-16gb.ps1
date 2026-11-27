@@ -49,7 +49,11 @@ $settings = @{
     VICTORY_PIPELINE_WORKERS = '4'      # was 10
     VICTORY_LAND_THREADS = '2'          # was 3 (cores / 4)
     VICTORY_UNDER_THREADS = '3'         # was 6
-    VICTORY_VIEW_THREADS = '3'          # was 4 views + 6 records
+    # 5, not 3: the view heap pass was 30.9 ms on one thread and the closing
+    # wait of the lists 12.5 ms. soak15 (97.3 ms) and soak16 (90.0 ms) against
+    # the 115.5 ms of soak3: -22% on the frame. Records stay at 4 - soak14 put
+    # them at 3 beside the views at 5 and the two fought (140.7 ms).
+    VICTORY_VIEW_THREADS = '5'          # was 3 (was 4 views + 6 records)
     # ---- card: 8 GB, DXGI budget ~7.1 GB ------------------------------------
     # Nivel de textura: desligado. A reducao por mip bias removia o device na
     # tela de carregamento (0x887A0001, chamada invalida no caminho de copia),
