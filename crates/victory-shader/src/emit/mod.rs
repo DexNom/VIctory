@@ -123,6 +123,24 @@ pub use shader::{
     USER_VIEW_RECORDS, USER_DISPATCH_THREADS_X, set_view_heap_limit, view_heap_limit,
 };
 
+static ATOMIC_SUB_LOOPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether atomic subtractions are written as compare-exchange loops (off
+/// until [`set_atomic_sub_loops`]): `atomicrmw sub`, and `atomicrmw add` of
+/// a value written as a negation (the console's `ds_sub_u32`, and
+/// `ds_add_u32` of a value the program negated). NVIDIA's compiler refuses
+/// the pipeline of a program with either on group-shared memory as out of
+/// memory. The setting is part of the translation, so the shader cache must
+/// key on it (`victory-gpu`'s does).
+pub fn atomic_sub_loops() -> bool {
+    ATOMIC_SUB_LOOPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets [`atomic_sub_loops`] for the translations made from now on.
+pub fn set_atomic_sub_loops(on: bool) {
+    ATOMIC_SUB_LOOPS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
