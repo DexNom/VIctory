@@ -306,6 +306,31 @@ pub fn run(
     Ok(())
 }
 
+const PROGRESS_EVERY_S: u64 = 10;
+
+/// Ends the progress thread when the scan returns, early or not.
+struct Stop<'a>(&'a std::sync::atomic::AtomicBool, std::thread::Thread);
+
+impl Drop for Stop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+        self.1.unpark();
+    }
+}
+
+/// `   773 s  22000 / 25745 shaders (85%), 12/s`. Without an expected total
+/// (a first warm-up) only the count shows; past it, the total is unknown again.
+fn progress_line(seconds: f64, n: usize, recent: usize, expected: Option<usize>) -> String {
+    let rate = recent as f64 / PROGRESS_EVERY_S as f64;
+    let rate = if recent > 0 { format!(", {rate:.0}/s") } else { String::new() };
+    match expected {
+        Some(total) if total > 0 && n <= total => {
+            format!("{seconds:6.0} s  {n} / {total} shaders ({}%){rate}", n * 100 / total)
+        }
+        _ => format!("{seconds:6.0} s  {n} shaders{rate}"),
+    }
+}
+
 /// `victory warm`: fills the caches a run reads (`Command::Warm`).
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, rays: crate::RayOptions) -> Result<()> {
     let paths = crate::default_paths(paths)?;
@@ -316,60 +341,82 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, rays: cra
     let seen = Mutex::new(HashSet::new());
     let [done, refused, made, unmade, omitted] = [const { AtomicUsize::new(0) }; 5];
     let started = std::time::Instant::now();
-    for root in &paths {
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let Some(bytes) = job.bytes() else { continue };
-                            let Ok(container) = Container::parse(&bytes) else { continue };
-                            // As the title passes it: no more than the container.
-                            let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { continue };
-                            let total = u32::from_le_bytes(total) as usize;
-                            let bytes = &bytes[..total.min(bytes.len())];
-                            let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { continue };
-                            if !lock(&seen).insert(blake3::hash(bytes)) {
-                                continue;
-                            }
-                            let Ok(programs) = native_programs(dxil) else { continue };
-                            let stage = programs.iter().find_map(|p| match p.stage {
-                                HwStage::Vs => Some("vertex"),
-                                HwStage::Ps => Some("pixel"),
-                                HwStage::Ms => Some("mesh"),
-                                HwStage::Cs => Some("compute"),
-                                _ => None,
-                            });
-                            let Some(stage) = stage else { continue };
-                            let compute = pipelines && stage == "compute";
-                            let Some((translated, pipeline)) = victory_hle::modules::d3d12x::warm_selected(stage, bytes, compute) else {
-                                omitted.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            };
-                            let count = if translated { &done } else { &refused };
-                            let n = count.fetch_add(1, Ordering::Relaxed) + 1;
-                            match pipeline {
-                                Some(true) => made.fetch_add(1, Ordering::Relaxed),
-                                Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
-                                None => 0,
-                            };
-                            if n.is_multiple_of(2000) {
-                                println!("{:6.0} s  {n} shaders", started.elapsed().as_secs_f64());
-                            }
-                        }
-                    });
+    // The scan reads files as it goes, so the total is unknown until it ends.
+    // The last warm-up's total stands in for it.
+    let total_file = cfg.cache_subdir("shaders")?.join("warm-total.txt");
+    let expected = std::fs::read_to_string(&total_file).ok().and_then(|s| s.trim().parse::<usize>().ok());
+    let finished = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let reporter = s.spawn(|| {
+            let mut shown = 0;
+            while !finished.load(Ordering::Relaxed) {
+                std::thread::park_timeout(std::time::Duration::from_secs(PROGRESS_EVERY_S));
+                if finished.load(Ordering::Relaxed) {
+                    break;
                 }
-            });
+                let n = done.load(Ordering::Relaxed) + refused.load(Ordering::Relaxed);
+                println!("{}", progress_line(started.elapsed().as_secs_f64(), n, n - shown, expected));
+                shown = n;
+            }
+        });
+        let _stop = Stop(&finished, reporter.thread().clone());
+        for root in &paths {
+            for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+                if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                    continue;
+                }
+                let Ok(data) = std::fs::read(entry.path()) else {
+                    continue;
+                };
+                let jobs = sources(&data);
+                let next = AtomicUsize::new(0);
+                std::thread::scope(|s| {
+                    for _ in 0..threads.min(jobs.len()) {
+                        s.spawn(|| {
+                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                let Some(bytes) = job.bytes() else { continue };
+                                let Ok(container) = Container::parse(&bytes) else { continue };
+                                // As the title passes it: no more than the container.
+                                let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { continue };
+                                let total = u32::from_le_bytes(total) as usize;
+                                let bytes = &bytes[..total.min(bytes.len())];
+                                let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { continue };
+                                if !lock(&seen).insert(blake3::hash(bytes)) {
+                                    continue;
+                                }
+                                let Ok(programs) = native_programs(dxil) else { continue };
+                                let stage = programs.iter().find_map(|p| match p.stage {
+                                    HwStage::Vs => Some("vertex"),
+                                    HwStage::Ps => Some("pixel"),
+                                    HwStage::Ms => Some("mesh"),
+                                    HwStage::Cs => Some("compute"),
+                                    _ => None,
+                                });
+                                let Some(stage) = stage else { continue };
+                                let compute = pipelines && stage == "compute";
+                                let Some((translated, pipeline)) = victory_hle::modules::d3d12x::warm_selected(stage, bytes, compute) else {
+                                    omitted.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                };
+                                let count = if translated { &done } else { &refused };
+                                count.fetch_add(1, Ordering::Relaxed);
+                                match pipeline {
+                                    Some(true) => made.fetch_add(1, Ordering::Relaxed),
+                                    Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
+                                    None => 0,
+                                };
+                            }
+                        });
+                    }
+                });
+            }
         }
+    });
+    let seen_total = done.load(Ordering::Relaxed) + refused.load(Ordering::Relaxed);
+    if seen_total > 0 {
+        let _ = std::fs::write(&total_file, seen_total.to_string());
     }
+    println!("{}", progress_line(started.elapsed().as_secs_f64(), seen_total, 0, Some(seen_total)));
     victory_hle::modules::d3d12x::save_pipeline_cache();
     println!(
         "warm         {} translated, {} refused; {} compute pipelines, {} refused; {} omitted by ray-tracing mode; {:.0} s",
@@ -859,4 +906,16 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::progress_line;
+
+    #[test]
+    fn shows_the_count_out_of_the_last_total_and_the_rate() {
+        assert_eq!(progress_line(773.2, 22000, 120, Some(25745)), "   773 s  22000 / 25745 shaders (85%), 12/s");
+        assert_eq!(progress_line(5.0, 300, 0, None), "     5 s  300 shaders");
+        assert_eq!(progress_line(9.0, 30000, 50, Some(25745)), "     9 s  30000 shaders, 5/s");
+    }
 }
