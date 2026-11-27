@@ -18,6 +18,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 mod tiled_write_probe;
 #[cfg(feature = "diagnostics")]
 mod card_steps_probe;
+#[cfg(any(feature = "diagnostics", test))]
+mod gpu_timing;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -67,6 +69,8 @@ pub(crate) struct Host {
     adapter: Option<IDXGIAdapter3>,
     /// Serialize the budget check and allocation for CPU-written GPU inputs.
     local_gpu_inputs: Option<Mutex<()>>,
+    #[cfg(feature = "diagnostics")]
+    gpu_timing: OnceLock<Option<Mutex<gpu_timing::QueueTimer>>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -346,10 +350,11 @@ pub(crate) fn log_removal_context() {
     tracing::error!("when the host device went: {}", removal_context());
 }
 
-/// Time spent in submissions since the last frame-rate line, in
-/// microseconds: preparing them on the CPU (title memory copies, texture
-/// detiling), then waiting for the GPU.
-static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
+/// CPU thread time since the last frame-rate line, in microseconds:
+/// preparation (memory copies, detiling), then blocked completion waits.
+/// With the relay, completion also waits for CPU publication of GPU writes.
+/// These are CPU durations and may overlap work on the GPU or other threads.
+static CPU_SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// After submissions: shader-written ranges compared and copied back into
@@ -448,7 +453,7 @@ fn card_clock_watch(clock: &'static CardClock) {
 fn card_clock_line(frames: f64, ms: f64) {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
-        "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
+        "the queue's clock per frame: nothing of ours queued {idle:.1} ms (outstanding work about {:.0}% by this fence estimate), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
          had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
         if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
@@ -716,6 +721,8 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
             local_gpu_inputs,
+            #[cfg(feature = "diagnostics")]
+            gpu_timing: OnceLock::new(),
         })
     }
 }
@@ -1539,6 +1546,20 @@ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+}
+
+/// Optional queue timestamps. Unlike per-command timing, this does not
+/// disable late submission or add a wait after each list.
+#[cfg(feature = "diagnostics")]
+fn queue_timing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_QUEUE_TIMING").is_some_and(|v| v == "1"))
+}
+
+fn measure_cpu_wait<T>(wait: impl FnOnce() -> T) -> (T, Duration) {
+    let started = Instant::now();
+    let result = wait();
+    (result, started.elapsed())
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -3294,8 +3315,8 @@ fn late_threads() {
 
 /// With [`relay`]: waits until `done` says so of the line, looked at each
 /// time flights have landed. Counted as a settle for `why`, and its time
-/// as waiting for the card. The caller may hold the submission lock: the
-/// thread that lands flights never takes it.
+/// as a CPU completion wait, including publication by the relay. The caller
+/// may hold the submission lock: the landing thread never takes it.
 fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let mut line = line();
     if done(&line) {
@@ -3314,7 +3335,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
-    SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    CPU_SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -4394,7 +4415,7 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.execute_lists(&[Some(list.cast()?)], false);
+                    self.execute_lists(&[Some(list.cast()?)], None);
                     Ok(())
                 })()
             };
@@ -4778,7 +4799,7 @@ impl Host {
                     probe.record_us = waiting.elapsed().as_micros() as u64;
                     Instant::now()
                 });
-                self.execute_lists(&lists, false);
+                self.execute_lists(&lists, None);
                 let after = *order;
                 let through = QUEUED_CARD_FLIGHT.load(Ordering::Relaxed);
                 // Queue the completion before releasing the next upload
@@ -5020,7 +5041,7 @@ impl Host {
                     list.Reset(allocator, None)?;
                     copy_fetch_runs(list, fetched, pieces.iter().map(|&(i, lo, hi, at)| (&plan.ranges[i].shadow.buffer, lo, hi, at)));
                     list.Close()?;
-                    self.execute_lists(&[Some(list.cast()?)], false);
+                    self.execute_lists(&[Some(list.cast()?)], None);
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.card_sent();
@@ -5282,7 +5303,9 @@ impl Host {
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
                             working(false);
-                            WaitForSingleObject(self.event, INFINITE);
+                            let (_, waited) =
+                                measure_cpu_wait(|| WaitForSingleObject(self.event, INFINITE));
+                            CPU_SUBMISSION_US[1].fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
                             stood(waiting);
                             working(true);
                         }
@@ -5292,7 +5315,6 @@ impl Host {
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-                SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
                     format!("{flights} submissions sent ahead, settled together")
@@ -5563,7 +5585,7 @@ impl Host {
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let ordered = (flown && capture_readbacks()).then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
-                self.execute_lists(&lists, true);
+                self.execute_lists(&lists, Some(*submitted));
                 if ordered.is_some() && let Some(card) = &card {
                     QUEUED_CARD_FLIGHT.store(card.sent_as, Ordering::Relaxed);
                 }
@@ -5591,7 +5613,7 @@ impl Host {
             }
             crate::texback::add_destination_aliases(&mut texture_writes);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
-            SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
+            CPU_SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
@@ -5627,7 +5649,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.execute_lists(group, true);
+                self.execute_lists(group, Some(*submitted));
                 self.card_sent();
                 let waited = self
                     .queue
@@ -5636,7 +5658,9 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         working(false);
-                        WaitForSingleObject(self.event, INFINITE);
+                        let (_, waited) =
+                            measure_cpu_wait(|| WaitForSingleObject(self.event, INFINITE));
+                        CPU_SUBMISSION_US[1].fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
                         stood(started);
                         working(true);
                     }
@@ -5680,8 +5704,7 @@ impl Host {
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        CPU_SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::card_waited(gpu.as_micros() as u64, || {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -7488,6 +7511,36 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 }
 
 impl Host {
+    #[cfg(feature = "diagnostics")]
+    fn queue_timer(&self) -> Option<&Mutex<gpu_timing::QueueTimer>> {
+        if !queue_timing() {
+            return None;
+        }
+        self.gpu_timing
+            .get_or_init(|| {
+                gpu_timing::QueueTimer::new(&self.device, &self.queue, &self.fence, 32)
+                    .map(Mutex::new)
+            })
+            .as_ref()
+    }
+
+    fn gpu_timing_summary(&self) -> String {
+        #[cfg(feature = "diagnostics")]
+        if queue_timing() {
+            return self.queue_timer().map_or_else(
+                || "GPU queue timing unavailable".to_owned(),
+                |timer| {
+                    timer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take_window()
+                        .summary()
+                },
+            );
+        }
+        "GPU queue timing off".to_owned()
+    }
+
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
@@ -7751,8 +7804,6 @@ struct Meter {
     cpu_us: u64,
     /// Percent of the machine's CPU over the last report.
     cpu_pct: f64,
-    /// Percent of the frame time the GPU was busy.
-    gpu_pct: f64,
     /// Working set in MB.
     ram_mb: f64,
 }
@@ -7769,7 +7820,6 @@ impl Meter {
             logged: now,
             cpu_us: process_cpu_us().unwrap_or(0),
             cpu_pct: 0.0,
-            gpu_pct: 0.0,
             ram_mb: 0.0,
         }
     }
@@ -7795,12 +7845,12 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
-        // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+        // CPU thread time preparing submissions and waiting for completion
+        // (including publication by the relay), averaged over presents.
+        let [cpu, cpu_wait] = [0, 1].map(|i| {
+            CPU_SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
-        // Process CPU share of the whole machine, GPU busy share of the frame,
-        // and the process's working set.
+        // Process CPU share of the whole machine and its working set.
         self.cpu_pct = {
             let now = process_cpu_us().unwrap_or(self.cpu_us);
             let pct = (now.saturating_sub(self.cpu_us)) as f64
@@ -7811,7 +7861,18 @@ impl Meter {
             self.cpu_us = now;
             pct
         };
-        self.gpu_pct = if ms > 0.0 { gpu / ms * 100.0 } else { 0.0 };
+        let gpu_queue = host().map_or_else(
+            || "GPU queue timing unavailable".to_owned(),
+            Host::gpu_timing_summary,
+        );
+        #[cfg(feature = "diagnostics")]
+        if queue_timing() {
+            tracing::info!(
+                cpu_completion_wait_ms_per_frame = cpu_wait,
+                gpu_queue = %gpu_queue,
+                "CPU completion waiting and GPU timestamp intervals"
+            );
+        }
         self.ram_mb = process_working_set().unwrap_or(0) as f64 / (1024.0 * 1024.0);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
@@ -7979,13 +8040,13 @@ impl Meter {
             }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
+                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {cpu_wait:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
-                 cpu {cpu_pct:.1}% gpu {gpu_pct:.0}% busy ram {ram_mb:.0} MB",
+                 cpu {cpu_pct:.1}% CPU completion wait {cpu_wait:.1} ms/frame ram {ram_mb:.0} MB",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
@@ -8006,7 +8067,6 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 cpu_pct = self.cpu_pct,
-                gpu_pct = self.gpu_pct,
                 ram_mb = self.ram_mb
             );
             #[cfg(feature = "diagnostics")]
@@ -8020,12 +8080,12 @@ impl Meter {
                 }
             }
         }
-        let (cpu_pct, gpu_pct, ram_mb) = (self.cpu_pct, self.gpu_pct, self.ram_mb);
+        let (cpu_pct, ram_mb) = (self.cpu_pct, self.ram_mb);
         crate::debug_hud::update(hwnd, || {
-            format!("DexNom RayTime diagnostics\n{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\nGPU wait {gpu:.1} ms   CPU prep {cpu:.1} ms   Copy-back {back_ms:.1} ms\nDropped {dropped:.0}/frame   RAM {ram_mb:.0} MB")
+            format!("DexNom RayTime diagnostics\n{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\nCPU completion wait {cpu_wait:.1} ms   CPU prep {cpu:.1} ms   Copy-back {back_ms:.1} ms\n{gpu_queue}\nDropped {dropped:.0}/frame   RAM {ram_mb:.0} MB")
         });
         let text = format!(
-            "DexNom RayTime | {fps:.0} fps {ms:.1} ms/frame | gpu {gpu_pct:.0}% busy \
+            "DexNom RayTime | {fps:.0} fps {ms:.1} ms/frame | CPU completion wait {cpu_wait:.1} ms/frame | \
              cpu {cpu_pct:.0}% ram {ram_mb:.0} MB | {draws:.0} draws/frame"
         );
         // Setting the text waits for the window's thread (a title thread,
@@ -8286,28 +8346,37 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
-    /// The card's memory as the system accounts it to this process, in
-    /// bytes: the budget and the use of the card's own memory, then of the
-    /// PC's memory shared with the card (where the system moves what does
-    /// not fit on the card).
-    fn execute_lists(&self, lists: &[Option<ID3D12CommandList>], title: bool) {
+    /// `completion` is the caller's next signal on our fence. Timed title
+    /// batches keep their original order; auxiliary copies pass `None`.
+    fn execute_lists(&self, lists: &[Option<ID3D12CommandList>], completion: Option<u64>) {
+        #[cfg(feature = "diagnostics")]
+        let timed = completion.and_then(|fence| {
+            self.queue_timer()?
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .bracket(lists, fence)
+        });
+        #[cfg(feature = "diagnostics")]
+        let lists = timed.as_deref().unwrap_or(lists);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = completion;
         #[cfg(feature = "diagnostics")]
         let started = Instant::now();
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = title;
         // SAFETY: callers provide closed lists and retain them through the
         // corresponding queue fence.
         unsafe { self.queue.ExecuteCommandLists(lists) };
         #[cfg(feature = "diagnostics")]
         {
             let elapsed = started.elapsed().as_micros() as u64;
-            let [count, total, longest] = &DRIVER_SUBMISSIONS[usize::from(!title)];
+            let [count, total, longest] = &DRIVER_SUBMISSIONS[usize::from(completion.is_none())];
             count.fetch_add(1, Ordering::Relaxed);
             total.fetch_add(elapsed, Ordering::Relaxed);
             longest.fetch_max(elapsed, Ordering::Relaxed);
         }
     }
 
+    /// Process memory in bytes: local budget and usage, then shared budget
+    /// and usage. These are residency figures, not transfer byte counts.
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
         let adapter = self.adapter.as_ref()?;
         let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();

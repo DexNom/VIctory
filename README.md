@@ -6,6 +6,8 @@ AMD Radeon is the primary target and the best-tested GPU path for this build. Se
 
 The Radeon FSR Quality 4K build is our most stable tested baseline for shaders and texture streaming. See [Things to Be Done](#things-to-be-done) for open work and how to measure a contribution.
 
+For performance diagnosis, [CPU waits and GPU queue timestamps](docs/timing.md) explains the measurement boundaries and a synthetic regression that needs no game files.
+
 ## Tested PC
 
 | Component | Test system |
