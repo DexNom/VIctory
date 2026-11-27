@@ -1854,6 +1854,13 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.gpu_writes_by(list, address, len, Declarer::Other);
+    }
+
+    /// [`gpu_writes`](Self::gpu_writes), counted under `by` for the settle
+    /// line ([`DECLARED`]): the write ranges each kind of binding declares,
+    /// their bytes, and those covering 64 MiB or more.
+    pub(crate) fn gpu_writes_by(self: &Arc<Self>, list: &HostList, address: u64, len: u64, by: Declarer) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -1863,6 +1870,12 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        let counts = &DECLARED[by as usize];
+        counts[0].fetch_add(1, Ordering::Relaxed);
+        counts[1].fetch_add(len, Ordering::Relaxed);
+        if len >= 64 << 20 {
+            counts[2].fetch_add(1, Ordering::Relaxed);
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -2963,6 +2976,26 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
+
+/// What kind of binding declared a range of shader writes
+/// ([`Shadow::gpu_writes_by`]), for the settle line.
+#[derive(Clone, Copy)]
+pub(crate) enum Declarer {
+    /// A caller not named below.
+    Other = 0,
+    /// A root UAV: no size, so all that is left of its buffer (`draw.rs`).
+    RootUav = 1,
+    /// A descriptor table's buffer UAV: the view's range (`draw.rs`).
+    TableUav = 2,
+    /// The guest-page directory's ranges of a copy (`memory.rs`).
+    DirectoryRange = 3,
+    /// The guest-page directory's pages a copy owns (`memory.rs`).
+    DirectoryPage = 4,
+}
+
+/// By [`Declarer`]: declared write ranges, their bytes, and ranges of
+/// 64 MiB or more, since the last settle line (which takes them).
+pub(crate) static DECLARED: [[AtomicU64; 3]; 5] = [const { [const { AtomicU64::new(0) }; 3] }; 5];
 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length

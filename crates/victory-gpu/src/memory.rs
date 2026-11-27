@@ -582,7 +582,7 @@ pub(crate) fn ready(
     let mut new_broad = [0, 0];
     for i in written {
         for &(start, len) in &m.ranges[i] {
-            m.copies[i].gpu_writes(list, start, len);
+            m.copies[i].gpu_writes_by(list, start, len, crate::shadow::Declarer::DirectoryRange);
             #[cfg(feature = "diagnostics")]
             if measure_broad {
                 new_broad[0] += 1;
@@ -592,7 +592,7 @@ pub(crate) fn ready(
     }
     writes.owned(&m.pages, |owner, at, len| {
         if owner < count as usize {
-            m.copies[owner].gpu_writes(list, at, len);
+            m.copies[owner].gpu_writes_by(list, at, len, crate::shadow::Declarer::DirectoryPage);
         }
     });
     #[cfg(feature = "diagnostics")]

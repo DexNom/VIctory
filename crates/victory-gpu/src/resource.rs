@@ -4322,7 +4322,7 @@ float4 lit() : SV_Target { return 1.0; }
                 let mut from_next_list = vec![0x42u8; size];
                 let consumer = host.new_list().unwrap();
                 // Prepare this CPU copy ahead of the next GPU submission.
-                consumer.defer_fill(from_next_list.as_mut_ptr(), at as *const u8, size);
+                consumer.defer_fill_by(from_next_list.as_mut_ptr(), at as *const u8, size, crate::host::FillBy::Other);
                 consumer.close();
                 // Keep the copy-back outstanding long enough to test staging
                 // before GPU completion even on a fast software adapter.

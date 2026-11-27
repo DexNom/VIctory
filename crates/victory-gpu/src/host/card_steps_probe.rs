@@ -90,6 +90,35 @@ pub(super) fn note(start: usize, bytes: usize, table_slot: bool) {
     COUNTS[usize::from(table_slot)][usize::from(relay_landing)][owner as usize]
         .fetch_add(1, Ordering::Relaxed);
     let sample = SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample.is_power_of_two() || sample % 64 == 0 {
+        // Which declared write spans of the flights in the air the fill
+        // touched, and the host copy each belongs to: whether the span is
+        // the bytes a shader wrote or a whole buffer declared for it.
+        let spans: Vec<String> = {
+            let line = line();
+            line.line
+                .iter()
+                .filter_map(|item| if let Late::Run(flight) = item { Some(flight) } else { None })
+                .flat_map(|flight| flight.back.iter())
+                .flat_map(|(shadow, ranges)| {
+                    let (base, len) = shadow.span();
+                    ranges
+                        .iter()
+                        .filter(move |&&(lo, hi)| lo < end && start < hi)
+                        .map(move |&(lo, hi)| {
+                            format!("{lo:#x}+{:#x} in copy {base:#x}+{len:#x}", hi - lo)
+                        })
+                })
+                .collect()
+        };
+        tracing::info!(
+            sample,
+            source = format_args!("{start:#x}"),
+            bytes,
+            overlapped = spans.join("; "),
+            "blocked upload fill, the declared writes it met"
+        );
+    }
     if sample.is_power_of_two() {
         tracing::info!(
             sample,
