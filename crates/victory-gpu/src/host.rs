@@ -8570,11 +8570,19 @@ impl Batch {
         let started = std::time::Instant::now();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
-        // many: then beside the others.
-        const FEW: usize = 256;
+        // many: then beside the others. The check is three uncontended locks
+        // and a page compare; the wide threads' work on a slot that copies
+        // nothing is a refresh, a span lookup and a lock for the same answer.
+        // The world flushes 5,000 spans a frame and 4,100 of them copy
+        // nothing, so the threshold is where the serial check stops paying:
+        // `VICTORY_REFRESH_FEW` moves it.
+        static FEW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let few = *FEW.get_or_init(|| {
+            std::env::var("VICTORY_REFRESH_FEW").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256)
+        });
         let mut spans = spans;
         // (Renderer port #6: on the threads beside, whatever their number.)
-        let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
+        let many = spans.len() > few || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
         if !many {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]

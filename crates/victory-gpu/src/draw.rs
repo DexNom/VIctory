@@ -774,7 +774,14 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+///
+/// The tail is 96 frames, not 400: a pass looks at a bounded number of slots
+/// (`most`, and `VICTORY_RECHECK_MB`'s bytes), so a shorter tail costs nothing
+/// a frame and only decides which slots compete for the looks that exist. At
+/// 400 frames a texture the title repaints through another view of its pages
+/// could show what it held 23 seconds ago, at 17 fps — which is what "a
+/// texture that flickers" and "a texture that is missing" both look like.
+const RECHECK_FRAMES: [u64; 5] = [4, 12, 24, 48, 96];
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -2716,16 +2723,26 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
+        // 250 ms is the pass's own ceiling: it runs on the thread that records
+        // the frame, so a pass that reaches it is a frame that reached it. The
+        // bytes are what drain the queue (192 MB is about 192 ms of staging),
+        // so this rarely binds — but catch-up used to triple it to 750 ms, and
+        // a scene's arrival then spent three quarters of a second in one
+        // frame. That is the hitch the open world and the cutscenes both show
+        // when a shot brings a screen of new textures. Catch-up still triples
+        // the bytes; it no longer triples the frame.
+        // `VICTORY_TEXTURE_STAGE_MS` still overrides.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
         }));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
-        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
-        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        // surfaces at 192 MB a frame) gets three times the bytes until it
+        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget. The
+        // span is not tripled: that is the frame's own time.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let per_frame = if catchup && on_time >= 1024 { per_frame * 3 } else { per_frame };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -2767,6 +2784,12 @@ impl State {
                 .map(|mb| mb << 20)
         });
         let mut looked = 0u64;
+        // Slots the title repaints through another view: they pass the byte
+        // bound above, but only this many of them a pass (they are a few
+        // dozen; a bound keeps a scene that repaints hundreds from spending
+        // the frame on looks alone).
+        let mut hot_looks = 0u32;
+        const HOT_LOOKS: u32 = 192;
         let began = std::time::Instant::now();
         if sync.is_none() {
             BAKE_SERVED.store(0, Ordering::Relaxed);
@@ -2783,7 +2806,11 @@ impl State {
             // spends its bytes leaves them at the tail for the next frames,
             // and the scene shows the neutral texture. They are a few dozen.
             let hot = checked.is_some_and(|(_, _, _, looks, _)| looks > 0);
-            if !hot && checked.is_some() && recheck_at_most.is_some_and(|most| looked >= most) {
+            if hot {
+                hot_looks += 1;
+            }
+            let spare = hot && hot_looks <= HOT_LOOKS;
+            if !spare && checked.is_some() && recheck_at_most.is_some_and(|most| looked >= most) {
                 served = false;
                 break;
             }

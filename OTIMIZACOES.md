@@ -318,6 +318,43 @@ placa **nao** e o gargalo: ela roda escondida atras da preparacao (estagio 3 do
   de leitura e varria todos os heaps registrados so para alimentar o diario de
   portas, que esta desligado: agora esta atras do interruptor dele.
 
+## Estabilidade: o que estava travando o quadro
+
+O número de fps esconde o problema. A conta do quadro (run de 17,4 fps, 57,5 ms)
+mostra onde ele vai:
+
+| fase | ms/quadro |
+| --- | --- |
+| o título, de um *present* até a primeira chamada de lista | 21,4 |
+| preparo nosso no thread que grava (passos das listas) | 19,3 |
+| espera pelos *flights* (retorno da placa) | 15,7 |
+| do último *submit* até o *present* (retorno de 5,5 MB) | 14,6 |
+| espera pelos registros dos heaps no fim | 5,0 |
+
+Dentro dos 19,3 ms: **12,7 ms em refreshes**, e **4.109 de 5.068 refreshes não
+copiam nada** — o filtro que os descarta antes (`Shadow::nothing_new`, três
+locks e uma comparação de página) só rodava abaixo de 256 spans, e o mundo
+despacha 5.068. Acima disso o trabalho ia inteiro para as threads.
+
+Três mudanças, todas medidas ou justificadas pela conta acima:
+
+- **`FEW` de 256 para 8192** (`VICTORY_REFRESH_FEW` move): o filtro serial
+  descarta 81% dos spans antes de eles virarem trabalho de thread. É a mudança
+  de maior efeito esperado desta rodada.
+- **O catch-up não triplica mais o *span* do passe de textura.** Ele triplicava
+  o tempo (250 → 750 ms) junto com os bytes. Como o passe roda no thread que
+  grava o quadro, um quadro de streaming custava até três quartos de segundo:
+  era o engasgo que o mundo aberto e as cutscenes mostram quando um plano traz
+  uma tela de texturas novas. Os bytes continuam triplicando — é o orçamento que
+  drena a fila.
+- **A cauda da rechecagem caiu de 400 para 96 quadros** (`[4, 12, 24, 48, 96]`).
+  O passe olha um número limitado de slots por quadro (`most` e
+  `VICTORY_RECHECK_MB`), então encurtar a cauda não custa nada e só decide quais
+  slots competem pelas olhadas que existem. A 400 quadros, uma textura que o
+  título repinta por outra view das mesmas páginas podia mostrar o que ela
+  tinha 23 segundos antes — que é exatamente o que "textura piscando" e
+  "textura faltando" parecem.
+
 ## Limites conhecidos
 
 - **16 GB é o piso, não o recomendado.** O processo chega a 22 GB privados; o
