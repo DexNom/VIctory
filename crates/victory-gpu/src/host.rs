@@ -1797,6 +1797,21 @@ struct FetchedRange {
     through: u64,
 }
 
+fn capture_exclusions(
+    brought: &[FetchedRange],
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    sent_as: u64,
+    from: usize,
+    to: usize,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let newer = brought.iter().filter(|b| {
+        b.through >= sent_as && std::sync::Arc::ptr_eq(&b.shadow, shadow) && b.from < to && b.to > from
+    });
+    join_ranges(&mut ranges, newer.map(|b| (b.from, b.to)));
+    ranges
+}
+
 #[derive(Default)]
 struct CapturedPiece {
     pages: [Option<usize>; 16],
@@ -1827,21 +1842,22 @@ fn capture_page_offset(span: &crate::shadow::CardSpan, piece: u32, page: usize, 
     (to.checked_sub(origin)? <= CAPTURE_PAGE).then_some(offset)
 }
 
-fn capture_uncovered(from: usize, to: usize, newer: impl Iterator<Item = (usize, usize)>) -> Vec<(usize, usize)> {
-    let mut newer: Vec<_> = newer.filter(|&(lo, hi)| lo < to && hi > from).collect();
-    newer.sort_unstable();
-    let mut result = Vec::new();
+/// Emit the gaps in a sorted, disjoint union of newer writes.
+fn capture_uncovered(from: usize, to: usize, newer: &[(usize, usize)], mut emit: impl FnMut(usize, usize)) {
     let mut start = from;
-    for (lo, hi) in newer {
-        if start < lo {
-            result.push((start, lo));
+    let first = newer.partition_point(|&(_, hi)| hi <= from);
+    for &(lo, hi) in &newer[first..] {
+        if lo >= to {
+            break;
         }
-        start = start.max(hi);
+        if start < lo {
+            emit(start, lo);
+        }
+        start = hi;
     }
     if start < to {
-        result.push((start, to));
+        emit(start, to);
     }
-    result
 }
 
 /// The compare of a declared range of a copy in the card's memory with
@@ -2490,7 +2506,11 @@ mod relay_tests {
 
         let span = crate::shadow::CardSpan { from: 4080, to: 9000, first: 0, pieces: 1, skew: 3 };
         assert_eq!(capture_page_offset(&span, 0, 1, 4093, 8189), Some(13));
-        assert_eq!(capture_uncovered(10, 24, [(15, 16), (19, 30), (4, 13), (14, 18)].into_iter()), [(13, 14), (18, 19)]);
+        let mut newer = Vec::new();
+        super::join_ranges(&mut newer, [(15, 16), (19, 30), (4, 13), (14, 18)]);
+        let mut gaps = Vec::new();
+        capture_uncovered(10, 24, &newer, |lo, hi| gaps.push((lo, hi)));
+        assert_eq!(gaps, [(13, 14), (18, 19)]);
     }
 
     #[test]
@@ -4589,6 +4609,9 @@ impl Host {
                 let mut seen = std::collections::HashSet::new();
                 for r in &plan.ranges {
                     let key = Arc::as_ptr(&r.shadow) as usize;
+                    // Build the union only if a captured page needs it. All
+                    // pages in this range share the same shadow and cutoff.
+                    let mut excluded = None;
                     for p in 0..r.span.pieces {
                         let Some(piece) = fetched.get(&(key, r.span.first + p)) else { continue };
                         for (page, slot) in piece.pages.iter().enumerate() {
@@ -4599,13 +4622,14 @@ impl Host {
                                 let at = base + slot * CAPTURE_PAGE + offset;
                                 if brought.is_empty() {
                                     copies.push((r.shadow.clone(), lo, hi, at, plan.sent_as));
-                                } else {
-                                    let newer = brought.iter().filter(|b| b.through >= plan.sent_as && Arc::ptr_eq(&b.shadow, &r.shadow))
-                                        .map(|b| (b.from, b.to));
-                                    for (from, to) in capture_uncovered(lo, hi, newer) {
-                                        copies.push((r.shadow.clone(), from, to, at + (from - lo), plan.sent_as));
-                                    }
+                                    continue;
                                 }
+                                let excluded = excluded.get_or_insert_with(|| capture_exclusions(
+                                    brought, &r.shadow, plan.sent_as, r.span.from as usize, r.span.to as usize,
+                                ));
+                                capture_uncovered(lo, hi, excluded, |from, to| {
+                                    copies.push((r.shadow.clone(), from, to, at + (from - lo), plan.sent_as));
+                                });
                             }
                         }
                     }
