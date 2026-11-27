@@ -7638,8 +7638,11 @@ impl HostList {
                     batch.title_written();
                     crate::port::copied(dst, src, len);
                     // Renderer port #7: into a heap's records, the rounds
-                    // asked earlier did not see it.
-                    if crate::descriptor::in_shader_heap(dst, len) {
+                    // asked earlier did not see it. The look is a read lock
+                    // and a scan of every registered heap: 3,000 copies a
+                    // frame, and nothing it can find while the journal is
+                    // off (`VICTORY_PORT_JOURNAL`).
+                    if crate::port_journal::on() && crate::descriptor::in_shader_heap(dst, len) {
                         crate::port_journal::prep_wrote();
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
@@ -7669,7 +7672,7 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
-                    if crate::descriptor::in_shader_heap(p.dst, p.len) {
+                    if crate::port_journal::on() && crate::descriptor::in_shader_heap(p.dst, p.len) {
                         crate::port_journal::prep_wrote();
                     }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
