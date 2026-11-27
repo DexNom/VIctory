@@ -110,11 +110,49 @@ pub(crate) fn limited_host_ram() -> bool {
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
 }
 
-fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+/// The two free-RAM lines that bracket host pressure.
+///
+/// The defaults are the lines every measured run on this build used: enter at
+/// 3 GiB of free RAM, leave at 5 GiB. `VICTORY_PRESSURE_FREE_MB` and
+/// `VICTORY_PRESSURE_CLEAR_MB` move them, in MiB, for hosts whose steady state
+/// sits somewhere else. The commit lines below are not knobs: they exist
+/// because a 40 GB pagefile leaves commit to spare while the RAM is gone, and
+/// that is the state the card was removed in.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Lines {
+    pub free: u64,
+    pub clear: u64,
+}
+
+fn mib_from_env(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|mib| *mib > 0)
+        .map(|mib| mib << 20)
+}
+
+fn clamp_lines(free: u64, clear: u64) -> Lines {
+    // A clear line at or under the free line flaps the state on every sample,
+    // and each flip rewrites the prefetch budget: 256 MiB is the smallest gap a
+    // 16 GB host resolves between two one-second samples.
+    Lines { free, clear: clear.max(free.saturating_add(256 * MIB)) }
+}
+
+pub(crate) fn lines() -> Lines {
+    static LINES: OnceLock<Lines> = OnceLock::new();
+    *LINES.get_or_init(|| {
+        let free = mib_from_env("VICTORY_PRESSURE_FREE_MB").unwrap_or(3 * GIB);
+        let clear = mib_from_env("VICTORY_PRESSURE_CLEAR_MB").unwrap_or(5 * GIB);
+        clamp_lines(free, clear)
+    })
+}
+
+fn next_pressure(was: bool, physical: u64, commit: u64, lines: Lines) -> bool {
     if was {
-        physical < 5 * GIB || commit < 6 * GIB
+        physical < lines.clear || commit < 6 * GIB
     } else {
-        physical <= 3 * GIB || commit <= 4 * GIB
+        physical <= lines.free || commit <= 4 * GIB
     }
 }
 
@@ -124,7 +162,8 @@ pub(crate) fn refresh() {
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let lines = lines();
+    let pressure = next_pressure(was, physical, commit, lines);
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -133,6 +172,8 @@ pub(crate) fn refresh() {
                 frame = crate::frame::current(),
                 physical_free_mib = physical >> 20,
                 available_commit_mib = commit >> 20,
+                enter_free_mib = lines.free >> 20,
+                clear_free_mib = lines.clear >> 20,
                 buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
                 texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
                 spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
@@ -189,27 +230,46 @@ mod tests {
 
     #[test]
     fn bake_and_lookahead_leave_room_for_live_game_allocations() {
-        for (commit, bake, lookahead, growth) in [
-            (128 * MIB, false, false, false),
-            (192 * MIB, false, true, false),
-            (256 * MIB, true, true, false),
-            (512 * MIB, true, true, true),
-            (1024 * MIB, true, true, true),
-        ] {
-            assert_eq!(has_upload_reserve(commit, true), bake);
-            assert_eq!(has_upload_reserve(commit, false), lookahead);
-            assert_eq!(has_growth_reserve(commit, false), growth);
-        }
+        // The floors are inclusive: a host sitting exactly on one admits.
+        // Upload: 192 MiB for lookahead, 128 MiB for a one-shot bake.
+        assert!(!has_upload_reserve(191 * MIB, false));
+        assert!(has_upload_reserve(192 * MIB, false));
+        assert!(!has_upload_reserve(127 * MIB, true));
+        assert!(has_upload_reserve(128 * MIB, true));
+        // Growth: 512 MiB for a new pool block, 192 MiB for a bake.
+        assert!(!has_growth_reserve(511 * MIB, false));
+        assert!(has_growth_reserve(512 * MIB, false));
+        assert!(!has_growth_reserve(191 * MIB, true));
+        assert!(has_growth_reserve(192 * MIB, true));
     }
 
     #[test]
     fn either_constraint_enters_pressure_and_both_must_recover() {
-        assert!(next_pressure(false, 12 * GIB, 4 * GIB));
-        assert!(next_pressure(false, 3 * GIB, 16 * GIB));
-        assert!(next_pressure(true, 4 * GIB, 7 * GIB));
-        assert!(next_pressure(true, 6 * GIB, 5 * GIB));
-        assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
-        assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+        let l = Lines { free: 3 * GIB, clear: 5 * GIB };
+        assert!(next_pressure(false, 12 * GIB, 4 * GIB, l));
+        assert!(next_pressure(false, 3 * GIB, 16 * GIB, l));
+        assert!(next_pressure(true, 4 * GIB, 7 * GIB, l));
+        assert!(next_pressure(true, 6 * GIB, 5 * GIB, l));
+        assert!(!next_pressure(true, 5 * GIB, 6 * GIB, l));
+        assert!(!next_pressure(false, 4 * GIB, 5 * GIB, l));
+    }
+
+    #[test]
+    fn the_configured_lines_move_the_state_without_flapping() {
+        // The launcher's default: enter at 1 GiB, leave at 2 GiB.
+        let tight = clamp_lines(1024 * MIB, 2048 * MIB);
+        assert_eq!(tight.free, 1024 * MIB);
+        assert_eq!(tight.clear, 2048 * MIB);
+        // 2 GiB free is idle at the defaults and still idle here.
+        assert!(!next_pressure(false, 2 * GIB, 32 * GIB, tight));
+        assert!(!next_pressure(false, 1100 * MIB, 32 * GIB, tight));
+        assert!(next_pressure(false, 1024 * MIB, 32 * GIB, tight));
+        // Once in, it stays in until the clear line, not the free one.
+        assert!(next_pressure(true, 1500 * MIB, 32 * GIB, tight));
+        assert!(!next_pressure(true, 2048 * MIB, 32 * GIB, tight));
+        // A clear line under the free line is pushed to free + 256 MiB.
+        let clamped = clamp_lines(4 * GIB, 1 * GIB);
+        assert_eq!(clamped.clear, 4 * GIB + 256 * MIB);
     }
 
     #[test]

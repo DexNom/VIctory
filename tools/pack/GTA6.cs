@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -9,6 +10,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
 using Timer = System.Windows.Forms.Timer;
 
 // GTA6.exe - tudo em um so: extrai o runtime (VIctory, base Belobug + o perfil
@@ -36,10 +38,13 @@ static class GTA6
     static Button playPanel;
     static Button prepare;
     static CheckBox fullScreenBox;
+    static ComboBox modeBox;
+    static Label modeNote;
     static Process running;
     static Timer focus;
     static int focusTicks;
     static bool preparing;
+    static Mode activeMode;
 
     [STAThread]
     static void Main(string[] args)
@@ -48,6 +53,7 @@ static class GTA6
         bool book = args.Length > 0 && args[0] == "--book";
         bool headless = args.Length > 0 && (args[0].StartsWith("--play", StringComparison.Ordinal) || book);
         bool installOnly = args.Length > 0 && args[0] == "--install";
+        bool codeOnly = args.Length > 0 && args[0].StartsWith("--code", StringComparison.Ordinal);
 
         try
         {
@@ -67,6 +73,31 @@ static class GTA6
 
         if (installOnly)
         {
+            Environment.Exit(0);
+            return;
+        }
+
+        // O codigo do perfil pela linha de comando, para suporte e para testar
+        // um codigo sem abrir a janela:
+        //   GTA6.exe --code                  imprime o codigo do modo atual
+        //   GTA6.exe "--code=s=0.5;b=512;..." valida e normaliza um codigo
+        if (codeOnly)
+        {
+            string text = args[0].Length > 6 ? args[0].Substring(6).TrimStart('=').Trim() : "";
+            if (text.Length == 0)
+            {
+                Console.WriteLine(Code(SelectedMode()));
+                Environment.Exit(0);
+                return;
+            }
+            Mode parsed = ParseCode(text);
+            if (parsed == null)
+            {
+                Console.WriteLine("invalido");
+                Environment.Exit(2);
+                return;
+            }
+            Console.WriteLine(Code(parsed));
             Environment.Exit(0);
             return;
         }
@@ -379,12 +410,180 @@ static class GTA6
 
     // ------------------------------------------------------------------ play
 
+    // Os modos: o mesmo perfil medido, com as alavancas que mudam de maquina
+    // para maquina. `recomendado` e o perfil deste PC (Ryzen 5 5600G, 16 GB,
+    // RTX 3060 Ti 8 GB, Windows 10) com a escala 0.6667 que o soak28 aprovou:
+    // GPU de 34,0 para 13,7 ms e quadro de 99,2 para 90,1 ms a 6.191 draws,
+    // sem artefato visivel. E o valor nativo do upscaler do proprio titulo
+    // (Series X desenha 2/3). Os outros modos sao o mesmo desenho para outras
+    // placas; so o recomendado foi medido aqui.
+    sealed class Mode
+    {
+        public string Key;
+        public string Name;
+        public string Tag;
+        public string Scale;
+        public int BuffersMb;
+        public int TargetsMb;
+        public int MemoryCardMb;
+        public int WindowsMb;
+        public int RoomPercent;
+        public int RipeBlocks;
+        public int PressureFreeMb;
+        public int PressureClearMb;
+        public string Note;
+
+        public Mode(string key, string name, string tag, string scale, int buffers, int targets,
+            int memoryCard, int windows, int roomPercent, int ripe, int pressureFree, int pressureClear, string note)
+        {
+            Key = key;
+            Name = name;
+            Tag = tag;
+            Scale = scale;
+            BuffersMb = buffers;
+            TargetsMb = targets;
+            MemoryCardMb = memoryCard;
+            WindowsMb = windows;
+            RoomPercent = roomPercent;
+            RipeBlocks = ripe;
+            PressureFreeMb = pressureFree;
+            PressureClearMb = pressureClear;
+            Note = note;
+        }
+
+        public override string ToString()
+        {
+            return Name + "   " + Tag;
+        }
+    }
+
+    static readonly Mode[] Modes = new Mode[]
+    {
+        new Mode("recomendado", "Recomendado", "720p reconstruido a 1080p", "0.6667",
+            768, 768, 128, 96, 90, 4, 0, 0,
+            "Medido nesta maquina: 90,1 ms de quadro a 6.191 draws, GPU em 10% de uso. A CPU e a parede."),
+        new Mode("nitido", "Nitido", "720p nativo, sem upscaler", "1.0",
+            768, 768, 128, 96, 90, 4, 0, 0,
+            "Medido nesta maquina: 99,2 ms de quadro. A imagem e 1:1, sem reconstrucao."),
+        new Mode("rapido", "Rapido", "540p reconstruido", "0.5",
+            768, 768, 128, 96, 90, 4, 0, 0,
+            "Para CPU apertada: mais quadros, imagem mais mole. Nao medido nesta maquina."),
+        new Mode("modesto", "PC modesto", "placas de 6-8 GB, 16 GB de RAM", "0.5",
+            512, 512, 96, 64, 90, 2, 1024, 2048,
+            "Menos buffers e textura menor na placa, com as linhas de pressao de RAM ligadas."),
+        new Mode("ultra", "Ultra baixo", "4-6 GB de placa, 8-16 GB de RAM", "0.5",
+            384, 384, 64, 48, 90, 2, 1536, 3072,
+            "O menor consumo de memoria de todos. Imagem macia. Para o PC mais fraco da lista."),
+        new Mode("classico", "Classico", "o perfil de 16 GB sem a escala", "1.0",
+            768, 768, 128, 96, 90, 4, 0, 0,
+            "O perfil anterior a escala 0.6667, para comparar lado a lado."),
+    };
+
+    static Mode FindMode(string key)
+    {
+        foreach (Mode mode in Modes)
+        {
+            if (mode.Key == key)
+            {
+                return mode;
+            }
+        }
+        return Modes[0];
+    }
+
+    // O modo escolhido. `custom` vem do codigo colado, e um codigo invalido cai
+    // no recomendado em vez de abrir o jogo com valor fora de faixa.
+    static Mode SelectedMode()
+    {
+        string key = Setting("mode", "recomendado");
+        if (key == "custom")
+        {
+            Mode custom = ParseCode(Setting("custom", ""));
+            if (custom != null)
+            {
+                return custom;
+            }
+        }
+        return FindMode(key);
+    }
+
+    // O codigo do perfil, curto o bastante para colar num chat:
+    //   s=escala;b=buffers;t=alvos;m=cartao;w=janelas;p=percentual;r=ripe;g=pressao;c=limpeza
+    static string Code(Mode mode)
+    {
+        return "s=" + mode.Scale
+            + ";b=" + mode.BuffersMb
+            + ";t=" + mode.TargetsMb
+            + ";m=" + mode.MemoryCardMb
+            + ";w=" + mode.WindowsMb
+            + ";p=" + mode.RoomPercent
+            + ";r=" + mode.RipeBlocks
+            + ";g=" + mode.PressureFreeMb
+            + ";c=" + mode.PressureClearMb;
+    }
+
+    static Mode ParseCode(string code)
+    {
+        if (string.IsNullOrEmpty(code))
+        {
+            return null;
+        }
+        double scale = 0;
+        int buffers = 0, targets = 0, memoryCard = 0, windows = 0, room = 0, ripe = 0, free = 0, clear = 0;
+        int seen = 0;
+        foreach (string part in code.Split(';'))
+        {
+            int at = part.IndexOf('=');
+            if (at <= 0)
+            {
+                continue;
+            }
+            string key = part.Substring(0, at).Trim();
+            string value = part.Substring(at + 1).Trim();
+            switch (key)
+            {
+                case "s":
+                    if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out scale))
+                    {
+                        return null;
+                    }
+                    seen |= 1;
+                    break;
+                case "b": if (!int.TryParse(value, out buffers)) { return null; } seen |= 2; break;
+                case "t": if (!int.TryParse(value, out targets)) { return null; } seen |= 4; break;
+                case "m": if (!int.TryParse(value, out memoryCard)) { return null; } seen |= 8; break;
+                case "w": if (!int.TryParse(value, out windows)) { return null; } seen |= 16; break;
+                case "p": if (!int.TryParse(value, out room)) { return null; } seen |= 32; break;
+                case "r": if (!int.TryParse(value, out ripe)) { return null; } seen |= 64; break;
+                case "g": if (!int.TryParse(value, out free)) { return null; } seen |= 128; break;
+                case "c": if (!int.TryParse(value, out clear)) { return null; } seen |= 256; break;
+            }
+        }
+        // Todas as nove chaves, e cada uma dentro da faixa que o runtime aceita.
+        // Um codigo pela metade abriria o jogo com o resto em zero.
+        if (seen != 511)
+        {
+            return null;
+        }
+        if (scale < 0.3 || scale > 1.0 || buffers < 256 || buffers > 2048
+            || targets < 256 || targets > 4096 || memoryCard < 32 || memoryCard > 2048
+            || windows < 32 || windows > 1024 || room < 50 || room > 98
+            || ripe < 1 || ripe > 8 || free < 0 || free > 8192 || clear < 0 || clear > 16384)
+        {
+            return null;
+        }
+        return new Mode("custom", "Personalizado", "o codigo colado", scale.ToString("0.####", CultureInfo.InvariantCulture),
+            buffers, targets, memoryCard, windows, room, ripe, free, clear,
+            "Valores colados a mao. Sem medicao nesta maquina.");
+    }
+
     // O perfil da build numa maquina de 16 GB (Ryzen 5 5600G, 16 GB, RTX 3060
     // Ti 8 GB, Windows 10). Cada linha foi medida; o porque esta em
     // OTIMIZACOES.md. Cada grupo e uma funcao: mexer num budget nao pede ler o
     // perfil inteiro.
     static void Profile(ProcessStartInfo start, bool high, bool panel)
     {
+        activeMode = SelectedMode();
         ProfileFork(start);
         ProfilePorts(start);
         ProfilePicture(start, high);
@@ -445,18 +644,16 @@ static class GTA6
         start.EnvironmentVariables["VICTORY_AMBIENT_AIR"] = "1.5";
         // O titulo acredita que a TV e 4K e desenha 2560x1440 dentro de uma
         // janela 1080p: 4x os alvos, 4x as copias. VICTORY_OUTPUT e o modo que
-        // ele reporta; a escala 1.0 desenha na resolucao do modo, sem upscaler.
-        // A 0.5 (640x360) o upscaler dele mesmo (6) aplica nitidez e a imagem
-        // fica dura, com halo; a placa fica 78% ociosa de qualquer jeito, entao
-        // desenhar 720p inteiro custa quase nada e tira o serrilhado.
+        // ele reporta; a escala decide o tamanho real do desenho.
         start.EnvironmentVariables["VICTORY_OUTPUT"] = high ? "1920x1080" : "1280x720";
         start.EnvironmentVariables["VICTORY_UPSCALER"] = "6";
-        // 1.0 desenha 1280x720 inteiro, 1:1. A 0.8 (1024x576) o upscaler do
-        // proprio titulo (6) estica e aplica nitidez: a imagem fica dura, com
-        // halo nos fios de cabelo. O ganho de fps da 0.8 nao se paga: no
-        // mundo a CPU e a parede (41-50 ms de preparo contra 30-37 de GPU),
-        // entao a placa tem folga para desenhar 720p inteiro.
-        start.EnvironmentVariables["VICTORY_RENDER_SCALE"] = "1.0";
+        // A escala vem do modo. 0.6667 (854x480 reconstruido a 1280x720) e o
+        // valor nativo do upscaler do proprio titulo (Series X desenha 2/3) e
+        // o que o soak28 mediu nesta maquina: GPU de 34,0 para 13,7 ms e
+        // quadro de 99,2 para 90,1 ms a 6.191 draws, sem artefato visivel.
+        // A 1.0 a imagem e 1:1 e o quadro custa ~9% mais; a 0.5 o upscaler
+        // aplica nitidez demais e a imagem fica dura, com halo.
+        start.EnvironmentVariables["VICTORY_RENDER_SCALE"] = activeMode.Scale;
         // O nivel de textura fica em `high`: a reducao por mip bias removia o
         // device na tela de carregamento, entao ela esta desligada no runtime
         // e o launcher nao a oferece.
@@ -471,7 +668,8 @@ static class GTA6
         start.EnvironmentVariables["VICTORY_LIBRARY_STORE_LATER"] = "1";
     }
 
-    // A placa de 8 GB e o que ela guarda.
+    // A placa de 8 GB e o que ela guarda. Os numeros vem do modo: o
+    // recomendado e o perfil medido nesta maquina.
     static void ProfileCard(ProcessStartInfo start)
     {
         // A 95% a fila enchia o cartao ate a linha e todo alvo ou copia que o
@@ -479,18 +677,18 @@ static class GTA6
         // (15.462 esperando, 5.655 MB enviados na run cf-1). 90%, com a dieta
         // menor abaixo (cf-12/cf-13), deixa ~1 GB e o orcamento nunca mais foi
         // o gatilho em run nenhuma depois disso.
-        start.EnvironmentVariables["VICTORY_TEXTURE_ROOM_PERCENT"] = "90";
-        start.EnvironmentVariables["VICTORY_CARD_ROOM_FOR_TARGETS_MB"] = "768";
+        start.EnvironmentVariables["VICTORY_TEXTURE_ROOM_PERCENT"] = activeMode.RoomPercent.ToString(CultureInfo.InvariantCulture);
+        start.EnvironmentVariables["VICTORY_CARD_ROOM_FOR_TARGETS_MB"] = activeMode.TargetsMb.ToString(CultureInfo.InvariantCulture);
         // 128, nao os 1.536 do perfil antigo: o espaco guardado para alvos que
         // ainda nao existem e o que a fila de textura nao tem num cartao de
         // 8 GB.
-        start.EnvironmentVariables["VICTORY_MEMORY_CARD_MB"] = "128";
-        start.EnvironmentVariables["VICTORY_CARD_WINDOWS_MB"] = "96";
+        start.EnvironmentVariables["VICTORY_MEMORY_CARD_MB"] = activeMode.MemoryCardMb.ToString(CultureInfo.InvariantCulture);
+        start.EnvironmentVariables["VICTORY_CARD_WINDOWS_MB"] = activeMode.WindowsMb.ToString(CultureInfo.InvariantCulture);
         // 768 MB de buffers no cartao, e MIN_MB=1 para o pool poder encher ate
         // a linha: com o pool em 192 MB a varredura de escrita dos shaders
         // virou thrash (cf-4). Com 768 a varredura caiu de 66,6 ms/658 MB
         // para 3,2 ms/30 MB (cf-12).
-        start.EnvironmentVariables["VICTORY_CARD_BUFFERS_MB"] = "768";
+        start.EnvironmentVariables["VICTORY_CARD_BUFFERS_MB"] = activeMode.BuffersMb.ToString(CultureInfo.InvariantCulture);
         start.EnvironmentVariables["VICTORY_CARD_BUFFERS_MIN_MB"] = "1";
     }
 
@@ -523,7 +721,21 @@ static class GTA6
         // buffers compartilhados (42.594 shared/28.615 MB contra 16.259/
         // 10.818), e o heap pass foi de ~10 ms para 176 ms. Fica nos 4 MiB.
         // Blocos de textura feitos adiantados (64 MiB cada).
-        start.EnvironmentVariables["VICTORY_RIPE_BLOCKS"] = "4";
+        start.EnvironmentVariables["VICTORY_RIPE_BLOCKS"] = activeMode.RipeBlocks.ToString(CultureInfo.InvariantCulture);
+        // As duas linhas de pressao de RAM. Cruzou a linha de entrada, o host
+        // corta o prefetch de textura para 64 MiB por quadro e solta staging
+        // parado; voltou acima da linha de limpeza, ele retoma. Zero nas duas
+        // deixa o padrao do runtime (3 GiB para entrar, 5 GiB para sair), que
+        // e o que o perfil medido usa. Os modos apertados descem para
+        // 1 GiB / 2 GiB, onde a maquina de 16 GB realmente opera.
+        if (activeMode.PressureFreeMb > 0)
+        {
+            start.EnvironmentVariables["VICTORY_PRESSURE_FREE_MB"] = activeMode.PressureFreeMb.ToString(CultureInfo.InvariantCulture);
+        }
+        if (activeMode.PressureClearMb > 0)
+        {
+            start.EnvironmentVariables["VICTORY_PRESSURE_CLEAR_MB"] = activeMode.PressureClearMb.ToString(CultureInfo.InvariantCulture);
+        }
         // O anel de constantes do titulo e' reaproveitado, entao os dois testes
         // do FILL_TITLE=1 (`written_since_taken`, `!landed_lately`) nunca
         // passavam e 22 a 24 ms por quadro iam em espera por um fill de 80
@@ -925,7 +1137,7 @@ static class GTA6
     {
         window = new Form();
         window.Text = "GTA6";
-        window.ClientSize = new Size(560, 420);
+        window.ClientSize = new Size(600, 552);
         window.FormBorderStyle = FormBorderStyle.FixedSingle;
         window.MaximizeBox = false;
         window.StartPosition = FormStartPosition.CenterScreen;
@@ -937,28 +1149,83 @@ static class GTA6
         title.Text = "GTA6 no PC";
         title.Font = new Font("Segoe UI", 20f, FontStyle.Bold);
         title.ForeColor = Color.FromArgb(255, 255, 255);
-        title.SetBounds(28, 22, 500, 40);
+        title.SetBounds(28, 18, 540, 40);
         window.Controls.Add(title);
 
         Label sub = new Label();
-        sub.Text = "Runtime VIctory, base Belobug, perfil de 16 GB.";
+        sub.Text = "Runtime VIctory, base Belobug. O perfil recomendado foi medido nesta maquina.";
         sub.ForeColor = Color.FromArgb(150, 150, 160);
-        sub.SetBounds(30, 64, 500, 22);
+        sub.SetBounds(30, 60, 540, 22);
         window.Controls.Add(sub);
 
-        play720 = MakeButton("Jogar  720p", 30, 104, 240);
+        Label modeLabel = new Label();
+        modeLabel.Text = "Modo";
+        modeLabel.ForeColor = Color.FromArgb(180, 180, 190);
+        modeLabel.SetBounds(30, 90, 540, 18);
+        window.Controls.Add(modeLabel);
+
+        modeBox = new ComboBox();
+        modeBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        modeBox.FlatStyle = FlatStyle.Flat;
+        modeBox.BackColor = Color.FromArgb(40, 40, 48);
+        modeBox.ForeColor = Color.FromArgb(240, 240, 245);
+        modeBox.SetBounds(30, 110, 540, 26);
+
+        string wanted = Setting("mode", "recomendado");
+        foreach (Mode mode in Modes)
+        {
+            modeBox.Items.Add(mode);
+        }
+        Mode custom = wanted == "custom" ? ParseCode(Setting("custom", "")) : null;
+        if (custom != null)
+        {
+            modeBox.Items.Add(custom);
+        }
+        Mode start = custom ?? FindMode(wanted);
+        for (int i = 0; i < modeBox.Items.Count; i++)
+        {
+            if (((Mode)modeBox.Items[i]).Key == start.Key)
+            {
+                modeBox.SelectedIndex = i;
+                break;
+            }
+        }
+        if (modeBox.SelectedIndex < 0)
+        {
+            modeBox.SelectedIndex = 0;
+        }
+        window.Controls.Add(modeBox);
+
+        modeNote = new Label();
+        modeNote.Text = start.Note;
+        modeNote.ForeColor = Color.FromArgb(130, 130, 142);
+        modeNote.SetBounds(30, 142, 540, 44);
+        window.Controls.Add(modeNote);
+
+        modeBox.SelectedIndexChanged += delegate
+        {
+            Mode picked = modeBox.SelectedItem as Mode;
+            if (picked == null)
+            {
+                return;
+            }
+            SaveSetting("mode", picked.Key);
+            modeNote.Text = picked.Note;
+        };
+
+        play720 = MakeButton("Jogar  720p", 30, 194, 262);
         play720.Click += delegate { Play(false, false); };
         window.Controls.Add(play720);
 
-        play1080 = MakeButton("Jogar  1080p", 290, 104, 240);
+        play1080 = MakeButton("Jogar  1080p", 308, 194, 262);
         play1080.Click += delegate { Play(true, false); };
         window.Controls.Add(play1080);
 
-        playPanel = MakeButton("Jogar com painel (F3)", 30, 156, 240);
+        playPanel = MakeButton("Jogar com painel (F3)", 30, 242, 262);
         playPanel.Click += delegate { Play(false, true); };
         window.Controls.Add(playPanel);
 
-        Button folder = MakeButton("Pasta do jogo", 290, 156, 240);
+        Button folder = MakeButton("Pasta do jogo", 308, 242, 262);
         folder.Click += delegate
         {
             if (AskGame())
@@ -974,7 +1241,7 @@ static class GTA6
         fullScreenBox = new CheckBox();
         fullScreenBox.Text = "Tela cheia";
         fullScreenBox.ForeColor = Color.FromArgb(220, 220, 226);
-        fullScreenBox.SetBounds(30, 204, 240, 26);
+        fullScreenBox.SetBounds(30, 294, 130, 26);
         fullScreenBox.Checked = FullScreen();
         fullScreenBox.CheckedChanged += delegate
         {
@@ -982,19 +1249,165 @@ static class GTA6
         };
         window.Controls.Add(fullScreenBox);
 
-        prepare = MakeButton("Preparar (compilar)", 30, 262, 240);
+        Button code = MakeButton("Codigo do perfil", 180, 288, 180);
+        code.Click += delegate { ShowCode(); };
+        window.Controls.Add(code);
+
+        prepare = MakeButton("Preparar (compilar)", 30, 336, 262);
         prepare.Click += delegate { Prepare(); };
         window.Controls.Add(prepare);
 
         status = new Label();
         status.Text = "Jogo: " + (ReadGamePath().Length > 0 ? ReadGamePath() : "nao encontrado");
         status.ForeColor = Color.FromArgb(150, 150, 160);
-        status.SetBounds(30, 312, 500, 80);
+        status.SetBounds(30, 388, 540, 100);
         window.Controls.Add(status);
+
+        Label hardware = new Label();
+        hardware.Text = HardwareLine();
+        hardware.ForeColor = Color.FromArgb(110, 110, 122);
+        hardware.SetBounds(30, 504, 540, 20);
+        window.Controls.Add(hardware);
 
         focus = new Timer();
         focus.Interval = 500;
         focus.Tick += delegate { Watch(); };
+    }
+
+    // O codigo do perfil, para colar num chat ou receber o de outra pessoa.
+    // Aplicar grava como `custom` e passa a usa-lo na proxima partida.
+    static void ShowCode()
+    {
+        using (Form dialog = new Form())
+        {
+            dialog.Text = "Codigo do perfil";
+            dialog.ClientSize = new Size(520, 200);
+            dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
+            dialog.MaximizeBox = false;
+            dialog.MinimizeBox = false;
+            dialog.StartPosition = FormStartPosition.CenterParent;
+            dialog.BackColor = Color.FromArgb(24, 24, 28);
+            dialog.ForeColor = Color.FromArgb(232, 232, 236);
+            dialog.Font = new Font("Segoe UI", 9.5f);
+
+            Label hint = new Label();
+            hint.Text = "Cole o codigo de outro perfil, ou copie este para compartilhar.";
+            hint.SetBounds(18, 14, 480, 20);
+            hint.ForeColor = Color.FromArgb(150, 150, 160);
+            dialog.Controls.Add(hint);
+
+            TextBox box = new TextBox();
+            box.Text = Code(SelectedMode());
+            box.SetBounds(18, 40, 480, 24);
+            box.BackColor = Color.FromArgb(40, 40, 48);
+            box.ForeColor = Color.FromArgb(240, 240, 245);
+            box.BorderStyle = BorderStyle.FixedSingle;
+            dialog.Controls.Add(box);
+
+            Button copy = MakeButton("Copiar", 18, 82, 150);
+            copy.Click += delegate
+            {
+                try
+                {
+                    Clipboard.SetText(box.Text);
+                    Say("Codigo copiado.");
+                }
+                catch (Exception)
+                {
+                }
+            };
+            dialog.Controls.Add(copy);
+
+            Button apply = MakeButton("Aplicar", 180, 82, 150);
+            apply.Click += delegate
+            {
+                Mode parsed = ParseCode(box.Text.Trim());
+                if (parsed == null)
+                {
+                    MessageBox.Show(dialog,
+                        "Codigo invalido: falta alguma chave, ou algum valor saiu da faixa que o runtime aceita.",
+                        "GTA6", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                SaveSetting("custom", Code(parsed));
+                SaveSetting("mode", "custom");
+                bool replaced = false;
+                for (int i = 0; i < modeBox.Items.Count; i++)
+                {
+                    if (((Mode)modeBox.Items[i]).Key == "custom")
+                    {
+                        modeBox.Items[i] = parsed;
+                        modeBox.SelectedIndex = i;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced)
+                {
+                    modeBox.Items.Add(parsed);
+                    modeBox.SelectedIndex = modeBox.Items.Count - 1;
+                }
+                modeNote.Text = parsed.Note;
+                dialog.DialogResult = DialogResult.OK;
+            };
+            dialog.Controls.Add(apply);
+
+            Button close = MakeButton("Fechar", 342, 82, 150);
+            close.Click += delegate { dialog.DialogResult = DialogResult.Cancel; };
+            dialog.Controls.Add(close);
+
+            dialog.AcceptButton = apply;
+            dialog.CancelButton = close;
+            dialog.ShowDialog(window);
+        }
+    }
+
+    // O que a maquina tem, sem WMI: o registro da o processador e a placa, e o
+    // kernel da a RAM instalada. Uma linha, so para o usuario saber onde esta.
+    static string HardwareLine()
+    {
+        string cpu = null;
+        string gpu = null;
+        try
+        {
+            cpu = Registry.GetValue(
+                @"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                "ProcessorNameString", null) as string;
+        }
+        catch (Exception)
+        {
+        }
+        try
+        {
+            string device = Registry.GetValue(
+                @"HKEY_LOCAL_MACHINE\HARDWARE\DEVICEMAP\VIDEO", @"\Device\Video0", null) as string;
+            if (!string.IsNullOrEmpty(device))
+            {
+                string path = device.Replace(@"\Registry\Machine\", @"HKEY_LOCAL_MACHINE\");
+                gpu = Registry.GetValue(path, "DriverDesc", null) as string;
+            }
+        }
+        catch (Exception)
+        {
+        }
+        MEMORYSTATUSEX memory = new MEMORYSTATUSEX();
+        memory.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+        ulong ram = GlobalMemoryStatusEx(ref memory) ? memory.ullTotalPhys : 0;
+
+        List<string> parts = new List<string>();
+        if (!string.IsNullOrEmpty(cpu))
+        {
+            parts.Add(Regex.Replace(cpu.Trim(), @"\s+", " "));
+        }
+        if (ram > 0)
+        {
+            parts.Add(Math.Round(ram / 1073741824.0) + " GB");
+        }
+        if (!string.IsNullOrEmpty(gpu))
+        {
+            parts.Add(gpu.Trim());
+        }
+        return string.Join("  -  ", parts.ToArray());
     }
 
     static Button MakeButton(string text, int x, int y, int width)
@@ -1058,6 +1471,23 @@ static class GTA6
 
     [DllImport("user32.dll")]
     static extern bool SetForegroundWindow(IntPtr handle);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct MEMORYSTATUSEX
+    {
+        public uint dwLength;
+        public uint dwMemoryLoad;
+        public ulong ullTotalPhys;
+        public ulong ullAvailPhys;
+        public ulong ullTotalPageFile;
+        public ulong ullAvailPageFile;
+        public ulong ullTotalVirtual;
+        public ulong ullAvailVirtual;
+        public ulong ullAvailExtendedVirtual;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX status);
 
     delegate bool EnumProc(IntPtr handle, IntPtr param);
 

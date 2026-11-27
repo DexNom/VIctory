@@ -79,3 +79,6 @@ validate_*.txt
 *.swp
 Thumbs.db
 .DS_Store
+
+# The reference launcher is a shipped artifact kept for parity work.
+!reference/Julias-Launcher.exe

@@ -19,6 +19,8 @@ This build unites the cutting-edge optimizations from leading PortWatch projects
 - **Custom Resolution & Scaling:** `VICTORY_OUTPUT=1920x1080` (or `2560x1440`) and `VICTORY_RENDER_SCALE=0.667..1.0` with the 4K backbuffer pool check bypass.
 - **Frame Rate Unlock:** `VICTORY_FRAME_INTERVAL_MS=16.667` (60 FPS) or `8.333` (120 FPS) while keeping game simulation clock strictly at 1.00x.
 - **Renderer Port 5 (Zero-Copy CBV):** `VICTORY_PORT_CBV=1` reads constant buffers as raw bytes in-place, eliminating ~22,000 buffer copies per frame.
+- **Launcher modes and a shareable profile code:** `GTA6.exe` opens with six measured presets (Recommended, Sharp, Fast, Modest PC, Ultra Low, Classic) and a `s=...;b=...` profile string you can copy, paste, or pass on the command line. The Recommended preset draws at 0.6667 and lets the title's own upscaler rebuild 720p — measured here at 90.1 ms/frame against 99.2 ms at 1.0, with no visible artifact.
+- **Host RAM pressure lines as knobs:** `VICTORY_PRESSURE_FREE_MB` and `VICTORY_PRESSURE_CLEAR_MB` set the free-RAM lines that start and clear host pressure, with the hysteresis clamped so the state cannot flap between one-second samples. Defaults are the 3 GiB / 5 GiB every measured run used.
 
 ---
 
@@ -45,6 +47,40 @@ For 4GB / 8GB VRAM laptops or low-memory systems, you can also launch with:
 
 ```powershell
 .\Play-VIctory-4GB.cmd
+```
+
+### Launcher modes
+
+`GTA6.exe` carries the whole thing: the runtime, the Agility SDK, the profile and
+the launcher. It opens with a mode picker.
+
+| mode | scale | buffers MB | targets MB | card MB | windows MB | ripe | RAM pressure |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Recommended | 0.6667 | 768 | 768 | 128 | 96 | 4 | runtime default |
+| Sharp | 1.0 | 768 | 768 | 128 | 96 | 4 | runtime default |
+| Fast | 0.5 | 768 | 768 | 128 | 96 | 4 | runtime default |
+| Modest PC | 0.5 | 512 | 512 | 96 | 64 | 2 | 1024 / 2048 |
+| Ultra Low | 0.5 | 384 | 384 | 64 | 48 | 2 | 1536 / 3072 |
+| Classic | 1.0 | 768 | 768 | 128 | 96 | 4 | runtime default |
+
+Only Recommended and Sharp were measured on the reference machine (Ryzen 5
+5600G, RTX 3060 Ti 8 GB, Windows 10). Recommended is the 0.6667 run: GPU 34.0 to
+13.7 ms and frame 99.2 to 90.1 ms at 6,191 draws, no visible artifact. Sharp is
+the profile before that change, for a side-by-side.
+
+The **Codigo do perfil** button copies the current mode as one line and accepts a
+pasted one:
+
+```
+s=scale;b=buffers;t=targets;m=card;w=windows;p=percent;r=ripe;g=pressure;c=clear
+```
+
+A code with a missing key or an out-of-range value is rejected whole — the game
+never starts with half the values at zero. From a shell:
+
+```powershell
+GTA6.exe --code                                     # the current mode's code
+GTA6.exe "--code=s=0.5;b=512;t=512;m=96;w=64;p=90;r=2;g=1024;c=2048"
 ```
 
 ---

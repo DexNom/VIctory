@@ -771,3 +771,73 @@ A biblioteca é construída pelo uso, no nosso formato. O que sobra do ScarlettP
   pixel, compute ou mesh). São geometria não usada.
 - **`amd_fidelityfx_upscaler_xbox.dll` é recusado no primeiro pedido** e
   carregado depois como DLL do título. É normal no log.
+
+---
+
+## Os modos do GTA6.exe e a paridade com o launcher da Julia
+
+O `GTA6.exe` deixou de ter um perfil unico. Ele abre com seis modos na primeira
+tela e um codigo de perfil que se cola num chat.
+
+| modo | escala | buffers | alvos | cartao | janelas | ripe | pressao |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Recomendado | 0.6667 | 768 | 768 | 128 | 96 | 4 | padrao |
+| Nitido | 1.0 | 768 | 768 | 128 | 96 | 4 | padrao |
+| Rapido | 0.5 | 768 | 768 | 128 | 96 | 4 | padrao |
+| PC modesto | 0.5 | 512 | 512 | 96 | 64 | 2 | 1024 / 2048 |
+| Ultra baixo | 0.5 | 384 | 384 | 64 | 48 | 2 | 1536 / 3072 |
+| Classico | 1.0 | 768 | 768 | 128 | 96 | 4 | padrao |
+
+So o **Recomendado** e o **Nitido** foram medidos nesta maquina. O Recomendado
+e o `soak28`: escala 0.6667, GPU de 34,0 para 13,7 ms e quadro de 99,2 para
+90,1 ms a 6.191 draws, sem artefato visivel. Repetido hoje pelo launcher: 91,1
+a 95,8 ms a ~6.000 draws. O Nitido e o perfil anterior a escala.
+
+### O codigo do perfil
+
+```
+s=escala;b=buffers;t=alvos;m=cartao;w=janelas;p=percentual;r=ripe;g=pressao;c=limpeza
+```
+
+O botao **Codigo do perfil** copia o modo atual e aceita um colado. Um codigo
+incompleto ou fora da faixa e recusado inteiro: o jogo nunca abre com metade
+dos valores em zero. Pela linha de comando:
+
+```powershell
+GTA6.exe --code                                     # o codigo do modo atual
+GTA6.exe "--code=s=0.5;b=512;t=512;m=96;w=64;p=90;r=2;g=1024;c=2048"
+```
+
+### As duas linhas de pressao de RAM
+
+`VICTORY_PRESSURE_FREE_MB` e `VICTORY_PRESSURE_CLEAR_MB` sao novas no runtime.
+Cruzou a linha de entrada, o host corta o prefetch de textura para 64 MiB por
+quadro e solta staging parado; voltou acima da linha de limpeza, ele retoma. O
+padrao do runtime e 3 GiB para entrar e 5 GiB para sair, que e o valor de toda
+run medida ate aqui, e e o que o modo Recomendado usa. Os modos apertados descem
+para 1 GiB / 2 GiB.
+
+O `residency.rs` ganhou as linhas como parametro, com a histerese presa: uma
+linha de limpeza abaixo da linha de entrada e empurrada para entrada + 256 MiB,
+porque sem isso o estado alterna a cada amostra de um segundo e cada alternancia
+reescreve o orcamento de prefetch.
+
+### O que o launcher da Julia tem e este runtime nao honra
+
+O `Julias-Launcher.exe` aponta para `felicienradio/cold-project-vi`. Das 64
+chaves que ele escreve, 44 existem aqui e 20 sao escritas no vazio:
+
+```
+AMBIENT_MOST BAKE_NO_WAIT BORDERLESS BORDERLESS_DPI BVH_MISS FPS_MAX
+FRAMEGEN INF_AS KBM_GTA NAN_SCRUB OWN_UPSCALER PANEL_FRAMEGEN
+POOL_FULLEST PORT_DESCRIPTORS PRESSURE_CLEAR_MB PRESSURE_FREE_MB
+TEXTURE_MAX TEXTURE_RAM_GUARD VRAM_RESERVE WAVE_WIDE_DIGESTS
+```
+
+Duas dessas passaram a existir com este trabalho (`PRESSURE_*`). As outras
+dezoito descrevem recursos que este runtime nao tem: geracao de quadros,
+upscaler proprio, borderless, sanitizacao numerica, BVH. O launcher nao as
+oferece, para nao vender um botao que nao faz nada.
+
+O relatorio completo esta em `reference/REPORT-JULIAS.md`, com o binario e os 45
+arquivos descompilados em `reference/`. Nada disso entra no build.
