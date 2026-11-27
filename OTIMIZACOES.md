@@ -494,6 +494,35 @@ Perfis: `balanced` (padrão), `maxfps` (LOD de textura em 2.0 e saída em 640x48
 O launcher aplica o `balanced` antes de cada partida (`gamecuts=0` no
 `settings.ini` desliga), porque o título regrava o arquivo ao sair.
 
+### Medido: +11% de fps, e o melhor custo por draw até agora
+
+Três medições de 180 s de assentamento e 120 s de janela, mesma máquina, mesmo
+perfil, cenas diferentes (é o mundo aberto, a câmera muda):
+
+| run | fps médio | ms/frame | draws/frame | µs por draw | o que mudou |
+|---|---|---|---|---|---|
+| soak1 | 8,69 | 116,7 | 3.748 | 31,1 | base: `CARD_BUFFERS_MB=768`, `CARD_WINDOWS_MB=96` |
+| soak2 | 7,80 | 130,7 | 4.096 | 31,9 | `1024`/`256`, sem os cortes do jogo |
+| soak3 | **8,68** | **115,5** | 4.118 | **28,0** | os mesmos `1024`/`256` **com** o perfil `balanced` |
+
+O soak2 e o soak3 rodaram a mesma cena (4.096 e 4.118 draws): **o corte do
+`settings.xml` valeu 15,2 ms por quadro, 11%**, e o custo por draw caiu de
+31,9 para 28,0 µs — o melhor que essa máquina já mediu. O soak1 tinha 31,1 µs
+com 10% menos geometria.
+
+O ganho é menor do que o tamanho do corte porque **o quadro aqui é de CPU**:
+`preparing` 74–81 ms mais `copying back` 23–31 ms dão ~105 ms de trabalho de
+CPU, e a GPU fica em 20–24 ms. Tirar trabalho da GPU encurta a fila dela, não a
+nossa. O que sobrou para atacar, em ordem:
+
+- `copies` 29–33 ms para 50–54 MB (≈1,7 GB/s): é `ReadProcessMemory` peça por
+  peça, limitado por banda de memória da CPU.
+- `heap buffers` 15–44 ms: o `sync_heaps`, com ~10 ms por quadro que os três
+  contadores internos não explicam.
+- `copying back` 23–31 ms para 6,4 MB (≈250 MB/s): a thread do relay passa 43 ms
+  esperando o cartão sem ter o que aterrissar. É onde o `VICTORY_QUEUE2` do
+  `uiliannn/VItoriaBr` ataca (fila de cópia própria para o fetch).
+
 ## Limites conhecidos
 
 - **16 GB é o piso, não o recomendado.** O processo chega a 22 GB privados; o
