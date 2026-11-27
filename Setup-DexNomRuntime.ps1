@@ -13,6 +13,30 @@ if (!(Get-Command rustup -ErrorAction SilentlyContinue) -or !(Get-Command cargo 
     throw 'Install Rust for Windows from https://rustup.rs, then reopen Setup.cmd.'
 }
 
+# The MSVC toolchain links with Visual Studio's C++ build tools and the
+# Windows SDK's libraries. Without them the build fails only at its end, with
+# a linker error, so check before the game is chosen and the build starts.
+function Test-BuildTools {
+    param(
+        [string] $VsWhere = (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'),
+        [string] $KitsRoot = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -Name KitsRoot10 -ErrorAction SilentlyContinue).KitsRoot10
+    )
+    $missing = @()
+    $cpp = (Test-Path -LiteralPath $VsWhere -PathType Leaf) -and
+        (& $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+    if (!$cpp) { $missing += 'the C++ build tools' }
+    $sdk = $KitsRoot -and (Get-ChildItem -Path (Join-Path $KitsRoot 'Lib\*\um\x64\kernel32.lib') -ErrorAction SilentlyContinue)
+    if (!$sdk) { $missing += 'a Windows 10 or 11 SDK' }
+    $missing
+}
+$missingTools = @(Test-BuildTools)
+if ($missingTools) {
+    throw ("This build needs $($missingTools -join ' and '). Install the Visual Studio Build Tools with " +
+        "'Desktop development with C++' (it includes both), for example from PowerShell:`n" +
+        "winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override `"--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`"`n" +
+        'Then reopen Setup.cmd.')
+}
+
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
 for ($parent = [IO.DirectoryInfo]::new($InstallDir); $parent; $parent = $parent.Parent) {
     if (Test-Path -LiteralPath (Join-Path $parent.FullName '.victory-root')) {
