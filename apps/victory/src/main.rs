@@ -9,6 +9,7 @@ mod run;
 mod shader;
 mod translate;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -81,9 +82,9 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
+        /// Number of worker threads, at least 1 (default: every logical core).
         #[arg(long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
     },
     /// Translate the shaders of a title's archives into the cache and make
     /// their compute pipelines, so that a run finds them there.
@@ -91,9 +92,9 @@ enum Command {
         #[command(flatten)]
         rays: RayOptions,
         paths: Vec<PathBuf>,
-        /// Worker threads (default: every logical core).
+        /// Number of worker threads, at least 1 (default: every logical core).
         #[arg(long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
         /// Only translate: no host pipelines.
         #[arg(long)]
         no_pipelines: bool,
@@ -161,8 +162,20 @@ impl RayOptions {
 }
 
 #[cfg(test)]
-mod ray_cli_tests {
+mod cli_tests {
     use super::*;
+
+    #[test]
+    fn shader_commands_require_positive_worker_counts() {
+        for verb in ["translate", "warm"] {
+            let error = Cli::try_parse_from(["victory", verb, "--jobs", "0"])
+                .err()
+                .expect("--jobs 0 should be rejected");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            assert!(Cli::try_parse_from(["victory", verb]).is_ok());
+            assert!(Cli::try_parse_from(["victory", verb, "--jobs", "1"]).is_ok());
+        }
+    }
 
     #[test]
     fn normal_run_and_warm_keep_cli_precedence() {
@@ -233,10 +246,10 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, jobs.map(NonZeroUsize::get))
         }
         Command::Warm { rays, paths, jobs, no_pipelines } => {
-            translate::warm(paths, jobs, !no_pipelines, rays)
+            translate::warm(paths, jobs.map(NonZeroUsize::get), !no_pipelines, rays)
         }
         Command::Run {
             rays,
