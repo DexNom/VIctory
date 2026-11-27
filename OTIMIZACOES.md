@@ -355,6 +355,36 @@ Três mudanças, todas medidas ou justificadas pela conta acima:
   tinha 23 segundos antes — que é exatamente o que "textura piscando" e
   "textura faltando" parecem.
 
+## Rodada 27/11 — a instrução não era o custo
+
+Duas hipóteses testadas e as duas medidas, para não serem repetidas.
+
+- **`VICTORY_RELAY=2` reprovado.** Mediana 9 fps contra 17,5 do `RELAY=1`, com
+  o pior quadro em 577 ms contra 737 ms. A documentação promete 420→240 ms na
+  referência; nesta máquina ele só piorou. Fica `RELAY=1`.
+- **`rep movsb` trocado por stores AVX2 em `safecopy` — neutro.** O raciocínio
+  era bom: 18.305 cópias por quadro de 453 bytes cada, 2 µs por cópia, e o
+  Zen 3 não tem fast-short-rep (a AMD só ganhou isso no Zen 4). A troca passou
+  nos testes do projeto (`copies_every_length_and_alignment`,
+  `faults_are_failures`) e **não mudou a taxa**: 0,335 ms/MB antes, 0,277 a
+  0,328 depois. Ou seja, a cópia não é limitada por instrução, é limitada por
+  banda de memória — 57,7 MB de cópia por quadro a 3 GB/s é o que a memória
+  entrega com o resto do quadro disputando o controlador. A troca fica (não é
+  pior em nenhuma medição e remove uma penalidade conhecida), mas não é
+  ganho, e não deve ser vendida como tal.
+
+O que a rodada ensinou sobre onde **não** está o custo:
+
+- não está no `rep movsb`;
+- não está no número de locks do `nothing_new` (3 locks sem contenção = ~0,5 ms);
+- não está na falta de paralelismo do `WIDE_BACK` (já vai para ~5 threads em
+  peças de 1 MiB).
+
+O que sobra, medido: **59,4 ms de CPU por quadro** (42,9 de preparo + 16,5 de
+cópia de volta) contra **26,8 ms de placa**, num quadro de 74,9 ms. A placa
+não é o muro; o preparo é, e ele é feito de 3.264 draws traduzidos por quadro
+(8,2 µs de CPU cada) mais 9.749 spans de refresh.
+
 ## Limites conhecidos
 
 - **16 GB é o piso, não o recomendado.** O processo chega a 22 GB privados; o
