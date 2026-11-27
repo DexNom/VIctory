@@ -2,7 +2,8 @@
 param(
     [string] $GamePath,
     [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'DexNom Runtime'),
-    [string] $ShortcutDirectory = [Environment]::GetFolderPath('Programs')
+    [string] $ShortcutDirectory = [Environment]::GetFolderPath('Programs'),
+    [switch] $SkipGpuCheck
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,6 +12,82 @@ if ($env:OS -ne 'Windows_NT' -or ![Environment]::Is64BitOperatingSystem) {
 }
 if (!(Get-Command rustup -ErrorAction SilentlyContinue) -or !(Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw 'Install Rust for Windows from https://rustup.rs, then reopen Setup.cmd.'
+}
+
+# The game needs mesh shaders and Shader Model 6.6. Check before the long build so an unsupported GPU is found early.
+# This only warns; -SkipGpuCheck skips it, and a non-interactive run continues after the warning.
+if (!$SkipGpuCheck) {
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public class VictoryGpuInfo { public string Name; public bool Software; public bool Device; public bool Mesh; public int Model; }
+public static class VictoryGpuProbe {
+    [DllImport("d3d12.dll")] static extern int D3D12CreateDevice(IntPtr a, int fl, ref Guid iid, out IntPtr dev);
+    [DllImport("dxgi.dll")] static extern int CreateDXGIFactory1(ref Guid iid, out IntPtr f);
+    delegate int EnumD(IntPtr s, uint i, out IntPtr a);
+    delegate int DescD(IntPtr s, IntPtr d);
+    delegate int CheckD(IntPtr s, int f, IntPtr d, int n);
+    delegate uint RelD(IntPtr s);
+    static IntPtr Slot(IntPtr o, int i) { return Marshal.ReadIntPtr(Marshal.ReadIntPtr(o), i * IntPtr.Size); }
+    static void Rel(IntPtr o) { if (o != IntPtr.Zero) ((RelD)Marshal.GetDelegateForFunctionPointer(Slot(o, 2), typeof(RelD)))(o); }
+    static int Check(IntPtr dev, int feature, IntPtr p, int n) {
+        return ((CheckD)Marshal.GetDelegateForFunctionPointer(Slot(dev, 13), typeof(CheckD)))(dev, feature, p, n);
+    }
+    public static List<VictoryGpuInfo> Run() {
+        List<VictoryGpuInfo> list = new List<VictoryGpuInfo>();
+        Guid iidF = new Guid("770aae78-f26f-4dba-a829-253c83d1b387"), iidD = new Guid("189819f1-1db6-4b57-be54-1821339b85f7");
+        IntPtr f; if (CreateDXGIFactory1(ref iidF, out f) < 0) return list;
+        EnumD en = (EnumD)Marshal.GetDelegateForFunctionPointer(Slot(f, 12), typeof(EnumD));
+        IntPtr buf = Marshal.AllocHGlobal(512);
+        for (uint i = 0; ; i++) {
+            IntPtr ad; if (en(f, i, out ad) < 0) break;
+            VictoryGpuInfo g = new VictoryGpuInfo();
+            if (((DescD)Marshal.GetDelegateForFunctionPointer(Slot(ad, 10), typeof(DescD)))(ad, buf) >= 0) {
+                g.Name = Marshal.PtrToStringUni(buf, 128).TrimEnd('\0');
+                g.Software = (Marshal.ReadInt32(buf, 304) & 2) != 0;
+            }
+            IntPtr dev;
+            g.Device = D3D12CreateDevice(ad, 0xb000, ref iidD, out dev) >= 0 && dev != IntPtr.Zero;
+            if (g.Device) {
+                IntPtr p = Marshal.AllocHGlobal(8);
+                for (int sm = 0x6A; sm >= 0x60; sm--) {
+                    Marshal.WriteInt32(p, sm);
+                    if (Check(dev, 7, p, 4) >= 0) { g.Model = Marshal.ReadInt32(p); break; }
+                }
+                Marshal.WriteInt64(p, 0);
+                if (Check(dev, 32, p, 8) >= 0) g.Mesh = Marshal.ReadInt32(p) != 0;
+                Marshal.FreeHGlobal(p);
+                Rel(dev);
+            }
+            Rel(ad);
+            list.Add(g);
+        }
+        Marshal.FreeHGlobal(buf);
+        Rel(f);
+        return list;
+    }
+}
+'@
+        $gpus = @([VictoryGpuProbe]::Run() | Where-Object { !$_.Software })
+        if ($gpus.Count -gt 0 -and !($gpus | Where-Object { $_.Device -and $_.Mesh -and $_.Model -ge 0x66 })) {
+            Write-Warning 'No GPU in this PC reports mesh shaders and Shader Model 6.6, which the game needs:'
+            foreach ($gpu in $gpus) {
+                $model = '{0}.{1}' -f (($gpu.Model -shr 4) -band 0xF), ($gpu.Model -band 0xF)
+                Write-Warning ('  {0}: mesh shaders {1}, Shader Model {2}' -f $gpu.Name, $(if ($gpu.Mesh) { 'yes' } else { 'no' }), $(if ($gpu.Device) { $model } else { 'unavailable' }))
+            }
+            Write-Warning 'The game will most likely not start on this GPU. Use -SkipGpuCheck to build anyway.'
+            if ([Environment]::UserInteractive -and ![Console]::IsInputRedirected) {
+                if ((Read-Host 'Continue with the build anyway? (y/N)') -notmatch '^[Yy]') {
+                    Write-Host 'Setup cancelled.'
+                    return
+                }
+            }
+        }
+    } catch {
+        Write-Verbose "GPU check skipped: $($_.Exception.Message)"
+    }
 }
 
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
