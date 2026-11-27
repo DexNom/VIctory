@@ -4259,9 +4259,13 @@ float4 lit() : SV_Target { return 1.0; }
             assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "requested WARP device could not be created");
             return;
         };
-        for (dimension, depth_or_array_size, slices) in [(3, 3, 3), (4, 8, 1)] {
+        // A single 64x64 mip fits a 4 KiB-tiled layout exactly; the same image
+        // in a 64 KiB tile leaves 32 KiB of the guest allocation untouched.
+        for (dimension, depth_or_array_size, slices, mips, layout) in [
+            (3, 1, 1, 1, 0), (3, 1, 1, 1, 0x109), (3, 3, 3, 7, 0), (4, 8, 1, 7, 0),
+        ] {
             let desc = ResourceDesc {
-                dimension, depth_or_array_size, flags: 4, ..texture(64, 64, 16, 7)
+                dimension, depth_or_array_size, layout, flags: 4, ..texture(64, 64, 16, mips)
             };
             let heap = heap(footprint(&desc).unwrap().size);
             let null = std::ptr::null();
