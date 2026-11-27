@@ -1488,9 +1488,21 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`; else a
+/// quarter of the processors, 2 to 6).
+///
+/// A submission's refreshes are spread over these and the submitting thread:
+/// on six cores the default is three, and the refresh was 15 ms of a 75 ms
+/// frame (run cf-13, 40 flushes of 5,800).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4))
+            .clamp(1, 16)
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -5323,6 +5335,21 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
+    }
+    // The PC's own memory, which the card's account does not see. The
+    // world's streaming keeps asking for new windows, and their copies were
+    // 4.6 GB of a 16 GB PC when a driver allocation failed and a host list
+    // did not close (run cf-18: 325 MB free, 25 GB of commit left). Below
+    // 512 MB free, a window that is not there yet is not made: the read
+    // gives zeros until the PC has room again, and `let_go_idle` has been
+    // freeing the windows nothing names since the free memory fell under a
+    // gigabyte.
+    //
+    // 256 MB, not 1,024: this PC holds 0.3-2.0 GB free with the world
+    // loaded, so a 1 GB line left the world's new windows unmade and their
+    // reads zero — the texture flicker of run cf-19c.
+    if crate::host::available_physical_ram().is_some_and(|free| free < (256 << 20)) {
+        return None;
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));

@@ -243,6 +243,7 @@ static class GTA6
         ProfilePicture(start, high);
         ProfileCard(start);
         ProfileMemory(start);
+        ProfileThreads(start);
         ProfileInput(start, panel);
         ProfileKept(start);
     }
@@ -251,7 +252,10 @@ static class GTA6
     static void ProfileFork(ProcessStartInfo start)
     {
         start.EnvironmentVariables["VICTORY_TEXTURE_NO_WAIT"] = "1";
-        start.EnvironmentVariables["VICTORY_RELAY"] = "2";
+        // RELAY=2 desenhou uma parede no lugar errado na documentacao do
+        // proprio fork; 1 e o valor de todas as runs medidas aqui (cf-11 em
+        // diante): GPU de 22-68% para 85-100%.
+        start.EnvironmentVariables["VICTORY_RELAY"] = "1";
         start.EnvironmentVariables["VICTORY_WIDE_BACK"] = "1";
         start.EnvironmentVariables["VICTORY_CARD_REHASH_RUNS"] = "1";
         start.EnvironmentVariables["VICTORY_JOIN_COPIES"] = "1";
@@ -260,7 +264,12 @@ static class GTA6
         start.EnvironmentVariables["VICTORY_CARD_STEPS"] = "2";
         start.EnvironmentVariables["VICTORY_INDIRECT_BATCH"] = "2";
         start.EnvironmentVariables["VICTORY_MAP_THREADS"] = "1";
-        start.EnvironmentVariables["VICTORY_TITLE_PRIORITIES"] = "0";
+        // TITLE_PRIORITIES=1 (run cf-13): com 0 as threads do titulo ficam em
+        // IDLE (-15) e o `xmem::lift_thread` (que so levanta -2..0) nunca as
+        // sobe; com o padrao elas ficam em BELOW_NORMAL e vao a ABOVE_NORMAL.
+        // A fila "waiting for their memory" caiu de 22.096 para ~1.000 sem
+        // custo no tempo de quadro.
+        start.EnvironmentVariables["VICTORY_TITLE_PRIORITIES"] = "1";
         start.EnvironmentVariables["VICTORY_CARD_AWAKE"] = "1";
         start.EnvironmentVariables["VICTORY_THIN"] = "1";
         // O corte das listas em partes (1 a 3 ms por quadro) e o bercario de
@@ -295,26 +304,40 @@ static class GTA6
         // desenhar 720p inteiro custa quase nada e tira o serrilhado.
         start.EnvironmentVariables["VICTORY_OUTPUT"] = high ? "1920x1080" : "1280x720";
         start.EnvironmentVariables["VICTORY_UPSCALER"] = "6";
-        start.EnvironmentVariables["VICTORY_RENDER_SCALE"] = high ? "0.85" : "1.0";
+        // 1.0 desenha 1280x720 inteiro, 1:1. A 0.8 (1024x576) o upscaler do
+        // proprio titulo (6) estica e aplica nitidez: a imagem fica dura, com
+        // halo nos fios de cabelo. O ganho de fps da 0.8 nao se paga: no
+        // mundo a CPU e a parede (41-50 ms de preparo contra 30-37 de GPU),
+        // entao a placa tem folga para desenhar 720p inteiro.
+        start.EnvironmentVariables["VICTORY_RENDER_SCALE"] = "1.0";
         // A biblioteca de pipelines: 200 e poucos MB de disco que valem a fila
         // inteira. STORE_LATER entrega a pipeline na hora e a grava com o save,
         // em vez de segurar o quadro esperando o disco.
         start.EnvironmentVariables["VICTORY_LIBRARY"] = "1";
         start.EnvironmentVariables["VICTORY_LIBRARY_STORE_LATER"] = "1";
-        start.EnvironmentVariables["VICTORY_PIPELINE_WORKERS"] = "10";
     }
 
     // A placa de 8 GB e o que ela guarda.
     static void ProfileCard(ProcessStartInfo start)
     {
-        // 512 MB, nao os 3.072 do padrao: num cartao de 8 GB com 6,8 em uso, o
-        // espaco reservado para alvos que ainda nao existem e o que falta para
-        // a fila de textura. 95% e o teto pratico (97 e o maximo do knob).
-        start.EnvironmentVariables["VICTORY_CARD_ROOM_FOR_TARGETS_MB"] = "512";
-        start.EnvironmentVariables["VICTORY_TEXTURE_ROOM_PERCENT"] = "95";
-        start.EnvironmentVariables["VICTORY_MEMORY_CARD_MB"] = "2048";
-        start.EnvironmentVariables["VICTORY_CARD_WINDOWS_MB"] = "512";
-        start.EnvironmentVariables["VICTORY_CARD_BUFFERS_MB"] = "256";
+        // A 95% a fila enchia o cartao ate a linha e todo alvo ou copia que o
+        // host fizesse depois era recusado: textura expulsa e subida de novo
+        // (15.462 esperando, 5.655 MB enviados na run cf-1). 90%, com a dieta
+        // menor abaixo (cf-12/cf-13), deixa ~1 GB e o orcamento nunca mais foi
+        // o gatilho em run nenhuma depois disso.
+        start.EnvironmentVariables["VICTORY_TEXTURE_ROOM_PERCENT"] = "90";
+        start.EnvironmentVariables["VICTORY_CARD_ROOM_FOR_TARGETS_MB"] = "768";
+        // 128, nao os 1.536 do perfil antigo: o espaco guardado para alvos que
+        // ainda nao existem e o que a fila de textura nao tem num cartao de
+        // 8 GB.
+        start.EnvironmentVariables["VICTORY_MEMORY_CARD_MB"] = "128";
+        start.EnvironmentVariables["VICTORY_CARD_WINDOWS_MB"] = "96";
+        // 768 MB de buffers no cartao, e MIN_MB=1 para o pool poder encher ate
+        // a linha: com o pool em 192 MB a varredura de escrita dos shaders
+        // virou thrash (cf-4). Com 768 a varredura caiu de 66,6 ms/658 MB
+        // para 3,2 ms/30 MB (cf-12).
+        start.EnvironmentVariables["VICTORY_CARD_BUFFERS_MB"] = "768";
+        start.EnvironmentVariables["VICTORY_CARD_BUFFERS_MIN_MB"] = "1";
     }
 
     // Os 16 GB de RAM: tudo o que o host guarda, pequeno. Sem
@@ -326,13 +349,55 @@ static class GTA6
     {
         start.EnvironmentVariables["VICTORY_UPLOAD_AHEAD"] = "1";
         // 16 GB: o que da para encolher sem tirar nada do jogo.
-        start.EnvironmentVariables["VICTORY_KEEP_SNAPSHOTS_MB"] = "32";
+        // O snapshot dos buffers que os shaders escrevem era refeito inteiro
+        // (339 MB) por quadro para achar os ~11 MB que mudaram: 55 ms de um
+        // quadro de 134 (run cf-3). Com o relay (RELAY=1) as copias voltam
+        // numa thread propria, e guardar o snapshot desliga o relay
+        // (`shadow::relay`/`keeps`): a GPU foi de 22-68% para 85-100% com
+        // KEEP_SNAPSHOTS=0 (cf-11).
+        start.EnvironmentVariables["VICTORY_KEEP_SNAPSHOTS"] = "0";
+        // O titulo commita 22 GB nesta maquina de 16. O que sobra vai para o
+        // pagefile, e com a RAM cheia cada chamada de lista passou de 21 us:
+        // 41.283 chamadas por quadro custavam 897,7 ms somados (run cf-1).
+        // Soltar as listas paradas derrubou isso para 316,3 ms com as mesmas
+        // ~40.000 chamadas (run cf-3).
+        start.EnvironmentVariables["VICTORY_LIST_IDLE_TRIM_S"] = "10";
+        start.EnvironmentVariables["VICTORY_LIST_IDLE_MOST"] = "192";
+        // VICTORY_WINDOW_KB=256 foi medido e e PIOR (cf-16): 6.224 janelas de
+        // 256 KiB para 4.081 MB contra 1.130 de 4 MiB para 4.724 MB no cf-15 —
+        // economiza 643 MB de dados e custa 5,5x mais janelas e 2,6x mais
+        // buffers compartilhados (42.594 shared/28.615 MB contra 16.259/
+        // 10.818), e o heap pass foi de ~10 ms para 176 ms. Fica nos 4 MiB.
+        // Blocos de textura feitos adiantados (64 MiB cada).
+        start.EnvironmentVariables["VICTORY_RIPE_BLOCKS"] = "4";
+        // O anel de constantes do titulo e' reaproveitado, entao os dois testes
+        // do FILL_TITLE=1 (`written_since_taken`, `!landed_lately`) nunca
+        // passavam e 22 a 24 ms por quadro iam em espera por um fill de 80
+        // bytes. =2 deixa so o tamanho decidir (ate' 64 KiB): as esperas
+        // desapareceram na run cf-18.
+        start.EnvironmentVariables["VICTORY_FILL_TITLE"] = "2";
+        // Um buffer de leitura cresce ate a maior textura que a thread leu e fica.
+        start.EnvironmentVariables["VICTORY_READ_KEEP_MB"] = "64";
         // Duas texturas com as mesmas palavras de descricao, mudando so o
         // "filler", viravam dois recursos e duas copias (8.438 delas na run 15).
         start.EnvironmentVariables["VICTORY_PLACED_FILLER"] = "1";
         // Um pipeline que falta faz o draw sumir; 1 s de espera por quadro
         // custa menos que um personagem sem corpo na cutscene.
         start.EnvironmentVariables["VICTORY_PIPELINE_WAIT_MS"] = "1000";
+    }
+
+    // As threads: 6 nucleos, 12 threads de hardware.
+    static void ProfileThreads(ProcessStartInfo start)
+    {
+        // O padrao do fork e dimensionado para um 12900K de 24 threads. Aqui
+        // ele punha ~30 threads prontas em 12 e a thread que submete (a parede
+        // do quadro) era preemptada: 550 ms de um quadro de 1.070 esperando no
+        // present (run cf-1).
+        start.EnvironmentVariables["VICTORY_THIN_THREADS"] = "6";
+        start.EnvironmentVariables["VICTORY_PIPELINE_WORKERS"] = "4";
+        start.EnvironmentVariables["VICTORY_LAND_THREADS"] = "2";
+        start.EnvironmentVariables["VICTORY_UNDER_THREADS"] = "3";
+        start.EnvironmentVariables["VICTORY_VIEW_THREADS"] = "3";
     }
 
     // Entrada, painel e o quanto o runtime fala.

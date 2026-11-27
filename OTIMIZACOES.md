@@ -251,6 +251,38 @@ Ou use o perfil pronto:
 
 ---
 
+## Memória: o que a medição de 26/11 mudou
+
+O perfil antigo tratava o *commit* do Windows como se fosse RAM. Não é: com
+40 GB de arquivo de paginação o commit nunca acaba, e o processo chegou a
+21,5 GB privados com 325 MB de RAM livre — o driver recusou alocar, a lista
+não fechou (`0x8007000E`) e o cartão saiu.
+
+O que passou a valer:
+
+- **`residency` lê o menor entre commit e RAM livre.** Todo portão do arquivo
+  (reserva de upload, reserva de crescimento, estado crítico) usava
+  `ullAvailPageFile`. Agora usa `min(ullAvailPageFile, ullAvailPhys)`, e o
+  estado crítico dispara abaixo de 1,5 GB efetivos.
+- **Janelas fora de buffers não nascem abaixo de 1 GB livre.** Eram 4,6 GB de
+  cópias num PC de 16 GB. A leitura devolve zeros até a RAM voltar, e a janela
+  é feita depois.
+- **O pass de texturas não varre slot nenhum quando a placa não tem sala.**
+  Era 43 a 176 ms de quadro lendo 48 KiB por slot para não subir nada.
+- **`VICTORY_FILL_TITLE=2`.** O anel de constantes do título é reaproveitado,
+  então os dois testes do `=1` nunca passavam e 22 a 24 ms por quadro iam em
+  espera. `=2` deixa só o tamanho decidir (até 64 KiB).
+
+### Memória do título em place: o censo
+
+`VICTORY_INPLACE_PROBE=1` mediu o que poderia ser aberto como heap da placa,
+sem cópia: 3.410 buffers de 736 MB, 3.281 de 217 MB privados commitados
+inteiros, e 37.468 views de páginas físicas somando 6,5 GB. Mas o pool do
+título é uma seção `SEC_RESERVE` (3.977 MB numa view só), e
+`OpenExistingHeapFromFileMapping` recusa seção reservada, enquanto abrir por
+endereço trava cada página na RAM e impede o título de descommitar. Não é
+caminho para o pool que faz streaming — e o probe em si custa 256 MB travados.
+
 ## Limites conhecidos
 
 - **16 GB é o piso, não o recomendado.** O processo chega a 22 GB privados; o

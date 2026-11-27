@@ -576,6 +576,9 @@ pub(crate) fn is_skipped(this: This) -> bool {
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_drop(this: This) {
+    if !drops_this_frame() {
+        return;
+    }
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
@@ -589,9 +592,31 @@ pub(crate) fn note_drop(this: This) {
     }
 }
 
-/// Counts a draw or dispatch dropped for `why` (diagnostics).
+/// Whether a drop this frame is worth naming: [`DROPS_A_FRAME`] a frame,
+/// no more. A world's first minutes drop three thousand draws a frame
+/// (run cf-17) and naming each is a `String`, a global lock and a map
+/// insert, 20 ms of the frame that the build without diagnostics does not
+/// pay. The counts stay right; only the reasons of the first few hundred
+/// are named.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn drops_this_frame() -> bool {
+    const DROPS_A_FRAME: u64 = 256;
+    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let frame = crate::frame::current();
+    if FRAME.swap(frame, std::sync::atomic::Ordering::Relaxed) != frame {
+        COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < DROPS_A_FRAME
+}
+
+/// Counts a draw or dispatch dropped for `why` (diagnostics). See
+/// [`drops_this_frame`] for the cap.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
+    if !drops_this_frame() {
+        return;
+    }
     crate::capture::op(0, || format!("DROPPED {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;

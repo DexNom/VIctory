@@ -1177,6 +1177,7 @@ mod host {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, SetCursorPos,
+        ShowCursor,
     };
 
     use super::*;
@@ -1350,12 +1351,44 @@ mod host {
     struct Mouse {
         last: Option<(i32, i32)>,
         center: Option<(i32, i32)>,
+        /// Where the cursor stood when the look took it, and whether the
+        /// look has it hidden.
+        saved: Option<(i32, i32)>,
+        hidden: bool,
     }
 
     impl Mouse {
+        /// Hides or shows the host's cursor, counting only its own change.
+        /// The look warps the cursor to the middle of the window on every
+        /// poll, so a visible one sat dead centre of the picture.
+        fn cursor(&mut self, hidden: bool) {
+            if self.hidden == hidden {
+                return;
+            }
+            self.hidden = hidden;
+            if hidden {
+                let mut at = POINT::default();
+                // SAFETY: room for the point.
+                if unsafe { GetCursorPos(&mut at) } != 0 {
+                    self.saved = Some((at.x, at.y));
+                }
+                // SAFETY: a plain call; the counter is the process's own.
+                unsafe { ShowCursor(0) };
+            } else {
+                // SAFETY: a plain call, the pair of the one above.
+                unsafe { ShowCursor(1) };
+                if let Some((x, y)) = self.saved.take() {
+                    // SAFETY: a plain call; the cursor goes back where the
+                    // hand left it, not to the middle of the window.
+                    unsafe { SetCursorPos(x, y) };
+                }
+            }
+        }
+
         fn poll(&mut self) -> Pointer {
             let mut pointer = Pointer::default();
             if !focused() {
+                self.cursor(false);
                 self.last = None;
                 self.center = None;
                 return pointer;
@@ -1365,20 +1398,24 @@ mod host {
             // SAFETY: plain queries.
             pointer.right = unsafe { GetAsyncKeyState(i32::from(VK_RBUTTON)) } < 0;
             if !look_enabled() {
+                self.cursor(false);
                 self.last = None;
                 self.center = None;
                 return pointer;
             }
             // SAFETY: a plain query.
             if unsafe { GetAsyncKeyState(i32::from(VK_ESCAPE)) } < 0 {
+                self.cursor(false);
                 self.last = None;
                 self.center = None;
             }
             if !pointer.right {
+                self.cursor(false);
                 self.last = None;
                 self.center = None;
                 return pointer;
             }
+            self.cursor(true);
             let mut at = POINT::default();
             // SAFETY: room for the point.
             if unsafe { GetCursorPos(&mut at) } == 0 {
@@ -1402,6 +1439,13 @@ mod host {
             // SAFETY: a plain call; a window that went away leaves the cursor.
             unsafe { SetCursorPos(center.0, center.1) };
             pointer
+        }
+    }
+
+    impl Drop for Mouse {
+        fn drop(&mut self) {
+            // A cursor left hidden would outlive the title's window.
+            self.cursor(false);
         }
     }
 

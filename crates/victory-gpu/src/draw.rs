@@ -2642,7 +2642,22 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
-        let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+        // With no room on the card nothing here can be uploaded, and the
+        // slots' walk is the expensive half of this pass: reading 48 KiB of
+        // each for its fingerprint, asking the kernel where its memory is.
+        // With the card full (run cf-16) it was 43 to 176 ms of a frame and
+        // bought nothing; the held slots are due again the frame room
+        // comes back (`texture_slots_room`).
+        let (mut due, census) = host.texture_slots_due(
+            frame,
+            if !room {
+                0
+            } else if baking {
+                1 << 16
+            } else {
+                4096
+            },
+        );
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if baking {
@@ -2718,12 +2733,37 @@ impl State {
             )
         };
 
+        // The recheck of a slot already uploaded reads 48 KiB of its memory
+        // for a fingerprint (the title may fill a texture after its view was
+        // written, with nothing from the runtime to tell of it). A pass with
+        // thousands due read hundreds of MB to find the few that changed:
+        // 35 ms of a frame in the world, beside the recording and waited for
+        // at the lists' close. Past this many bytes the rest wait for the
+        // next frame: they are the oldest of the queue, and the uploads of
+        // the pass are bounded by the staging bytes anyway, so a frame that
+        // stops looking here stages no less than one that does not.
+        // `VICTORY_RECHECK_MB=0`: no bound, as before.
+        static RECHECK_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let recheck_at_most = *RECHECK_MB.get_or_init(|| {
+            std::env::var("VICTORY_RECHECK_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(|mb| mb << 20)
+        });
+        let mut looked = 0u64;
         let began = std::time::Instant::now();
         if sync.is_none() {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
         for (index, write) in due {
+            // A slot with nothing checked is uploaded below, not looked at:
+            // only the rechecks are bounded.
+            let checked = host.texture_slot_checked(index);
+            if checked.is_some() && recheck_at_most.is_some_and(|most| looked >= most) {
+                served = false;
+                break;
+            }
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
                 break;
@@ -2753,7 +2793,8 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            if let Some((at, len, print, looks, uploaded)) = checked {
+                looked = looked.saturating_add(len.min(48 << 10));
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {

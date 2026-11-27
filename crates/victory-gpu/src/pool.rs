@@ -377,6 +377,25 @@ impl Drop for StagingPiece {
     }
 }
 
+/// The most blocks of staging memory that may be alive at once. A block is
+/// 64 MiB of the PC's memory whether one piece of it is used or all of it,
+/// and the pool never let one go: a block with a piece resting is not
+/// wholly free, and a piece rests 2.5 s. Run cf-19b held 60 of them (3,840
+/// MB) for 61 MB of live pieces, on a PC with 507 MB free. At the cap a
+/// texture gets an upload buffer of its own size instead, which is what the
+/// block was for; when that cannot be had either, the upload waits a frame
+/// (`crate::residency`).
+fn staging_most() -> usize {
+    let free_mib = crate::host::available_physical_ram().map_or(u64::MAX, |b| b >> 20);
+    if free_mib < 1024 {
+        2
+    } else if free_mib < 2048 {
+        4
+    } else {
+        16
+    }
+}
+
 /// `bytes` of upload memory, all zeros: the buffer it lies in, where in
 /// that buffer, and its mapping. `None`: not pooled.
 pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
@@ -385,7 +404,17 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let mut pool = lock(&STAGING);
+    if pool.blocks() >= staging_most() {
+        // What is wholly free goes now, rather than at the next second's
+        // `room`, and if the cap still stands this texture takes a buffer
+        // of its own size.
+        pool.reclaim(now(), 0, true);
+        if pool.blocks() >= staging_most() {
+            return None;
+        }
+    }
+    let (piece, memory, again) = pool.take(bytes, 512, now(), || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
@@ -397,6 +426,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;
+    drop(pool);
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };

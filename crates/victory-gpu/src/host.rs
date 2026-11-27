@@ -3051,7 +3051,9 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
 /// flights when the title itself wrote the memory since they were given it
-/// (`VICTORY_FILL_TITLE=1`; off by default).
+/// (`VICTORY_FILL_TITLE=1`; off by default). `=2`: any small fill of
+/// upload memory goes on, without either test (see below for what that
+/// costs).
 ///
 /// The title's 174 MB heap is declared written as a whole (a root view has
 /// no size), and the title keeps a ring of constants in it: one fill of 480
@@ -3065,14 +3067,25 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// the wait, for constants at the end of a 64 KiB page that the title wrote
 /// before the page was taken.
 ///
-/// What can go wrong: a constant a flight's shader really writes, in a
-/// block that the title (or an earlier flight's copy-back) also wrote, or
-/// for the first time, is read as it was before that flight.
+/// Both tests fail on the fills that matter here (run cf-17: 22.2 and 23.9
+/// ms a frame waiting on one 80-byte fill): the title's ring is reused, so
+/// a flight's shader has written the block within 600 frames, and the
+/// write is declared over the heap's whole 182 MB, so
+/// [`crate::watch::landed_lately`] answers yes for every block in it.
+/// `=2` drops both: what can go wrong is a fill's bytes read as the shader
+/// left them instead of as the title wrote them, which is one frame of a
+/// constant.
 fn fill_is_titles(src: usize, len: usize) -> bool {
     const SMALL: usize = 64 << 10;
-    static ON: OnceLock<bool> = OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_TITLE").is_some_and(|v| v == "1"));
-    on && len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        std::env::var("VICTORY_FILL_TITLE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    });
+    match on {
+        2 => len <= SMALL,
+        1 => len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600)),
+        _ => false,
+    }
 }
 
 /// Diagnostics: the waits for flights, by what waited, why it was not done

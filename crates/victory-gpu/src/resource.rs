@@ -1755,6 +1755,19 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
+    // Nothing new while the PC is down to its last 256 MB, floor or no
+    // floor: a copy that costs a page fault a frame is worse than one that
+    // waits, and the world load that filled the pagefile removed the card
+    // (run cf-15). The floor below is a floor on the card's memory, not on
+    // the PC's, and the two are not the same account.
+    //
+    // 256 MB, not 2,048: 0.3-2.0 GB free is this PC's steady state with the
+    // world loaded (runs cf-19c and play2). At a 2 GB line this gate was
+    // shut for the whole run — no host copy was ever made, and 21,239
+    // textures waited for their memory while the screen flickered.
+    if crate::host::available_physical_ram().is_some_and(|free| free < (256 << 20)) {
+        return false;
+    }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
     if filled < floor {
         return true;
@@ -2111,6 +2124,24 @@ pub(crate) fn let_go_idle() {
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
+    };
+    // The PC's own memory, which the card's account does not see: a world
+    // load took this process to 23 GB of 16 (run cf-15), the allocations
+    // for uploads began to fail, frames went over a second and the card
+    // was removed. The card's line said there was room all the while. Two
+    // floors, by how much of the PC is left, each cutting idle copies to
+    // an age and a size that leave the title its own memory back.
+    //
+    // Measured (run cf-19c and play2): 0.3-2.0 GB free is this PC's steady
+    // state with the world loaded, so any floor near a gigabyte is always
+    // crossed and the copies it cuts are what the world flickers with. Only
+    // the last 256 MB cuts: idle 500 ms and down to 192 MB.
+    let (idle_ms, most) = match crate::host::available_physical_ram() {
+        Some(free) if free < (256 << 20) => {
+            let filled = KINDS[1].load(Relaxed);
+            (idle_ms.min(500), most.min(filled.saturating_sub(192 << 20)))
+        }
+        _ => (idle_ms, most),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
