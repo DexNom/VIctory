@@ -65,6 +65,45 @@ Por crate, os diferentes: `victory-gpu` 49, `victory-shader` 18, `victory-hle` 6
 
 É um merge viável — não é um fork reescrito.
 
+## `onlycheat/`
+
+| | |
+|---|---|
+| origem | https://github.com/Amdavea/onlycheat |
+| commit | `081cf56` (onlycheat v1.0.2) |
+| licença | GPL-3.0-or-later |
+| layout | igual ao nosso, mais `runtime-rs-nvidia/` e `start-nvidia.bat` |
+
+É o VIctory-NVIDIA (`trustno1-coder`, `d12eb1b`) com **DLSS e geração de quadros**, mais o
+medidor de desempenho do autor (`scripts/medidor.ps1`, `janela.ps1`).
+
+O que interessa de lá:
+
+- **`victory-hle/src/modules/fidelityfx.rs`** e **`victory-gpu/src/streamline/fsr.rs`** — geração de
+  quadros por **FSR 3**, que é o caminho que funciona em RTX 20/30 (DLSS FG exige RTX 40+).
+- **`start-nvidia.bat`, variável `AUTOR`** — 30 switches medidos pelo autor. Dezoito deles não
+  existem no nosso código:
+
+  `WC_NO_BACK`, `SOFT_VIEWS`, `PRELUDE_UPLOADS`, `SHOW_NEW_LATER`, `POOL_SMALL`, `TABLED_REREAD`,
+  `QUEUE_HOST_TEXTURES`, `HEAP_SYNC_FIRST`, `SYNC_IN_PLACE`, `SPANS_QUICK`, `SYNC_FINE`,
+  `HEAP_SYNC_AT_SUBMIT`, `EARLY_DEPTH`, `LEAVE_OUT`, `FRAME_INTERVAL_US`, `DLSS`, `FRAMEGEN`,
+  `MENU_FRAMEGEN`, `NATIVE_1440P`, `AMBIENT_SPECULAR`.
+
+  Cinco deles (`HEAP_SYNC_FIRST`, `SYNC_IN_PLACE`, `SYNC_FINE`, `HEAP_SYNC_AT_SUBMIT`,
+  `SPANS_QUICK`) são exatamente o `heap buffers`/`sync_heaps` — a parte mais cara do nosso quadro.
+- **`VICTORY_LEAVE_OUT=<hash>,<hash>`** — a versão genérica do nosso water light: em vez de dois
+  hashes fixos no código, uma lista por variável de ambiente.
+- **`docs/bug-journal.md`** e **`docs/findings.md`** — o caderno de medição deles.
+
+## Diff atual entre `onlycheat/crates` e `crates/`
+
+| | |
+|---|---|
+| arquivos iguais | 149 |
+| arquivos diferentes | 64 |
+| só deles | 16 |
+| só nossos | 6 |
+
 ## Política de porte
 
 1. Nada entra sem medição. O chão atual é ~88-90 ms/frame (11,3 fps) com

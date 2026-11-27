@@ -1,0 +1,8 @@
+onlycheat v1.0.2 (2026-11-27, tag git onlycheat-v1.0.2): VIctory-NVIDIA (trustno1-coder d12eb1b) com DLSS e geracao de quadros.
+Igual a v1.0.1, mais: o titulo da janela termina em " - ONLYCHEAT".
+Para rodar: extraia este zip dentro de D:\torrents\onlycheat e abra start-nvidia.bat (opcao 1: Series S + DLSS Qualidade + geracao 2x).
+O jogo abre pelo medidor (scripts\medidor.ps1): janela de medicao ao lado e ajuste da tela (scripts\janela.ps1, posicao em janela.json).
+O cache de shaders (.cache\nvidia) nao vem no zip: a primeira abertura monta os shaders de novo (alguns minutos).
+runtime-rs-nvidia\nvidia-sdk: arquivos da NVIDIA (Streamline 2.14.16, DLSS 310.9.16), com as licencas ao lado; so para uso pessoal.
+No jogo: F1 menu (nao ligar RAY TRACING), F3 fps e tempos.
+O codigo do runtime fica no git local do projeto (tag onlycheat-v1.0.2).
