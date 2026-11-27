@@ -617,7 +617,10 @@ impl Layout {
 
     fn render_xor_offset(&self, mip: &Mip, x: u32, y: u32) -> u64 {
         let [w, h, _] = self.block;
-        let block = u64::from(y / h) * u64::from(mip.pitch / w) + u64::from(x / w);
+        // Tile dimensions are powers of two. This runs for every 16-byte copy.
+        let width_shift = w.trailing_zeros();
+        let block_row = u64::from(y >> h.trailing_zeros()) * u64::from(mip.pitch >> width_shift);
+        let block = block_row + u64::from(x >> width_shift);
         let ox = &self.pattern[0];
         let oy = &self.pattern[1];
         block * self.alignment + u64::from(ox[x as usize & (ox.len() - 1)] ^ oy[y as usize & (oy.len() - 1)])
@@ -751,11 +754,17 @@ impl Layout {
         if self.desc.swizzle == Swizzle::SW_64KB_R_X {
             // The low four byte-address bits are column/element bits only.
             // All supported element sizes therefore have 16-byte runs.
+            let full = bytes / 16 * 16;
+            let shift = n.trailing_zeros();
             for y in 0..m.height {
-                for x in (0..m.width).step_by(16 / n) {
-                    let lx = x as usize * n;
-                    let at = self.render_xor_offset(m, x, y) as usize;
-                    copy(at, y as usize * row_pitch + lx, 16.min(bytes - lx));
+                let row = y as usize * row_pitch;
+                for lx in (0..full).step_by(16) {
+                    let at = self.render_xor_offset(m, (lx >> shift) as u32, y);
+                    copy(at as usize, row + lx, 16);
+                }
+                if full < bytes {
+                    let at = self.render_xor_offset(m, (full >> shift) as u32, y);
+                    copy(at as usize, row + full, bytes - full);
                 }
             }
             return Ok(());
