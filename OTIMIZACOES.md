@@ -730,20 +730,28 @@ Medido em 27/11, com o binário release desta árvore:
 |---|---|---|
 | `known-pipelines.bin` (48 MB) | `victory warm --used --limit 20` | 20 feitas, 0 sem host pipeline, 0 ruins |
 | `known-shaders.bin` (189 MB) | o mesmo | 20 feitas (o tradutor gera o mesmo container) |
-| `host-pipelines.bin` (341 MB) | primeiros 48 bytes idênticos | carrega no `CreatePipelineLibrary` |
+| `host-pipelines.bin` (341 MB) | carrega (`mapped=true`), mas so 16 das 3.549 pipelines iniciais sao achadas pelo nome | **nao entra** - ver abaixo |
 | `early-pipelines.txt` (3.543) | união com o nosso (1.948) | 3.549 hashes |
 
 O `GTA6.exe` agora faz duas coisas com isso:
 
 1. `ImportScarlettCache()` no Setup: se o ScarlettPort estiver instalado, copia
-   o livro, os shaders e a biblioteca de host. Sem ele, nada muda.
+   o livro (known-pipelines.bin), os shaders (known-shaders.bin) e une
+   a lista de hashes. Sem ele, nada muda.
 2. `--prepare` roda `victory shaders <shaders.rpf>` **antes** do `warm --used`,
    como o "Build shaders" deles (`scarlett warm`, 25.889 shaders em 171 s).
    Era o passo que faltava para o cache ser construído em vez de improvisado.
 
-**O que ainda falta validar:** a biblioteca de host de 341 MB numa partida. Se o
-driver recusar, o runtime abre uma vazia e o número volta ao de antes — sem
-dano, só sem o ganho.
+**A biblioteca de host de 341 MB não entra.** Medido em 27/11 (`soak24`): ela
+carrega - `host pipeline library loaded bytes=358274130 mapped=true` - mas só
+**16 das 3.549** pipelines iniciais são achadas pelo nome. As descrições que o
+nosso runtime monta não batem com as que a deles gravou, então o `LoadPipeline`
+devolve erro para quase tudo. E o custo é real: 341 MB de páginas mapeadas
+disputando memória com o título levaram o quadro de **88-90 ms para 178 ms**
+(6,2 fps, `dropped 1311`), com `host memory pressure` já no quadro 49.
+
+A biblioteca é construída pelo uso, no nosso formato. O que sobra do ScarlettPort
+é o livro e os shaders: eles poupam a tradução, não a criação.
 
 ## Limites conhecidos
 

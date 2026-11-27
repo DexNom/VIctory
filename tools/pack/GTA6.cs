@@ -208,16 +208,13 @@ static class GTA6
             }
             File.Copy(from, to, true);
         }
-        // A biblioteca de pipelines de host: so entra se a nossa for menos da
-        // metade da deles. Uma biblioteca nossa ja tem as pipelines do nosso
-        // perfil e cresce com o uso; nao se troca por uma menor.
-        string library = Path.Combine(theirs, "host-pipelines.bin");
-        string target = Path.Combine(ours, "host-pipelines.bin");
-        if (File.Exists(library)
-            && (!File.Exists(target) || new FileInfo(target).Length * 2 < new FileInfo(library).Length))
-        {
-            File.Copy(library, target, true);
-        }
+        // A biblioteca de host NAO entra. Medido em 27/11 (soak24): a deles
+        // carrega (358 MB, mapped=true), mas so 16 das 3.549 pipelines
+        // iniciais sao encontradas pelo nome - as descricoes que o nosso
+        // runtime monta nao batem com as que a deles gravou. O custo e real:
+        // 341 MB de paginas mapeadas disputando memoria com o titulo, e o
+        // quadro foi de 88-90 ms para 178 ms. So os livros de shader e a
+        // lista de hashes entram; a biblioteca e construida pelo uso.
         // Os hashes que os quadros desenham primeiro: a uniao dos dois.
         string earlyTheirs = Path.Combine(theirs, "early-pipelines.txt");
         if (File.Exists(earlyTheirs))

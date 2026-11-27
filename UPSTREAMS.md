@@ -170,7 +170,7 @@ byte por byte. Testado com o binário release desta árvore:
 |---|---|---|
 | `known-pipelines.bin` (48 MB, 83.561 pipelines) | `victory warm --used --limit 20` com o livro deles | 20 feitas, 0 sem host pipeline, 0 ruins |
 | `known-shaders.bin` (189 MB) | o mesmo, lendo os containers deles | 20 feitas |
-| `host-pipelines.bin` (341 MB) | os primeiros 48 bytes são idênticos aos do nosso | **aceito em partida**: `host pipeline library loaded bytes=358274130 mapped=true` |
+| `host-pipelines.bin` (341 MB) | carrega (`mapped=true`), mas **so 16 das 3.549** pipelines iniciais sao achadas pelo nome | **nao entra**: as descricoes do nosso runtime nao batem com as que a deles gravou. Custo medido: 88-90 ms/frame virou 178 ms (soak24), com 341 MB de paginas disputando memoria |
 | `early-pipelines.txt` (3.543) | união com o nosso (1.948) = 3.549 | 6 hashes só nossos |
 
 O `known-shaders.bin` deles referencia 105.151 containers; o nosso tradutor gera ~26.000 a
