@@ -132,7 +132,8 @@ trait Source: Send {
         None
     }
     /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Motor speeds; `triggers` are the Xbox trigger motors (left, right).
+    fn rumble(&mut self, slot: usize, low: u16, high: u16, triggers: [u16; 2]);
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -586,7 +587,7 @@ fn host() -> Box<dyn Source> {
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: u16, _: u16, _: [u16; 2]) {}
     }
     Box::new(Nothing)
 }
@@ -969,24 +970,23 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; the title sends trigger levels in slot 0x50.
+// shortcut: XInput has no trigger motors, so an Xbox pad drops them (the host
+// API for them is Windows.Gaming.Input). A DualSense plays them as
+// adaptive-trigger vibration.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let [low, high, left, right] = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    lock(&device.hub().source).rumble(device.index, speed(low), speed(high), [speed(left), speed(right)]);
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1264,7 +1264,16 @@ mod host {
         }
 
         fn native_pad(&mut self) -> Option<PadState> {
-            self.dualsense.poll()
+            #[allow(unused_mut)]
+            let mut pad = self.dualsense.poll()?;
+            // The scripted keys press its buttons too, as for XInput slot 0.
+            #[cfg(feature = "diagnostics")]
+            for vk in scripted() {
+                if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                    pad.buttons |= button;
+                }
+            }
+            Some(pad)
         }
 
         #[cfg(feature = "diagnostics")]
@@ -1299,13 +1308,23 @@ mod host {
                 .poll(PATH.as_deref()?, Instant::now(), stand_in_connected)
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+        fn rumble(&mut self, slot: usize, low: u16, high: u16, triggers: [u16; 2]) {
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,
             };
             // SAFETY: a valid vibration; an empty slot just fails.
-            unsafe { XInputSetState(slot as u32, &speeds) };
+            let missing = unsafe { XInputSetState(slot as u32, &speeds) } != 0;
+            // The DualSense stands in for the first pad when XInput has none.
+            if missing && slot == 0 {
+                let level = |speed: u16| (speed >> 8) as u8;
+                self.dualsense.rumble(dualsense::Motors {
+                    low: level(low),
+                    high: level(high),
+                    left_trigger: level(triggers[0]),
+                    right_trigger: level(triggers[1]),
+                });
+            }
         }
     }
 
@@ -1411,7 +1430,7 @@ mod tests {
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+        fn rumble(&mut self, slot: usize, low: u16, high: u16, _: [u16; 2]) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
         }
     }
