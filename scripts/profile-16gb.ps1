@@ -65,10 +65,33 @@ $settings = @{
     # 128, not the default 3,072: the room held for targets that do not exist
     # yet is what the texture queue lacks on 8 GB.
     VICTORY_MEMORY_CARD_MB = '128'
-    VICTORY_CARD_WINDOWS_MB = '96'
-    # 768 MB of card buffers, and `CARD_BUFFERS_MIN_MB=1` so the pool may fill
+    VICTORY_CARD_WINDOWS_MB = '256'
+    # 1024 MB of card buffers, and `CARD_BUFFERS_MIN_MB=1` so the pool may fill
     # to its line: with the pool at 192 MB the write sweep thrashed (cf-4).
-    VICTORY_CARD_BUFFERS_MB = '768'
+    #
+    # The number comes from the budget sweep in
+    # WASDeKeys/victory-low-end-pc `RESULTS.md` (a 6 GB card, the same
+    # cool_fox tree): 1024 carries the whole gain and 768 gives it back.
+    #
+    #   CARD_BUFFERS_MB  CARD_WINDOWS_MB  median ms/frame
+    #   1024             256              91.2, 90.2, 93.5
+    #   1024             768              92-98
+    #   1280             512              106.1
+    #   768              1024             273.7   <- what this file had
+    #   640              1152             274.6
+    #
+    # Below the line the title's buffer copies no longer fit on the card and
+    # every one of them is read back over the bus: that is the 3x, not a
+    # texture setting. `CARD_WINDOWS_MB` is 256 rather than 0: their sweep has
+    # 256 at 91 and 0 at 93.6, inside the noise, and 256 keeps the vertex and
+    # index windows on the card.
+    #
+    # Here (RTX 3060 Ti 8 GB) the pair measures neutral: 768/96 gave 116.7 ms
+    # at 3,748 draws (31.1 us a draw, soak1) and 1024/256 gave 130.7 ms at
+    # 4,096 draws (31.9 us a draw, soak2) - a 2.5% spread, inside the scene's
+    # own variation. The sweep above is a controlled A/B and this is not, so
+    # the sweep's number stays and the local figure is recorded, not claimed.
+    VICTORY_CARD_BUFFERS_MB = '1024'
     VICTORY_CARD_BUFFERS_MIN_MB = '1'
     # Snapshots: 339 MB a frame copied and compared whole to find the ~11 MB
     # that changed was 55 ms of a 134 ms frame (run cf-3). With the relay
