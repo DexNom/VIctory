@@ -3303,6 +3303,163 @@ fn refresh_remembers_writes_newer_than_the_submission_query() {
     assert_eq!(shadow.copy_stale(from, to, 1, &[(page, 3)]), 0);
 }
 
+/// E02.5: instrumented synchronous submissions with independent upload shadows.
+/// Only synthetic memory; run alone. Readback verifies every byte outside timing.
+#[cfg(all(test, feature = "diagnostics"))]
+#[test]
+#[ignore = "synthetic D3D12 submission benchmark"]
+fn measures_grouped_shadow_scaling() {
+    use std::time::Instant;
+    use windows::Win32::Graphics::Direct3D12::D3D12_RANGE;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    let n: usize = std::env::var("VICTORY_E025_BUFFERS")
+        .expect("set buffer count")
+        .parse()
+        .unwrap();
+    assert!([32, 128].contains(&n));
+    const WARMUP: usize = 5;
+    const ROUNDS: usize = 30;
+    struct Allocation(*mut u8, usize);
+    impl Drop for Allocation {
+        fn drop(&mut self) {
+            crate::watch::ask_once_end();
+            crate::watch::title_memory_remapped(self.0 as usize, self.1);
+            let ok = unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+            if !std::thread::panicking() {
+                assert_ne!(ok, 0);
+            }
+        }
+    }
+    assert!(crate::watch::once());
+    let host = host().expect("D3D12 host required");
+    for layout in ["contiguous", "mixed", "dispersed"] {
+        let mut offsets = vec![0usize];
+        for i in 1..n {
+            let gap = match layout {
+                "contiguous" => 0,
+                "mixed" if i % 4 != 0 => 1,
+                _ => 32,
+            };
+            offsets.push(offsets[i - 1] + (1 + gap) * PAGE);
+        }
+        let bytes = offsets[n - 1] + PAGE;
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                bytes,
+                MEM_RESERVE | MEM_COMMIT | 0x20_0000,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
+        assert!(!base.is_null());
+        let allocation = Allocation(base, bytes);
+        let mut shadows = Vec::new();
+        for (i, &offset) in offsets.iter().enumerate() {
+            unsafe {
+                base.add(offset).write_bytes((i + 1) as u8, PAGE);
+            }
+            let (buffer, data) = host.upload_buffer(PAGE as u64).expect("upload buffer");
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            shadows.push(Arc::new(Shadow::new(
+                buffer,
+                data,
+                gpu,
+                unsafe { base.add(offset) } as u64,
+                PAGE as u64,
+            )));
+        }
+        let back = host
+            .read_back_buffer((n * PAGE) as u64)
+            .expect("readback buffer");
+        let list = host.new_list().unwrap();
+        for mode in ["clean", "sparse", "full"] {
+            let mut times = Vec::new();
+            let mut copied = Vec::new();
+            let mut kernel = Vec::new();
+            for round in 0..WARMUP + ROUNDS {
+                for (i, &offset) in offsets.iter().enumerate() {
+                    if mode == "full" || (mode == "sparse" && (i + round) % 10 == 0) {
+                        unsafe {
+                            base.add(offset).write_bytes((round + i + 37) as u8, PAGE);
+                        }
+                    }
+                }
+                for (i, shadow) in shadows.iter().enumerate() {
+                    shadow.refresh(&list, shadow.start, PAGE as u64);
+                    unsafe {
+                        list.list.CopyBufferRegion(
+                            &back,
+                            (i * PAGE) as u64,
+                            &shadow.buffer,
+                            0,
+                            PAGE as u64,
+                        );
+                    }
+                }
+                list.close();
+                let before = crate::host::PREPARING[1].load(Ordering::Relaxed);
+                crate::watch::e025_begin();
+                let started = Instant::now();
+                host.execute(&[&list]);
+                let elapsed = started.elapsed().as_secs_f64() * 1e6;
+                let stats = crate::watch::e025_end();
+                assert!(stats.0 > 0, "no submitting-thread kernel calls measured");
+                assert_eq!(stats.3, 0, "unexpected GetWriteWatch failure");
+                let after = crate::host::PREPARING[1].load(Ordering::Relaxed);
+                let mut mapped = std::ptr::null_mut();
+                unsafe {
+                    back.Map(
+                        0,
+                        Some(&D3D12_RANGE {
+                            Begin: 0,
+                            End: n * PAGE,
+                        }),
+                        Some(&mut mapped),
+                    )
+                    .unwrap();
+                    assert!(!mapped.is_null());
+                    let actual = std::slice::from_raw_parts(mapped.cast::<u8>(), n * PAGE);
+                    for (i, &offset) in offsets.iter().enumerate() {
+                        let expected = std::slice::from_raw_parts(base.add(offset), PAGE);
+                        assert!(
+                            actual[i * PAGE..(i + 1) * PAGE] == *expected,
+                            "readback mismatch: {layout} {mode} round={round} buffer={i}"
+                        );
+                    }
+                    back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                }
+                list.reset();
+                if round >= WARMUP {
+                    times.push(elapsed);
+                    copied.push(after.saturating_sub(before));
+                    kernel.push(stats);
+                }
+            }
+            let mut sorted_times = times.clone();
+            sorted_times.sort_by(f64::total_cmp);
+            let median = |mut values: Vec<u64>| {
+                values.sort_unstable();
+                (values[ROUNDS / 2 - 1] as f64 + values[ROUNDS / 2] as f64) / 2.0
+            };
+            println!(
+                "E02.5 layout={layout} mode={mode} n={n} median_us={:.3} copied_bytes_median={:.1} kernel_calls_median={:.1} queried_bytes_median={:.1} kernel_us_median={:.3} samples={times:?} kernel_samples={kernel:?} readback=ok",
+                (sorted_times[ROUNDS / 2 - 1] + sorted_times[ROUNDS / 2]) / 2.0,
+                median(copied),
+                median(kernel.iter().map(|v| v.0).collect()),
+                median(kernel.iter().map(|v| v.1).collect()),
+                median(kernel.iter().map(|v| v.2).collect()) / 1000.0
+            );
+        }
+        drop(list);
+        drop(back);
+        drop(shadows);
+        drop(allocation);
+    }
+}
+
 #[cfg(test)]
 mod window_tests {
     use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
