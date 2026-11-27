@@ -496,6 +496,31 @@ pub(crate) fn dump_with_input(
     }
 }
 
+/// Reads a completed capture while its readback buffer is mapped. A D3D12
+/// footprint can omit the final row's padding from the buffer allocation.
+fn with_readback_bytes(buffer: &ID3D12Resource, read: impl FnOnce(&[u8])) {
+    struct Mapping<'a>(&'a ID3D12Resource);
+    impl Drop for Mapping<'_> {
+        fn drop(&mut self) {
+            // SAFETY: constructed after a successful Map of subresource zero.
+            unsafe { self.0.Unmap(0, None) };
+        }
+    }
+
+    // SAFETY: capture owns the completed readback buffer, whose width is its byte length.
+    let Ok(len) = isize::try_from(unsafe { buffer.GetDesc() }.Width) else { return };
+    let mut data = std::ptr::null_mut();
+    // SAFETY: a readback buffer has one mappable subresource.
+    if unsafe { buffer.Map(0, None, Some(&mut data)) }.is_err() {
+        return;
+    }
+    let _mapping = Mapping(buffer);
+    if !data.is_null() {
+        // SAFETY: the mapping remains alive for the callback and spans exactly len bytes.
+        read(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len as usize) });
+    }
+}
+
 fn defer_texture_png(
     list: &crate::host::HostList,
     buffer: ID3D12Resource,
@@ -508,14 +533,8 @@ fn defer_texture_png(
     let buffer = Readback(buffer);
     list.defer_after(move || {
         let f = footprint.Footprint;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: the list has run; the mapping spans the footprint's rows.
-        unsafe {
-            if buffer.0.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
-                return;
-            }
+        with_readback_bytes(&buffer.0, |rows| {
             let pitch = f.RowPitch as usize;
-            let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
             // These small float textures include exposure state. PNG normalization
             // discards its absolute values and alpha channel.
             if f.Format == DXGI_FORMAT_R32G32B32A32_FLOAT && f.Height == 1 && f.Width <= 8 {
@@ -534,8 +553,7 @@ fn defer_texture_png(
                 Some(rgba) => save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba),
                 None => tracing::info!(format = f.Format.0, name, "texture not dumped: format"),
             }
-            buffer.0.Unmap(0, None);
-        }
+        });
     });
 }
 
@@ -718,18 +736,9 @@ pub(crate) fn save_read_back(
             return;
         }
     };
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished (every submission is waited for); the
-    // mapping spans the footprint's rows.
-    unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
-        }
-        let len = f.RowPitch as usize * f.Height as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+    with_readback_bytes(buffer, |rows| {
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
-        buffer.Unmap(0, None);
-    }
+    });
 }
 
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
@@ -820,14 +829,8 @@ fn dump_one(
     }
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the mapping spans the footprint's rows.
-    unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
-        }
+    with_readback_bytes(&buffer, |rows| {
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
         if matches!(d.Format.0, 44..=47) {
@@ -857,8 +860,7 @@ fn dump_one(
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
-        buffer.Unmap(0, None);
-    }
+    });
 }
 
 /// Logs which values a stencil plane read back by [`read_back_of`] holds
@@ -1229,6 +1231,33 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readback_rows_end_at_the_last_pixel() {
+        let Some(host) = crate::host::host() else { return };
+        // Two rows of three RGBA8 pixels, with padding only between the rows.
+        let size = 256 + 12;
+        let (upload, data) = host.upload_buffer(size).unwrap();
+        let buffer = host.read_back_buffer(size).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: both buffers contain exactly size bytes and the upload is mapped.
+        unsafe {
+            data.write_bytes(0x11, size as usize);
+            data.add(256).write_bytes(0x22, 12);
+            list.list.CopyBufferRegion(&buffer, 0, &upload, 0, size);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut visited = false;
+        super::with_readback_bytes(&buffer, |rows| {
+            visited = true;
+            assert_eq!(rows.len(), size as usize);
+            let rgba = super::to_rgba(28, 3, 2, 256, rows).unwrap();
+            assert_eq!(&rgba[0..3], &[0x11; 3]);
+            assert_eq!(&rgba[20..23], &[0x22; 3]);
+        });
+        assert!(visited);
+    }
+
     #[test]
     fn sparse_input_selector_requires_an_exact_shader_and_table_binding() {
         let input = super::input_selector("DF11DCD012CD7382:s1+56").unwrap();
