@@ -162,7 +162,7 @@ fn wait_budget() -> Duration {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_WAIT_MS);
+            .unwrap_or_else(|| if on_wine() { WINE_WAIT_MS } else { DEFAULT_WAIT_MS });
         tracing::info!(millis, "host pipeline wait budget per frame, per kind");
         Duration::from_millis(millis)
     })
@@ -177,6 +177,30 @@ fn wait_budget() -> Duration {
 /// 0007). Only a pipeline still not made after its frame's window loses
 /// that frame's draws. `VICTORY_PIPELINE_WAIT_MS=500` waits as before.
 const DEFAULT_WAIT_MS: u64 = 12_000;
+
+/// The default of [`wait_budget`] under Wine/Proton (Linux only; Windows
+/// keeps [`DEFAULT_WAIT_MS`]). There vkd3d-proton holds some pipelines for
+/// good, so the 12 s windows were waited out in every frame and their
+/// draws dropped anyway: 0.1 fps (about 12.2 s a frame, 402 s waiting in
+/// 56 frames) against 3.4 fps (about 300 ms a frame) at 500 ms, with
+/// fewer draws dropped.
+const WINE_WAIT_MS: u64 = 500;
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`).
+fn on_wine() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        static WINE: OnceLock<bool> = OnceLock::new();
+        // SAFETY: plain lookups in ntdll, always loaded.
+        *WINE.get_or_init(|| unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        })
+    }
+    #[cfg(not(windows))]
+    false
+}
 
 /// The title's GPU watchdog: one frame of more than this ends the run.
 const TITLE_WATCHDOG: Duration = Duration::from_secs(30);
