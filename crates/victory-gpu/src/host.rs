@@ -1634,6 +1634,20 @@ fn scratch_pool() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Whether copies' upload sources take slices of the lists' scratch chunks
+/// ([`CommandList::upload`]); `VICTORY_UPLOAD_SLICES=0`: a buffer for each
+/// copy, as before. Before the slices, every copy from title memory into a
+/// texture made, zeroed and freed an upload buffer of its own.
+fn upload_slices() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_SLICES").is_none_or(|v| v != "0"))
+}
+
+/// Copies' upload sources since the start, for the memory line: slices of
+/// scratch chunks and their bytes; buffers of their own and their bytes.
+pub(crate) static UPLOAD_SLICES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Things of some sizes that nothing holds now, kept for whoever next asks
 /// for one of the same size.
 struct Spare<T> {
@@ -6653,15 +6667,57 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
+    /// `size` bytes of mapped upload memory for a copy's source, alive until
+    /// the list is reset: the buffer, the offset of the bytes in it (a
+    /// multiple of 512, the placement alignment of texture data) and the
+    /// CPU pointer to them.
     ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    /// A copy that fits a scratch chunk takes a slice of one ([`upload_slice`],
+    /// given back with the list's chunks once its submissions ran); a bigger
+    /// one, or every one with `VICTORY_UPLOAD_SLICES=0`, gets a buffer of its
+    /// own as before. [`UPLOAD_SLICES`] counts both for the memory line.
+    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        if upload_slices()
+            && let Some(slice) = self.upload_slice(host, size)
+        {
+            UPLOAD_SLICES[0].fetch_add(1, Ordering::Relaxed);
+            UPLOAD_SLICES[1].fetch_add(size, Ordering::Relaxed);
+            return Some(slice);
+        }
+        UPLOAD_SLICES[2].fetch_add(1, Ordering::Relaxed);
+        UPLOAD_SLICES[3].fetch_add(size, Ordering::Relaxed);
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
-        Some((buffer, data))
+        Some((buffer, 0, data))
+    }
+
+    /// `len` bytes of the list's scratch chunks, starting at a multiple of
+    /// 512 bytes: the chunk's buffer, the offset in it and the CPU pointer.
+    /// None for more than a chunk holds, or without the shared chunks
+    /// ([`scratch_pool`]).
+    fn upload_slice(&self, host: &Host, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        const PLACEMENT: u64 = 512;
+        if !scratch_pool() || len > SCRATCH_CHUNK {
+            return None;
+        }
+        let len = len.max(1);
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if s.current == s.chunks.len() {
+                let chunk = take_chunk(host, SCRATCH_CHUNK)?;
+                s.chunks.push((chunk, SCRATCH_CHUNK));
+                s.used = 0;
+            }
+            let at = s.used.next_multiple_of(PLACEMENT);
+            if at + len <= s.chunks[s.current].1 {
+                // `scratch` hands out from `used` on, 256-byte aligned.
+                s.used = (at + len).next_multiple_of(256);
+                let chunk = &s.chunks[s.current].0;
+                return Some((chunk._buffer.clone(), at, (chunk.data + at as usize) as *mut u8));
+            }
+            (s.current, s.used) = (s.current + 1, 0);
+        }
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is

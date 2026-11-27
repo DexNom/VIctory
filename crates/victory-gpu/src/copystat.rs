@@ -702,6 +702,14 @@ fn log_memory() {
         tracing::info!("small texture placements since startup: {textures} textures on {heaps} native 64 KiB heaps");
         let (created, reused) = crate::texture::upload_pool_totals();
         tracing::info!("texture staging pool since startup: {created} chunks made, {reused} allocations served by existing chunks");
+        let slices: Vec<u64> = crate::host::UPLOAD_SLICES.iter().map(|m| m.load(Relaxed)).collect();
+        tracing::info!(
+            "copy upload sources since startup: {} slices of scratch chunks {:.0} MB, {} buffers of their own {:.0} MB",
+            slices[0],
+            mb(slices[1]),
+            slices[2],
+            mb(slices[3]),
+        );
     }
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.
