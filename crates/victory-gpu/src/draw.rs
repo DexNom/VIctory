@@ -602,6 +602,15 @@ pub(crate) fn dispatched() -> u64 {
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+/// Whether a dynamic table's constant-buffer slots read their buffer's host
+/// copy when the constants are 256-byte aligned in it, instead of a copy the
+/// CPU fills at submission. `VICTORY_TABLE_CONSTANT_SHADOW=0`: always the CPU
+/// fill, as before.
+fn table_constant_shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_CONSTANT_SHADOW").is_none_or(|v| v != "0"))
+}
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -620,7 +629,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
+    list.defer_fill_by(to, address as *const u8, len as usize, crate::host::FillBy::RootView);
     Some(gpu)
 }
 
@@ -1465,7 +1474,7 @@ impl State {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
-                s.gpu_writes(list, a, len);
+                s.gpu_writes_by(list, a, len, crate::shadow::Declarer::RootUav);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -3044,6 +3053,25 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // Read from the buffer's host copy, as root views are
+                        // (`root_view`), when the constants lie 256-byte
+                        // aligned in it: the card then reads them after the
+                        // shaders that may write them, in queue order, and the
+                        // list need not wait for those shaders before a CPU
+                        // fill (the copy's writes are declared for the whole
+                        // buffer, so the fill waited on every one of them).
+                        if let Some(shadow) = table_constant_shadow()
+                            .then(|| crate::shadow::find(address, u64::from(size)))
+                            .flatten()
+                            && shadow.left(address) >= u64::from(size)
+                            && shadow.gpu(address) % 256 == 0
+                        {
+                            shadow.refresh(list, address, u64::from(size));
+                            host.constant_at(index, shadow.gpu(address), size);
+                            crate::host::TABLE_CONSTANTS[0].fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        crate::host::TABLE_CONSTANTS[1].fetch_add(1, Ordering::Relaxed);
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -3801,7 +3829,7 @@ fn readable_view(list: &HostList, kind: ResourceType, view: &View, placed: bool)
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                shadow.gpu_writes(list, address, len);
+                shadow.gpu_writes_by(list, address, len, crate::shadow::Declarer::TableUav);
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

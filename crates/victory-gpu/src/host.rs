@@ -3022,6 +3022,7 @@ fn blocked_by_detail(
                     if let Some(fill) = step.fills().iter().find(|f| written.touches(f.src, f.src.saturating_add(f.len))) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            FILL_SETTLES[fill.by as usize].fetch_add(1, Ordering::Relaxed);
                         }
                         #[cfg(feature = "diagnostics")]
                         if let Some(found) = blocked_fill.as_deref_mut() {
@@ -3029,8 +3030,6 @@ fn blocked_by_detail(
                                 .is_some_and(|slots| slots.contains(&fill.dst));
                             *found = Some((fill.src, fill.len, table_slot));
                         }
-                        #[cfg(not(feature = "diagnostics"))]
-                        let _ = fill;
                         return Some(WHY_READ);
                     }
                 }
@@ -3507,6 +3506,32 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     card_steps_probe::report(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let by: Vec<f64> = FILL_SETTLES.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let constants: Vec<f64> = TABLE_CONSTANTS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    {
+        let names = ["other", "a root UAV", "a table's buffer UAV", "the page directory's ranges", "the page directory's pages"];
+        let parts: Vec<String> = crate::shadow::DECLARED
+            .iter()
+            .zip(names)
+            .map(|(c, name)| {
+                let [n, bytes, big] = [0, 1, 2].map(|i| c[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                format!("{name} {n:.1} ranges {:.0} MB ({big:.1} of 64 MB or more)", bytes / f64::from(1 << 20))
+            })
+            .collect();
+        tracing::info!("shader write ranges declared per frame, by binding: {}", parts.join(", "));
+    }
+    tracing::info!(
+        "settles for a fill of upload memory per frame, by caller: a copy from title memory into a texture {:.1}, \
+         a root constant-buffer view {:.1}, a dynamic constant-buffer slot {:.1}, other {:.1}; \
+         dynamic constant-buffer slots per frame: {:.1} read from their buffer's host copy, {:.1} filled by the CPU \
+         (VICTORY_TABLE_CONSTANT_SHADOW=0: all filled)",
+        by[FillBy::TextureCopy as usize],
+        by[FillBy::RootView as usize],
+        by[FillBy::TableConstant as usize],
+        by[FillBy::Other as usize],
+        constants[0],
+        constants[1],
+    );
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
@@ -6582,8 +6607,9 @@ impl HostList {
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
-    pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        let fill = Fill { dst: dst as usize, src: src as usize, len };
+    /// `by` names the caller for the settle line ([`FillBy`]).
+    pub(crate) fn defer_fill_by(&self, dst: *mut u8, src: *const u8, len: usize, by: FillBy) {
+        let fill = Fill { dst: dst as usize, src: src as usize, len, by };
         self.deferred().append_fill(fill, fill_workers());
     }
 
@@ -6592,12 +6618,12 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         if card_steps_probe::enabled() {
             let mut deferred = self.deferred();
-            let fill = Fill { dst: dst as usize, src: src as usize, len };
+            let fill = Fill { dst: dst as usize, src: src as usize, len, by: FillBy::TableConstant };
             deferred.table_constant_fills.get_or_insert_with(Default::default).insert(fill.dst);
             deferred.append_fill(fill, fill_workers());
             return;
         }
-        self.defer_fill(dst, src, len);
+        self.defer_fill_by(dst, src, len, FillBy::TableConstant);
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -6976,7 +7002,32 @@ struct Fill {
     dst: usize,
     src: usize,
     len: usize,
+    /// Which caller asked for it ([`FillBy`]), for [`FILL_SETTLES`].
+    by: FillBy,
 }
+
+/// Who asked for a CPU fill of upload memory, for the settle line: a
+/// settle "by a fill of upload memory" is counted under its caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillBy {
+    /// A caller not named below.
+    Other = 0,
+    /// The source of a copy from title memory into a texture (`list.rs`).
+    TextureCopy = 1,
+    /// A root constant-buffer view off 256-byte alignment (`draw.rs`).
+    RootView = 2,
+    /// A dynamic constant-buffer descriptor slot ([`CommandList::defer_table_constant`]).
+    TableConstant = 3,
+}
+
+/// Settles for a fill of upload memory by caller ([`FillBy`] as the
+/// index), counted with `LATE_STATS[16]` and reset with it.
+static FILL_SETTLES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Dynamic constant-buffer slots made since the last settle line: read from
+/// their buffer's host copy, and filled by the CPU (`draw.rs`).
+pub(crate) static TABLE_CONSTANTS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 impl Fill {
     fn run(self) {
@@ -7078,6 +7129,7 @@ mod fill_tests {
                 dst: out.as_mut_ptr() as usize,
                 src: source[i * bytes..].as_ptr() as usize,
                 len: bytes,
+                by: FillBy::Other,
             })
             .collect()
     }
