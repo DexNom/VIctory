@@ -15,8 +15,9 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
+use once_cell::sync::OnceCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
@@ -38,7 +39,7 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
-    inline: OnceLock<upload::Upload>,
+    inline: OnceCell<upload::Upload>,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     total: u64,
@@ -840,10 +841,11 @@ fn upload_texture(list: &HostList, resource: This, texture: &ID3D12Resource, fir
 
 impl Staging {
     fn inline_upload(&self) -> Option<&upload::Upload> {
-        if self.inline.get().is_none() {
-            let _ = self.inline.set(upload::Upload::new(host()?, self.bytes)?);
-        }
-        self.inline.get()
+        // Several lists can record their first upload concurrently. Allocate once;
+        // a failed allocation leaves the cell available for a later attempt.
+        self.inline
+            .get_or_try_init(|| host().and_then(|host| upload::Upload::new(host, self.bytes)).ok_or(()))
+            .ok()
     }
 
     fn mark_uploaded(&self) {
@@ -1602,7 +1604,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
-        inline: OnceLock::new(),
+        inline: OnceCell::new(),
         #[cfg(feature = "diagnostics")]
         total,
         footprints,
