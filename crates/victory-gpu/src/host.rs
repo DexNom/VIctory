@@ -25,6 +25,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+mod relay_fetch;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -4787,7 +4789,11 @@ impl Host {
                 drop(order);
                 self.card_sent();
                 fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
+                relay_fetch::confirm_completion(
+                    WaitForSingleObject(event, INFINITE),
+                    sent,
+                    || fence.GetCompletedValue(),
+                )?;
                 #[cfg(feature = "diagnostics")]
                 if let Some(((_, probe), queued)) = probe.as_mut().zip(queued) {
                     probe.queue_us = queued.elapsed().as_micros() as u64;
