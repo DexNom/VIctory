@@ -16,12 +16,15 @@
       maxfps             mais agressivo: LOD de textura em 2.0, resolução de
                          saída em 640x480, culling maior. Some detalhe, não
                          textura.
+      potato             o piso: LOD de geometria em 0.4, culling em 3.0,
+                         veículos no último LOD, modelos de dano desligados.
+                         Geometria some, textura não.
       sharp              desfaz os cortes de LOD/mip, mantém só os cortes de
                          pixel (RT, grama, SSR, motion blur).
       restore            devolve o backup mais recente.
 
 .PARAMETER Profile
-    balanced | maxfps | sharp | restore
+    balanced | maxfps | potato | sharp | restore
 
 .PARAMETER Set
     Sobrescreve um ajuste: -Set advancedGraphics.lodScale=1.0
@@ -39,7 +42,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('balanced', 'maxfps', 'sharp', 'restore')]
+    [ValidateSet('balanced', 'maxfps', 'potato', 'sharp', 'restore')]
     [string]$Profile = 'balanced',
     [string[]]$Set = @(),
     [switch]$DryRun,
@@ -126,6 +129,29 @@ $profiles = @{
         'advancedGraphics.ssroSampleCount'              = '0'
         'advancedGraphics.waterReflectionResX'          = '256'
         'advancedGraphics.waterReflectionResY'          = '128'
+    })
+    potato = New-Profile $pixelCuts $textureSoften ([ordered]@{
+        'video.uiResolution.width'                      = '640'
+        'video.uiResolution.height'                     = '480'
+        'video.resolutionFullscreen.width'              = '640'
+        'video.resolutionFullscreen.height'             = '480'
+        'graphics.anisotropicFiltering'                 = '0'
+        'advancedGraphics.decorationResolutionShift'    = '3'
+        'advancedGraphics.grassLod'                     = '0.000000'
+        'advancedGraphics.lodScale'                     = '0.400000'
+        'advancedGraphics.smallCullThreshold'           = '3.000000'
+        'advancedGraphics.vehicleLodBias'               = '3.000000'
+        'advancedGraphics.damageModelsEnabled'          = 'false'
+        'advancedGraphics.lensFlaresScreenResDivExponent' = '3'
+        'advancedGraphics.ssroSampleCount'              = '0'
+        'advancedGraphics.waterReflectionResX'          = '256'
+        'advancedGraphics.waterReflectionResY'          = '128'
+        'advancedGraphics.manualMipBias'                = '-2.000000'
+        'advancedGraphics.texLodScale_Global'           = '4.000000'
+        'advancedGraphics.texLodScale_Buildings'        = '4.000000'
+        'advancedGraphics.texLodScale_Objects'          = '4.000000'
+        'advancedGraphics.texLodScale_HD'               = '4.000000'
+        'advancedGraphics.texLodScale_LOD'              = '4.000000'
     })
     sharp = New-Profile $pixelCuts ([ordered]@{
         'video.uiResolution.width'                      = '1920'

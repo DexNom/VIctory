@@ -119,6 +119,7 @@ Perfis:
 |---|---|---|---|
 | `balanced` | 1280x720 | 1.0, mip bias -1.5 | padrão: toda textura presente, menos nítida |
 | `maxfps` | 640x480 | 2.0 | quem quer quadros e aceita imagem macia |
+| `potato` | 640x480 | 4.0, mip bias -2.0 | o piso: geometria em 0.4, culling em 3.0, veículo no último LOD |
 | `sharp` | 1920x1080 | 1.0, mip bias 0 | quem tem folga e quer nitidez |
 
 O que `balanced` corta: sombra por ray tracing, reflexo da água por SSR,

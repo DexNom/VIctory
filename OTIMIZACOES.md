@@ -490,7 +490,9 @@ pixel caro (RT, SSR, motion blur, 4K de UI, vsync, limite de 30) e **mantém** o
 Toda textura continua presente; a nitidez volta pelo sharpen, que é barato.
 
 Perfis: `balanced` (padrão), `maxfps` (LOD de textura em 2.0 e saída em 640x480),
-`sharp` (desfaz LOD e mip bias, mantém só os cortes de pixel), `restore`.
+`potato` (o piso: `lodScale` 0.4, `smallCullThreshold` 3.0, veículo no último
+LOD, modelos de dano fora), `sharp` (desfaz LOD e mip bias, mantém só os cortes
+de pixel), `restore`.
 O launcher aplica o `balanced` antes de cada partida (`gamecuts=0` no
 `settings.ini` desliga), porque o título regrava o arquivo ao sair.
 
