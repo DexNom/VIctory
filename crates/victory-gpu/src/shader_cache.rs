@@ -72,6 +72,8 @@ fn build() -> &'static [u8; 32] {
             u32::from(victory_shader::emit::ambient_fallback_enabled()),
             // And which clean-up passes ran over the translated code.
             victory_shader::emit::shader_opt(),
+            // And whether atomic subtractions are loops (`host_settings`).
+            u32::from(host_settings()),
         ] {
             hash.update(&n.to_le_bytes());
         }
@@ -98,9 +100,34 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// Tells the translator, once, what the host's shader compiler needs, and
+/// returns it: whether atomic subtractions on group memory are written as
+/// compare-exchange loops ([`victory_shader::emit::atomic_sub_loops`]),
+/// which NVIDIA's compiler needs (it refuses such a pipeline as out of
+/// memory). Decided by the vendor of the adapter the host device is made
+/// on; `VICTORY_ATOMIC_SUB_LOOP=1` or `=0` says otherwise. Called before
+/// anything is translated or a cache keyed.
+pub fn host_settings() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| {
+        const NVIDIA: u32 = 0x10DE;
+        let on = match std::env::var("VICTORY_ATOMIC_SUB_LOOP").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => crate::host::default_adapter_vendor() == Some(NVIDIA),
+        };
+        victory_shader::emit::set_atomic_sub_loops(on);
+        if on {
+            tracing::info!("atomic subtractions on group memory are compare-exchange loops");
+        }
+        on
+    })
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    host_settings();
     // Reuse every other shader's regular cache. The diagnostic translation
     // must never read or replace the cached uninstrumented shader.
     use victory_shader::emit;
