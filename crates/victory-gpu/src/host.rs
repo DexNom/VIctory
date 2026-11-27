@@ -6121,11 +6121,13 @@ impl HostList {
         result
     }
 
-    /// Moves host texture `copy` to `wanted` (a host state) in this list,
-    /// as [`HostList::transition`] does a title resource's host copy, and
-    /// records the barrier: for textures that are not a title resource's
-    /// host copy (colour twins) and for the copies between the two.
-    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+    /// As [`HostList::settle`], returning the barrier to record instead of
+    /// recording it (frame generation batches its own).
+    pub(crate) fn move_texture(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<D3D12_RESOURCE_BARRIER> {
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -6137,14 +6139,20 @@ impl HostList {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 (before != wanted).then_some(before)
             }
-        };
-        drop(states);
-        if let Some(before) = before {
-            let barrier = transition(
-                &copy.texture,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATES(wanted as i32),
-            );
+        }?;
+        Some(transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(wanted as i32),
+        ))
+    }
+
+    /// Moves host texture `copy` to `wanted` (a host state) in this list,
+    /// as [`HostList::transition`] does a title resource's host copy, and
+    /// records the barrier: for textures that are not a title resource's
+    /// host copy (colour twins) and for the copies between the two.
+    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        if let Some(barrier) = self.move_texture(copy, wanted) {
             // SAFETY: an open list and a live texture.
             unsafe { self.list.ResourceBarrier(&[barrier]) };
         }
@@ -7632,6 +7640,9 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// The AMD proxy and generator, if the opt-in path could be created.
+    #[cfg(feature = "diagnostics")]
+    framegen: Option<crate::framegen::Presentation>,
 }
 
 /// The process's CPU time in microseconds, kernel and user.
@@ -8088,6 +8099,10 @@ impl Host {
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
+            #[cfg(feature = "diagnostics")]
+            if let Some(fg) = &mut p.framegen {
+                fg.disable(&p.swap_chain);
+            }
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
@@ -8127,6 +8142,11 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
+            // Frame generation presents through its proxy from the one list
+            // upstream runs it with, not one sent ahead: in a sent-ahead
+            // list it crashed a run freeing objects (`bury`) after 4 minutes.
+            #[cfg(feature = "diagnostics")]
+            let read_now = read_now || p.framegen.is_some();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -8169,6 +8189,14 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 ),
             ]);
+            // Frame generation reads the last submitted upscale's depth and
+            // motion in this list, before the present inserts its frames.
+            #[cfg(feature = "diagnostics")]
+            let generated = p.framegen.as_mut().is_some_and(|fg| {
+                fg.prepare(&p.swap_chain, &self.device, copy, [width, height], frame)
+            });
+            #[cfg(not(feature = "diagnostics"))]
+            let generated = false;
             copy.close();
             match slot {
                 Some(i) => {
@@ -8181,7 +8209,19 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // The proxy paces generated frames against the display.
+            let status = p.swap_chain.Present(u32::from(generated), DXGI_PRESENT(0));
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = status;
+            #[cfg(feature = "diagnostics")]
+            if generated && let Some(fg) = &mut p.framegen {
+                if status == windows::Win32::Foundation::S_OK {
+                    fg.presented(&p.swap_chain, frame);
+                } else if status.is_err() {
+                    tracing::warn!(?status, frame, "FidelityFX frame generation: present failed; off");
+                    fg.disable(&p.swap_chain);
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -8217,6 +8257,20 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
+            #[cfg(feature = "diagnostics")]
+            let (swap_chain, framegen) = match crate::framegen::enabled()
+                .then(|| crate::framegen::Presentation::create(&factory, &self.device, &self.queue, hwnd, &desc))
+                .flatten()
+            {
+                Some((swap_chain, fg)) => (swap_chain, Some(fg)),
+                None => (
+                    factory
+                        .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                        .and_then(|chain| chain.cast::<IDXGISwapChain3>())?,
+                    None,
+                ),
+            };
+            #[cfg(not(feature = "diagnostics"))]
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
@@ -8233,6 +8287,8 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                #[cfg(feature = "diagnostics")]
+                framegen,
             })
         }
     }

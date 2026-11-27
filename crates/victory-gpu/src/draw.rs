@@ -3150,6 +3150,34 @@ impl State {
         out
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn record_framegen_camera(&self, list: &HostList) {
+        if !crate::framegen::ml_enabled() {
+            return;
+        }
+        let Some(pipeline) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        // The 1.0.2.1 velocity pass is identified by its shader pair.
+        if !pipeline.stages.iter().any(|stage| stage.shader.hash == "4adcfeaa24ae6450")
+            || !pipeline.stages.iter().any(|stage| stage.shader.hash == "9ab96b7a002d6ac8")
+        {
+            return;
+        }
+        let Some(Root::Table(table)) = self.roots_ref(false).get(1) else {
+            return;
+        };
+        let Some(handle) = table.checked_add(8 * 4) else {
+            return;
+        };
+        let Some(View::Constant(address, size)) = crate::descriptor::view(handle) else {
+            return;
+        };
+        if let Some(viewport) = self.viewports.first() {
+            crate::framegen::camera::record(list, address, size, [viewport.Width, viewport.Height]);
+        }
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -3176,6 +3204,10 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            if count == 3 && instances == 1 {
+                self.record_framegen_camera(list);
+            }
             let frontend = if count == 3 && instances == 1 {
                 self.native_frontend_viewport()
             } else {

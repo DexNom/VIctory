@@ -41,6 +41,12 @@ Open **DexNom RayTime (FSR Quality 4K)** to use the tested Series X profile. It 
 
 The baseline was tested with a PC FidelityFX 4.1.2 provider. Put the provider and its dependencies in the installed runtime's `fidelityfx` subfolder or set `VICTORY_FIDELITYFX_DIR` to the folder containing `amd_fidelityfx_upscaler_dx12.dll`. The provider is supplied separately.
 
+### Experimental AMD Frame Generation
+
+Frame generation is off by default. In a diagnostics build, set `VICTORY_FIDELITYFX_FRAMEGEN=4` before launching the FSR Quality preset to request Frame Generation 4.0.2. Set it to `1` to try the analytical 3.x provider. Both modes use `amd_fidelityfx_framegeneration_dx12.dll` from the same SDK folder as the upscaler.
+
+Frame generation requires an RGBA8 swap chain. Mode 4 also requires a supported GPU and a camera sample matching the current upscale. If the proxy or the requested provider is unavailable, the runtime logs the reason and continues with ordinary presentation.
+
 For a manual launch, use the same flags as the Quality shortcut.
 
 ```powershell

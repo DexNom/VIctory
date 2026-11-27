@@ -233,7 +233,19 @@ pub fn use_host_dir(dir: Option<&Path>) {
     match load(dir) {
         Ok((host, versions)) => {
             tracing::info!(folder = %dir.display(), versions, "FidelityFX: the host's upscaler serves the title's");
-            let _ = HOST.set(host);
+            let installed = HOST.set(host).is_ok();
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = installed;
+            #[cfg(feature = "diagnostics")]
+            if installed
+                && let Ok(mode) = std::env::var("VICTORY_FIDELITYFX_FRAMEGEN")
+                && matches!(mode.as_str(), "1" | "4")
+            {
+                match victory_gpu::external::use_frame_generation(dir, mode == "4") {
+                    Ok(dll) => tracing::info!(dll, mode, "FidelityFX: frame generation on the title's upscaled frames"),
+                    Err(why) => tracing::warn!("FidelityFX frame generation: {why}; off"),
+                }
+            }
         }
         Err(why) => tracing::warn!(
             folder = %dir.display(),
@@ -597,6 +609,9 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     };
     let list = dispatch.list.cast::<Object>().cast_const();
     let output = dispatch.resources[6].resource.cast::<Object>();
+    // Depth and motion as the title names them, for frame generation.
+    #[cfg(feature = "diagnostics")]
+    let title = dispatch;
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
     let mut backing_extents = [None; 7];
@@ -649,10 +664,19 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         // SAFETY: a live texture.
         unsafe { t.GetDesc() }.Format.0
     }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
-    let Some(code) = victory_gpu::external::record(list, |host_list| {
-        dispatch.list = host_list.as_raw();
+    let Some(code) = victory_gpu::external::record_upscale(list, |recording| {
+        dispatch.list = recording.list().as_raw();
         // SAFETY: the PC dispatch on host objects; the context is the host's.
-        unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
+        let code = unsafe { (host.dispatch)(context, &raw mut dispatch.header) };
+        #[cfg(feature = "diagnostics")]
+        if code == OK {
+            recording.frame_generation_inputs(
+                title.resources[1].resource.cast::<Object>().cast_const(),
+                title.resources[2].resource.cast::<Object>().cast_const(),
+                frame_inputs(&title, create.flags),
+            );
+        }
+        code
     }) else {
         once!(
             warn,
@@ -675,6 +699,26 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         );
     }
     code
+}
+
+/// What frame generation needs of an upscaling: `settings` in the order of
+/// `ffxDispatchDescUpscale` after the sizes (sharpening, sharpness, frame
+/// time, pre-exposure, reset, camera near/far/fov/scale, flags) and its
+/// context's creation `flags`.
+#[cfg(feature = "diagnostics")]
+fn frame_inputs(d: &DispatchUpscale, flags: u32) -> victory_gpu::external::FrameInputs {
+    let f = |i: usize| f32::from_bits(d.settings[i]);
+    victory_gpu::external::FrameInputs {
+        render: d.render_size,
+        jitter: d.jitter,
+        motion_scale: d.motion_scale,
+        frame_time_ms: f(2),
+        reset: d.settings[4] & 0xff != 0,
+        camera: [f(5), f(6), f(7), f(8)],
+        flags,
+        depth_desc: d.resources[1].description,
+        motion_desc: d.resources[2].description,
+    }
 }
 
 pub(crate) fn module() -> HleModule {

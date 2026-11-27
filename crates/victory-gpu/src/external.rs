@@ -45,6 +45,73 @@ pub fn prepare_input(list: *const Object, resource: *const Object) -> Option<()>
     Some(())
 }
 
+/// The host list while a title command list is being recorded.
+pub struct Recording<'a>(&'a crate::host::HostList);
+
+impl Recording<'_> {
+    /// The open D3D12 list for the provider to record into.
+    pub fn list(&self) -> &ID3D12GraphicsCommandList {
+        &self.0.list
+    }
+
+    /// At a host upscale recorded here: its depth and motion textures
+    /// (title resources) and constants feed frame generation for the next
+    /// present, once this list has run. Nothing when it is off.
+    #[cfg(feature = "diagnostics")]
+    pub fn frame_generation_inputs(
+        &self,
+        depth: *const Object,
+        motion: *const Object,
+        frame: FrameInputs,
+    ) {
+        if !crate::framegen::enabled() {
+            return;
+        }
+        let (Some(depth), Some(motion)) = (
+            crate::resource::host_copy(depth),
+            crate::resource::host_copy(motion),
+        ) else {
+            return;
+        };
+        crate::framegen::record(
+            self.0,
+            crate::framegen::Inputs {
+                depth,
+                motion,
+                frame,
+                pose: None,
+            },
+        );
+    }
+}
+
+/// What frame generation needs of an upscaled frame besides its depth and
+/// motion vectors: the upscale's constants (as its description has them)
+/// and the motion and depth bits of its creation flags.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg(feature = "diagnostics")]
+pub struct FrameInputs {
+    pub render: [u32; 2],
+    pub jitter: [f32; 2],
+    pub motion_scale: [f32; 2],
+    pub frame_time_ms: f32,
+    pub reset: bool,
+    /// Near, far, vertical field of view, metres per view-space unit.
+    pub camera: [f32; 4],
+    pub flags: u32,
+    /// The FidelityFX descriptions of the depth and motion textures.
+    pub depth_desc: [u32; 8],
+    pub motion_desc: [u32; 8],
+}
+
+/// Turns on AMD frame generation for upscaled frames (diagnostics) with
+/// `amd_fidelityfx_framegeneration_dx12.dll` from `dir`: the presenter's
+/// swap chain becomes its proxy. The DLL's path, or why not.
+#[cfg(feature = "diagnostics")]
+pub fn use_frame_generation(dir: &std::path::Path, ml: bool) -> Result<String, String> {
+    crate::framegen::load(dir, ml)
+}
+
 /// The producer recorded its output on the host's command list.
 pub fn output_written(resource: *const Object) {
     crate::texture::host_written(resource);
@@ -63,9 +130,15 @@ pub fn record<R>(
     list: *const Object,
     f: impl FnOnce(&ID3D12GraphicsCommandList) -> R,
 ) -> Option<R> {
+    record_upscale(list, |recording| f(recording.list()))
+}
+
+/// As [`record`], with access to the frame generation inputs for a
+/// successfully recorded upscale.
+pub fn record_upscale<R>(list: *const Object, f: impl FnOnce(Recording<'_>) -> R) -> Option<R> {
     let mut out = None;
     crate::list::with_state(list, |host, state| {
-        out = Some(f(&host.list));
+        out = Some(f(Recording(host)));
         state.host_state_lost();
     });
     out
