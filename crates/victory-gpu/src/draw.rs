@@ -2671,6 +2671,22 @@ impl State {
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
         }
+        // A line every five seconds in every build, diagnostics or not: the
+        // queue, what the pass staged, and how many rechecks found their
+        // texture changed under them. A scene that shows the neutral texture
+        // has a queue that does not drain; one whose frames arrive late has
+        // rechecks that keep finding changes.
+        if frame % 300 == 0 {
+            tracing::info!(
+                queue = census[0],
+                due = due.len(),
+                staged_mb = SPENT.load(Ordering::Relaxed) >> 20,
+                rechecked_same = HEAP_TEXTURES_RECHECKED[0].load(Ordering::Relaxed),
+                rechecked_changed = HEAP_TEXTURES_RECHECKED[1].load(Ordering::Relaxed),
+                same_copy = HEAP_TEXTURES_SAME.load(Ordering::Relaxed),
+                "texture queue"
+            );
+        }
         // Where the card's memory is, and what the due slots would need
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
@@ -2760,7 +2776,14 @@ impl State {
             // A slot with nothing checked is uploaded below, not looked at:
             // only the rechecks are bounded.
             let checked = host.texture_slot_checked(index);
-            if checked.is_some() && recheck_at_most.is_some_and(|most| looked >= most) {
+            // A slot found changed once is one the title repaints through
+            // another view of its pages (a cutscene's screens, a face's
+            // close-up): the write watch cannot see it, so it is looked at
+            // every frame whatever the budget below. Without it a pass that
+            // spends its bytes leaves them at the tail for the next frames,
+            // and the scene shows the neutral texture. They are a few dozen.
+            let hot = checked.is_some_and(|(_, _, _, looks, _)| looks > 0);
+            if !hot && checked.is_some() && recheck_at_most.is_some_and(|most| looked >= most) {
                 served = false;
                 break;
             }

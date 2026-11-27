@@ -283,6 +283,41 @@ título é uma seção `SEC_RESERVE` (3.977 MB numa view só), e
 endereço trava cada página na RAM e impede o título de descommitar. Não é
 caminho para o pool que faz streaming — e o probe em si custa 256 MB travados.
 
+## Perfil de 16 GB: o que foi medido (cf-19 em diante)
+
+O mundo aberto nao crasha mais e o quadro caiu de 83-100 ms para 57,5 ms.
+
+| | antes | depois |
+|---|---|---|
+| fps no mundo | 10-11,7 | **17,4** |
+| ms por quadro | 83-100 | **57,5** |
+| `0x8007000E` | 21.239 slots esperando memoria | **0** |
+| `device removed` | frequente | **0** em 600 s |
+
+O quadro de 57,5 ms se divide em 21,4 ms do proprio titulo (logica dele, entre
+o present e a primeira lista), ~17 ms de trabalho nosso e 19,2 ms de placa. A
+placa **nao** e o gargalo: ela roda escondida atras da preparacao (estagio 3 do
+`VICTORY_LATE_WAIT`, ligado pelo `VICTORY_RELAY=1`).
+
+- **Os tres portoes de RAM eram a regressao.** Com 0,3-2,0 GB livres no regime,
+  qualquer piso perto de 1 GB fica fechado para sempre: 21.239 texturas paradas
+  em "waiting for their memory" e janelas fora de buffers que nunca nasciam
+  (slot lendo zero - era o piscar). Pisos agora em 192-384 MB, que ainda
+  segura o `0x8007000E`.
+- **`VICTORY_RECHECK_MB=48`.** A rechecagem de uma textura ja subida le 48 KiB
+  da memoria dela para uma impressao digital. Milhares por quadro liam centenas
+  de MB (35 ms) para achar as poucas que o titulo mudou depois do upload. O
+  resto da fila espera o proximo quadro: sao os mais antigos, e os uploads ja
+  sao limitados pelos bytes de staging.
+- **Staging limitado pela RAM livre** (`pool::staging_most`, 2/4/16 blocos) e
+  devolvido antes de recusar: os 1,86 GB de upload write-combined sumiram.
+- **Build sem `diagnostics`.** O binario de medicao paga dois `Instant::now()`
+  e varios atomicos em cada uma das 3.279 copias de buffer por quadro. O de
+  release tem 11,5 MB contra 15,9 e mantem fps/ms/draws no titulo da janela.
+- **Nenhuma varredura de heap morta por copia.** `in_shader_heap` pegava o lock
+  de leitura e varria todos os heaps registrados so para alimentar o diario de
+  portas, que esta desligado: agora esta atras do interruptor dele.
+
 ## Limites conhecidos
 
 - **16 GB é o piso, não o recomendado.** O processo chega a 22 GB privados; o
