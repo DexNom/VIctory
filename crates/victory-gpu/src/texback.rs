@@ -61,6 +61,7 @@ pub(crate) struct Back {
     mapping: crate::inplace::ReadbackMapping,
     buffer: ID3D12Resource,
     buffer_bytes: usize,
+    preserve_padding: bool,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -79,6 +80,17 @@ fn subresource_count(desc: &D3D12_RESOURCE_DESC) -> u32 {
         u32::from(desc.DepthOrArraySize)
     };
     u32::from(desc.MipLevels) * slices
+}
+
+/// A single-sample, single-slice mip overwrites its allocation if every
+/// byte belongs to a texel (or a compressed block). Other layouts keep
+/// their original padding and any unused space between subresources.
+fn covers_destination(layout: &victory_formats::texture::Layout, subresources: u32, size: usize) -> bool {
+    let [mip] = layout.mips.as_slice() else { return false };
+    let elements = u64::from(mip.width) * u64::from(mip.height);
+    subresources == 1 && layout.desc.samples == 1 && layout.slices == 1 && mip.depth == 1
+        && layout.addressable()
+        && elements.checked_mul(u64::from(layout.desc.element_bytes)) == Some(size as u64)
 }
 
 impl Back {
@@ -159,7 +171,8 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, retained: crate::resource
     }
     COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let kind = crate::resource::texture_kind(resource);
-    Some(Back { _resource: retained, mapping, buffer, buffer_bytes, footprints, rows, mips, layout, at, size, kind })
+    let preserve_padding = !covers_destination(&layout, subresources, size);
+    Some(Back { _resource: retained, mapping, buffer, buffer_bytes, preserve_padding, footprints, rows, mips, layout, at, size, kind })
 }
 
 /// Textures copied back since the start.
@@ -171,7 +184,9 @@ pub(crate) fn land(back: &Back) {
     let Some(_mapping) = back.mapping.for_write() else { return };
     let mut tiled = vec![0u8; back.size];
     // Bytes of title memory the subresources do not cover stay as they are.
-    crate::host::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
+    if back.preserve_padding {
+        crate::host::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
+    }
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
