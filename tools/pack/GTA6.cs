@@ -80,6 +80,13 @@ static class GTA6
 
         if (prepareOnly)
         {
+            // Os shaders primeiro: sem eles o `warm` fabrica pipelines de um
+            // tradutor que ainda nao leu o pacote, e a partida traduz o resto
+            // no meio do quadro.
+            if (Shaders() <= 0)
+            {
+                Console.WriteLine("A traducao dos shaders nao terminou.");
+            }
             if (!HasBook())
             {
                 Console.WriteLine("Sem livro de pipelines: rode --book uma vez.");
@@ -125,6 +132,7 @@ static class GTA6
         Extract("D3D12Core.dll", Path.Combine(Runtime, "D3D12", "D3D12Core.dll"));
         Extract("CONTROLES.md", Path.Combine(Runtime, "CONTROLES.md"));
         Extract("OTIMIZACOES.md", Path.Combine(Runtime, "OTIMIZACOES.md"));
+        ImportScarlettCache();
 
         if (!File.Exists(GamePathFile) || !File.Exists(ReadGamePath()))
         {
@@ -165,6 +173,73 @@ static class GTA6
             }
             File.Move(temporary, target);
             File.SetLastWriteTimeUtc(target, File.GetLastWriteTimeUtc(assembly.Location));
+        }
+    }
+
+    // O cache do ScarlettPort serve neste runtime: mesma linhagem de codigo e
+    // mesmo formato de arquivo (medido em 27/11: 20 de 20 pipelines feitas a
+    // partir do livro deles, 0 sem host pipeline). Traz de la as 83.561
+    // pipelines conhecidas, os shaders ja traduzidos e 341 MB de pipelines de
+    // host prontas - o que apaga a tela preta de cache frio sem esperar as
+    // 26.000 traducoes do `shaders.rpf`. So roda se o ScarlettPort estiver
+    // instalado; sem ele, nada muda.
+    static void ImportScarlettCache()
+    {
+        string theirs = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ScarlettPort", "cache", "pipelines");
+        if (!Directory.Exists(theirs))
+        {
+            return;
+        }
+        string ours = PipelineFolder();
+        Directory.CreateDirectory(ours);
+        foreach (string name in new string[] { "known-pipelines.bin", "known-shaders.bin" })
+        {
+            string from = Path.Combine(theirs, name);
+            string to = Path.Combine(ours, name);
+            if (!File.Exists(from))
+            {
+                continue;
+            }
+            if (File.Exists(to) && new FileInfo(to).Length >= new FileInfo(from).Length)
+            {
+                continue;
+            }
+            File.Copy(from, to, true);
+        }
+        // A biblioteca de pipelines de host: so entra se a nossa for menos da
+        // metade da deles. Uma biblioteca nossa ja tem as pipelines do nosso
+        // perfil e cresce com o uso; nao se troca por uma menor.
+        string library = Path.Combine(theirs, "host-pipelines.bin");
+        string target = Path.Combine(ours, "host-pipelines.bin");
+        if (File.Exists(library)
+            && (!File.Exists(target) || new FileInfo(target).Length * 2 < new FileInfo(library).Length))
+        {
+            File.Copy(library, target, true);
+        }
+        // Os hashes que os quadros desenham primeiro: a uniao dos dois.
+        string earlyTheirs = Path.Combine(theirs, "early-pipelines.txt");
+        if (File.Exists(earlyTheirs))
+        {
+            string early = Path.Combine(ours, "early-pipelines.txt");
+            HashSet<string> all = new HashSet<string>();
+            foreach (string path in new string[] { early, earlyTheirs })
+            {
+                if (!File.Exists(path))
+                {
+                    continue;
+                }
+                foreach (string line in File.ReadAllLines(path))
+                {
+                    string hash = line.Trim();
+                    if (hash.Length == 32)
+                    {
+                        all.Add(hash);
+                    }
+                }
+            }
+            File.WriteAllLines(early, all);
         }
     }
 
@@ -757,6 +832,46 @@ static class GTA6
         }
     }
 
+    // Traduzir todo programa do pacote de shaders antes da partida, o passo
+    // que o launcher do ScarlettPort faz ("Build shaders": `scarlett warm`
+    // traduz os 25.889 shaders em 171 s). Sem ele a traducao acontece no meio
+    // do quadro e todo draw cujo programa ainda nao existe e deixado de fora:
+    // em soak22 (cache do tradutor com 1.726 programas de ~26.000) foram
+    // 1.644 draws de 2.192 por quadro, GPU 0,0 ms, 534 ms de quadro - a tela
+    // preta com o audio rodando. Com o pacote traduzido inteiro nao falta
+    // pipeline nenhuma.
+    static int Shaders()
+    {
+        string game = ReadGamePath();
+        if (string.IsNullOrEmpty(game))
+        {
+            Say("Sem o caminho do jogo: abra uma vez para escolher a pasta.");
+            return 0;
+        }
+        string pack = Path.Combine(Path.GetDirectoryName(game), "shaders.rpf");
+        if (!File.Exists(pack))
+        {
+            Say("Sem shaders.rpf na pasta do jogo.");
+            return 0;
+        }
+        Say("Traduzindo os shaders do jogo (minutos na primeira vez)...");
+        using (Process shaders = Process.Start(RuntimeStart("shaders \"" + pack + "\" --jobs " + Jobs())))
+        {
+            string line;
+            while ((line = shaders.StandardOutput.ReadLine()) != null)
+            {
+                // Uma linha a cada 1.000 shaders: o proprio runtime as escreve.
+                if (line.IndexOf("shaders in the cache", StringComparison.Ordinal) >= 0)
+                {
+                    Say(line.Trim());
+                }
+            }
+            shaders.WaitForExit();
+            Say("Shaders traduzidos (exit " + shaders.ExitCode + ").");
+            return shaders.ExitCode == 0 ? 1 : 0;
+        }
+    }
+
     static void Prepare()
     {
         if (preparing)
@@ -764,17 +879,18 @@ static class GTA6
             Say("Ja esta preparando.");
             return;
         }
-        if (!HasBook())
-        {
-            Say("Ainda nao ha livro de pipelines. Rode uma sessao com --book uma vez.");
-            return;
-        }
         preparing = true;
-        Say("Compilando as pipelines do jogo antes da partida...");
         Thread worker = new Thread(new ThreadStart(delegate
         {
             try
             {
+                Shaders();
+                if (!HasBook())
+                {
+                    Say("Shaders prontos. Falta o livro de pipelines: jogue uma vez com --book.");
+                    return;
+                }
+                Say("Compilando as pipelines do jogo antes da partida...");
                 Warm();
             }
             catch (Exception error)
