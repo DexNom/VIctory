@@ -1233,6 +1233,10 @@ impl State {
                 // write its result to a texture or a separate root UAV.
                 let raw_writes = if !publish || (write_skip() && !t.host.writes_guest_memory) {
                     Writes::None
+                } else if !indirect && crate::memory::recorded::usable(&stage.shader.hash) {
+                    // Its stores are written into title memory from their
+                    // record once the list has run (`memory::recorded`).
+                    Writes::None
                 } else if builder && !indirect && write_skip() {
                     builder_raw_writes(&stage.shader.hash, self.roots_ref(compute))
                 } else {
@@ -2454,6 +2458,7 @@ impl State {
             // Later ordinary or indirect dispatches use all lanes.
             unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
         }
+        crate::memory::recorded::after_dispatch(list, p);
         #[cfg(feature = "diagnostics")]
         crate::memory::ray_probe::after_dispatch(list, p);
         #[cfg(feature = "diagnostics")]
@@ -3665,6 +3670,9 @@ impl State {
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
+        }
+        if kind == DISPATCH {
+            crate::memory::recorded::after_dispatch(list, p);
         }
         #[cfg(feature = "diagnostics")]
         if kind == DISPATCH {

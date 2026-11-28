@@ -26,7 +26,8 @@ struct Owner {
 }
 
 pub(crate) fn after_dispatch(list: &HostList, pipeline: &HostPipeline) {
-    if !raw_store_probe_enabled() {
+    // With the record in use (`super::recorded`) it is read and reset there.
+    if !raw_store_probe_enabled() || victory_shader::emit::recorded_writes_enabled() {
         return;
     }
     let Some(stage) = pipeline.stages.first().filter(|stage| stage.shader.hash == RAW_STORE_PROBE_HASH) else {

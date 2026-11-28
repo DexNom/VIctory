@@ -60,6 +60,7 @@ use crate::shadow::Shadow;
 pub(crate) mod ray_probe;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod raw_store_probe;
+pub(crate) mod recorded;
 
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
@@ -197,7 +198,7 @@ impl Memory {
         CHANGES.get_or_init(Default::default);
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         let mut fault_dwords = MEMORY_FAULTS;
-        if victory_shader::emit::raw_store_probe_enabled() {
+        if victory_shader::emit::raw_store_probe_enabled() || victory_shader::emit::recorded_writes_enabled() {
             fault_dwords = victory_shader::emit::RAW_STORE_PROBE_BASE
                 + victory_shader::emit::RAW_STORE_PROBE_DWORDS;
         } else if victory_shader::emit::ray_probe_enabled() {
