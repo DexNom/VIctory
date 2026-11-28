@@ -925,7 +925,9 @@ mod tests {
     #[test]
     fn hair_runs_only_when_asked_for_with_a_value_that_says_so() {
         use std::ffi::OsStr;
-        assert!(!super::hair_asked(None));
+        // Unset: hair runs (a frame without the strands is a character with
+        // no hair at all).
+        assert!(super::hair_asked(None));
         for off in ["", "0", " 0 ", "off", "OFF", "false", "no"] {
             assert!(!super::hair_asked(Some(OsStr::new(off))), "{off:?}");
         }
