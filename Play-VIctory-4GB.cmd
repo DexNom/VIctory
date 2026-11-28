@@ -1,6 +1,13 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR=%USERPROFILE%\Downloads\GTA\GTA6.Xbox.v1.0.2.1-CYBERLEEK"
+if not defined VICTORY_GAME_DIR (
+  echo Set VICTORY_GAME_DIR to the folder containing your title executable. 1>&2
+  exit /b 2
+)
+if not exist "%VICTORY_GAME_DIR%\game_scarlett_master.exe" (
+  echo game_scarlett_master.exe not found in VICTORY_GAME_DIR: "%VICTORY_GAME_DIR%" 1>&2
+  exit /b 2
+)
 set "runner=%~dp0target\release\victory.exe"
 if not exist "%runner%" set "runner=%~dp0victory-3d-rtx-pareto-residency.exe"
 
@@ -23,6 +30,8 @@ if not defined VICTORY_THIN set "VICTORY_THIN=0"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
 if not defined VICTORY_LIBRARY_STORE_LATER set "VICTORY_LIBRARY_STORE_LATER=1"
 if not defined VICTORY_PIPELINE_WAIT_MS set "VICTORY_PIPELINE_WAIT_MS=0"
+if not defined VICTORY_PORT_GUARD set "VICTORY_PORT_GUARD=1"
+if not defined VICTORY_PORT_JOURNAL set "VICTORY_PORT_JOURNAL=1"
 if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=0"
 if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=0"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"

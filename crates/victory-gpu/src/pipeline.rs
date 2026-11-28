@@ -137,11 +137,19 @@ pub(crate) fn program_name(container: &[u8]) -> &str {
     std::str::from_utf8(name).unwrap_or("")
 }
 
+/// Whether `VICTORY_HAIR`'s value asks for the hair strands' programs to run:
+/// unset, or any value but `0`, `off`, `false` or `no`. Hair runs by default:
+/// a frame without the strands is a character with no hair at all, which is
+/// what every measured run showed.
+fn hair_asked(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| {
+        let v = v.to_string_lossy();
+        !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "off" | "false" | "no")
+    })
+}
+
 /// Whether a container's program is one of those that animate and draw hair
-/// strands, by its name. They run: a frame without them is a character with
-/// no hair at all, which is what every measured run showed. `VICTORY_HAIR=0`
-/// leaves them out again (some of them did not translate, and the others drew
-/// lines all over the screen without them).
+/// strands, by its name. They run unless `VICTORY_HAIR` says off ([`hair_asked`]).
 #[cfg(windows)]
 fn hair_strands(container: &[u8]) -> bool {
     static RUN: OnceLock<bool> = OnceLock::new();
@@ -165,7 +173,7 @@ fn hair_strands(container: &[u8]) -> bool {
         b"CS_CullMaskPass",
         b"CS_LodBlend",
     ];
-    if !*RUN.get_or_init(|| std::env::var("VICTORY_HAIR").map_or(true, |v| v != "0")) {
+    if !*RUN.get_or_init(|| hair_asked(std::env::var_os("VICTORY_HAIR").as_deref())) {
         return false;
     }
     let name = program_name(container);
@@ -243,6 +251,7 @@ impl Shader {
                         stage = self.stage,
                         hash = %self.hash,
                         program = program_name(&self.container),
+                        names = ?container_names(&self.container),
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         "shader translated"
@@ -816,9 +825,10 @@ pub(crate) extern "system" fn create_stream(
             break;
         };
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8, which the
+            // stream does not promise to be aligned.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -891,8 +901,39 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// The names a title's shader container carries (`CS_..._1234abcd`), for the
+/// log: printable runs of a stage prefix, an underscore and more.
+pub(crate) fn container_names(container: &[u8]) -> Vec<String> {
+    let mut found = Vec::new();
+    for run in container.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_')) {
+        if run.len() >= 6
+            && run.len() <= 96
+            && run[2] == b'_'
+            && matches!(&run[..2], b"CS" | b"PS" | b"VS" | b"MS" | b"AS" | b"GS" | b"HS" | b"DS")
+        {
+            let name = String::from_utf8_lossy(run).into_owned();
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hair_runs_only_when_asked_for_with_a_value_that_says_so() {
+        use std::ffi::OsStr;
+        assert!(!super::hair_asked(None));
+        for off in ["", "0", " 0 ", "off", "OFF", "false", "no"] {
+            assert!(!super::hair_asked(Some(OsStr::new(off))), "{off:?}");
+        }
+        for on in ["1", "yes", "on", "true", "2"] {
+            assert!(super::hair_asked(Some(OsStr::new(on))), "{on:?}");
+        }
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
@@ -905,6 +946,31 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// The slice a title's stream (or a pre-build's) is in need not be
+    /// 8-aligned: its bytecode is read as it lies.
+    #[test]
+    fn a_stream_of_any_alignment_is_read() {
+        let vs = [1u8, 2, 3];
+        let mut backing = [0u64; 5];
+        // SAFETY: the 40 bytes of `backing`, one off its (aligned) start.
+        let stream = unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
+        stream[..4].copy_from_slice(&1u32.to_le_bytes()); // vertex shader
+        stream[8..16].copy_from_slice(&(vs.as_ptr() as usize).to_le_bytes());
+        stream[16..24].copy_from_slice(&vs.len().to_le_bytes());
+        assert_ne!(stream.as_ptr() as usize % 8, 0);
+        let desc = StreamDesc {
+            size: 24,
+            stream: stream.as_ptr(),
+        };
+        let mut out = std::ptr::null();
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut out),
+            S_OK
+        );
+        assert_eq!(shaders(out), vec![("vertex", vs.to_vec())]);
+        crate::object::release_boxed::<Pipeline>(out);
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

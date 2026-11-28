@@ -624,6 +624,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    crate::draw::in_place_indirect_line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -906,12 +907,16 @@ pub(crate) enum View {
 
 impl View {
     /// Whether the view reads buffer memory (constant buffers, buffer views
-    /// of resources or of memory) or memory the title placed a texture in:
-    /// such views get host slots only for draws.
+    /// of resources or of memory) or memory the title placed a texture in
+    /// to sample: such views get host slots only for draws. Placed
+    /// unordered texture views live on the host alone, as texture objects'
+    /// unordered views do, so shader-visible heap writes mirror them.
     #[cfg(windows)]
     fn is_buffer(&self) -> bool {
+        const BUFFER: u32 = 1;
         match self {
-            View::Constant(..) | View::Placed(..) => true,
+            View::Constant(..) | View::Placed(false, ..) => true,
+            View::Placed(true, resource, _) => resource[0] == BUFFER,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
                 crate::resource::buffer_bytes(*r as This).is_some()
             }
@@ -1394,11 +1399,19 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
+/// `CreateConstantBufferView` with a null description. Leaving the slot
+/// untouched would keep a stale view active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size)
+        }
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -2004,6 +2017,23 @@ mod tests {
         assert_eq!(words(at), words(other.as_ptr() as u64));
         create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
         assert_ne!(words(at), words(other.as_ptr() as u64));
+    }
+
+    /// A null CBV description overwrites the slot (D3D12 null CBV), so a
+    /// later read does not see the previous view.
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let a = slots.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        create_srv(null, null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
     }
 
     /// A released resource's views go stale; the same view of a new
