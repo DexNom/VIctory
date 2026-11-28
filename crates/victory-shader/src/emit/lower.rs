@@ -2898,7 +2898,8 @@ impl<'a> Lower<'a> {
     /// Records the binding of an executed store with a mapped start address.
     /// Use the very same copy slot and offset as the store. The high word is
     /// unmasked for diagnosis; the directory uses only its low eight bits.
-    fn trace_raw_store(&mut self, [lo, hi]: [V; 2], copy: V, byte: V, mapped: V, width: u32) {
+    fn trace_raw_store(&mut self, [lo, hi]: [V; 2], copy: V, byte: V, mapped: V, values: &[V]) {
+        let width = 4 * values.len() as u32;
         use super::{RAW_STORE_PROBE_BASE, RAW_STORE_PROBE_CAPACITY, RAW_STORE_PROBE_EVENT_DWORDS, SLOT_FAULTS};
 
         let active = self.begin_guarded(Some(mapped));
@@ -2933,6 +2934,15 @@ impl<'a> Lower<'a> {
             self.cur, "rawBufferStore.i32", Attr::NoUnwind, self.s.t.void, 140,
             &[storage, entry_tail, undef, byte, undef, undef, undef, first, align],
         );
+        // The stored dwords, from the fifth.
+        let offset = self.s.m.i32(20);
+        let entry_values = self.s.m.bin(self.cur, Bin::Add, entry, offset);
+        let mut args = vec![storage, entry_values, undef];
+        args.extend_from_slice(values);
+        args.resize(3 + 4, undef);
+        args.push(self.s.m.i8((1u8 << values.len()) - 1));
+        args.push(align);
+        self.s.op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, self.s.t.void, 140, &args);
         self.end_guarded(in_bounds, &[]);
 
         // Only the first lost record sets this sticky flag. The host rejects
@@ -3026,7 +3036,7 @@ impl<'a> Lower<'a> {
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
             if super::RAW_STORE_PROBE.get() {
-                self.trace_raw_store([lo, hi], copy, byte, mapped, u32::from(n) * 4);
+                self.trace_raw_store([lo, hi], copy, byte, mapped, &vals);
             }
             self.end_guarded(at, &[]);
             self.s.writes_guest_memory = true;
@@ -3035,6 +3045,8 @@ impl<'a> Lower<'a> {
         let Some(op) = name.strip_prefix("global_atomic_") else {
             return Err(name);
         };
+        // Not in the store record: the host cannot rely on it alone.
+        super::note_unrecorded();
         let d = data.as_ref().ok_or("global atomic data")?;
         let v = self.vgprs(inst, d, 1)?[0];
         // With `glc` the value from before comes back, in the result

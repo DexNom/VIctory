@@ -169,10 +169,12 @@ pub fn translate_ray_probe(container: &[u8]) -> Result<HostShader, ShaderError> 
 pub const RAW_STORE_PROBE_HASH: &str = "3cea4534bbc15632";
 pub const RAW_STORE_PROBE_BASE: u32 = MEMORY_FAULTS + RAY_PROBE_DWORDS;
 pub const RAW_STORE_PROBE_CAPACITY: u32 = 4096;
-pub const RAW_STORE_PROBE_EVENT_DWORDS: u32 = 5;
-/// Attempted event count, overflow flag, then five dwords per store.
+pub const RAW_STORE_PROBE_EVENT_DWORDS: u32 = 9;
+/// Attempted event count, overflow flag, then nine dwords per store.
 /// Each store records the full low/high address, byte width, directory copy
-/// slot and byte offset into that copy's host view.
+/// slot and byte offset into that copy's host view, then the 1-4 dwords it
+/// stored (the rest of the four undefined): with them the host writes what
+/// the store wrote into title memory itself ([`recorded_writes_enabled`]).
 pub const RAW_STORE_PROBE_DWORDS: u32 = 2 + RAW_STORE_PROBE_CAPACITY * RAW_STORE_PROBE_EVENT_DWORDS;
 
 pub fn raw_store_probe_enabled() -> bool {
@@ -185,6 +187,33 @@ pub fn raw_store_probe_enabled() -> bool {
 
 thread_local! {
     static RAW_STORE_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while translating with the trace when the shader can change title
+    /// memory some way the trace does not record (an atomic on a raw address).
+    static UNRECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether InitHeaders' stores to title memory are recorded on the card
+/// and written into title memory by the host from that record, in place of
+/// declaring every visible copy written (`VICTORY_RECORDED_WRITES=0`: as
+/// before). InitHeaders takes its destinations from a table in title memory,
+/// so nothing bound to it says where it stores.
+pub fn recorded_writes_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECORDED_WRITES").is_none_or(|v| v != "0"))
+}
+
+/// InitHeaders translated with its stores recorded, and whether the record
+/// holds all it can change in title memory (no raw-address atomics).
+pub fn translate_recorded(container: &[u8]) -> Result<(HostShader, bool), ShaderError> {
+    UNRECORDED.set(false);
+    let shader = with_raw_store_probe(|| translate(container))?;
+    Ok((shader, !UNRECORDED.replace(false)))
+}
+
+pub(crate) fn note_unrecorded() {
+    if RAW_STORE_PROBE.get() {
+        UNRECORDED.set(true);
+    }
 }
 
 fn with_raw_store_probe<T>(work: impl FnOnce() -> T) -> T {
