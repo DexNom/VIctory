@@ -2497,6 +2497,33 @@ impl HostHeap {
             }
             return Ok(None);
         }
+        // A draw's first use of a texture makes its host copy (a committed
+        // resource: a kernel call of some milliseconds). Made below, that
+        // happened under the heap's `made` lock, and every thread recording
+        // a list waited behind it (stack samples in gameplay: about four
+        // times as long waiting for the lock as making copies). Made here
+        // first, the call below finds the copy. Not for the texture queue
+        // (`queued_write`), which may refuse to make copies under memory
+        // pressure. `VICTORY_MAKE_UNDER_LOCK=1`: as before.
+        if for_draw && queued_write.is_none() && !make_under_lock() {
+            // SAFETY: the handle is a descriptor slot in title memory (read
+            // again under the lock below; this read only picks a texture).
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            if tag == VIEW_TAG && let Some(view) = view_at(i, generation) {
+                if let Some(texture) = view.waiting_texture() {
+                    let _ = crate::resource::host_copy(texture as _);
+                } else if let Some((address, len)) = buffer_extent(&view) {
+                    // A buffer's host copy, likewise made on first use.
+                    let _ = crate::shadow::find(address, len);
+                } else if let Some(placed) = placed_texture(&view)
+                    && let Some(texture) = placed.view.waiting_texture()
+                {
+                    // A texture the title placed in memory: the resource
+                    // standing for it, then its host copy.
+                    let _ = crate::resource::host_copy(texture as _);
+                }
+            }
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         if queued_write.is_some_and(|write| !self.queued_write_current(index, write)) {
             return Ok(None);
@@ -3678,6 +3705,13 @@ fn resident_sampled_texture(view: &View) -> Option<crate::resource::ResidentText
 pub(crate) struct PlacedTexture {
     pub(crate) view: View,
     _owner: Option<crate::resource::ResourceRef>,
+}
+
+/// `VICTORY_MAKE_UNDER_LOCK=1`: a draw's first use of a texture makes its
+/// host copy under the heap's lock, as before (`HostHeap::mirror_if`).
+fn make_under_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAKE_UNDER_LOCK").is_some_and(|v| v == "1"))
 }
 
 /// A placed texture's original view on its host resource. A writable

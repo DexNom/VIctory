@@ -334,8 +334,17 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    // View memory the guards hold already (its first block read-only by
+    // our hand, or noted absent) is never write-watched: the kernel's
+    // answer would be a failure, a system call each time for every
+    // texture refresh in view memory. `VICTORY_WATCH_VIEWS=1` asks anyway.
+    let known_view = guarded && !watch_views() && {
+        let g = guards();
+        let block = start / BLOCK;
+        g.protected.contains(&block) || g.absent.contains(&block)
+    };
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
+    let failed = known_view || unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
@@ -379,6 +388,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// `VICTORY_WATCH_VIEWS=1`: [`writes`] asks the kernel about view memory
+/// the guards hold too, as before (the asking fails there).
+fn watch_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_VIEWS").is_some_and(|v| v == "1"))
 }
 
 /// Guarded blocks of view memory.

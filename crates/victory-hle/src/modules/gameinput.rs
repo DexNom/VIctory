@@ -124,8 +124,8 @@ trait Source: Send {
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
     #[cfg(feature = "diagnostics")]
-    fn auto_enter(&mut self) -> bool {
-        false
+    fn auto_enter(&mut self) -> Option<u32> {
+        None
     }
     #[cfg(feature = "diagnostics")]
     fn movement(&mut self, _stand_in_connected: bool) -> Option<std::sync::Arc<HeldMovement>> {
@@ -436,10 +436,10 @@ impl Hub {
             #[cfg(feature = "diagnostics")]
             let (pads, native, keys) = {
                 let (mut pads, mut native, mut keys) = (pads, native, keys);
-                if source.auto_enter() {
+                if let Some(button) = source.auto_enter() {
                     if let Some(pad) = pads.iter_mut().flatten().next().or(native.as_mut()) {
-                        pad.buttons |= A;
-                    } else if !keys.iter().any(|k| k.virtual_key == 0x0D) {
+                        pad.buttons |= button;
+                    } else if button == A && !keys.iter().any(|k| k.virtual_key == 0x0D) {
                         keys.push(KeyState {
                             virtual_key: 0x0D,
                             scan_code: 0x1C,
@@ -1204,6 +1204,8 @@ mod host {
         #[cfg(feature = "diagnostics")]
         enter_started: Option<Instant>,
         #[cfg(feature = "diagnostics")]
+        enter_button: u32,
+        #[cfg(feature = "diagnostics")]
         movement: MovementFile,
     }
 
@@ -1268,27 +1270,53 @@ mod host {
         }
 
         #[cfg(feature = "diagnostics")]
-        fn auto_enter(&mut self) -> bool {
+        fn auto_enter(&mut self) -> Option<u32> {
             static SIGNAL: LazyLock<Option<std::path::PathBuf>> =
                 LazyLock::new(|| std::env::var_os("VICTORY_ENTER_ON_FILE").map(Into::into));
-            let Some(path) = SIGNAL.as_ref() else {
-                return false;
-            };
+            let path = SIGNAL.as_ref()?;
             const HELD: Duration = Duration::from_millis(200);
             if let Some(started) = self.enter_started {
-                return started.elapsed() < HELD;
+                if started.elapsed() < HELD {
+                    return Some(self.enter_button);
+                }
+                // Re-arm once the signal file is removed, so a script can
+                // press again by creating it again.
+                if !path.is_file() {
+                    self.enter_started = None;
+                }
+                return None;
             }
             let now = Instant::now();
             if self.enter_check.is_some_and(|next| now < next) {
-                return false;
+                return None;
             }
             self.enter_check = Some(now + Duration::from_millis(100));
             if !path.is_file() {
-                return false;
+                return None;
             }
+            // The file may name a stand-in key (Enter, Esc, Down, Q, ...);
+            // empty or unknown text means A.
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let vk = match text.trim() {
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => 0x0D,
+            };
+            self.enter_button = super::FALLBACK_BUTTONS
+                .iter()
+                .find(|(key, _)| *key == vk)
+                .map_or(super::A, |&(_, button)| button);
             self.enter_started = Some(now);
-            tracing::info!(path = %path.display(), "pressing Enter/A for automated startup");
-            true
+            tracing::info!(path = %path.display(), key = text.trim(), "pressing a scripted button");
+            Some(self.enter_button)
         }
 
         #[cfg(feature = "diagnostics")]
