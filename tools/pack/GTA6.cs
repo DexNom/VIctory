@@ -1009,6 +1009,20 @@ static class GTA6
         start.CreateNoWindow = true;
         start.Arguments = "run \"" + game + "\" --execute --console series-s";
         Profile(start, high, panel);
+        try
+        {
+            string logsDir = Path.Combine(Runtime, "logs");
+            Directory.CreateDirectory(logsDir);
+            string envLog = Environment.GetEnvironmentVariable("VICTORY_LOG");
+            string envFile = Environment.GetEnvironmentVariable("VICTORY_LOG_FILE");
+            start.EnvironmentVariables["VICTORY_LOG"] = string.IsNullOrEmpty(envLog) ? "info" : envLog;
+            start.EnvironmentVariables["VICTORY_LOG_FILE"] = string.IsNullOrEmpty(envFile)
+                ? Path.Combine(logsDir, "gameplay-latest.log")
+                : envFile;
+        }
+        catch (Exception)
+        {
+        }
         return Process.Start(start);
     }
 

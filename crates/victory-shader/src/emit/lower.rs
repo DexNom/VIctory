@@ -1925,9 +1925,15 @@ impl<'a> Lower<'a> {
             let group = s.threads.map(|t| t.into_iter().product::<u32>()).unwrap_or(0);
             let waves = group.div_ceil(64).max(1);
             // One dword per console wave per meet: both halves share it, each in its own
-            // 16-bit half of the dword. A site that does not fit is refused rather than
-            // declared past the host's 32 KiB.
-            let spare = HOST_LDS_DWORDS.saturating_sub(s.lds_dwords).saturating_sub(3);
+            // 16-bit half of the dword. Keep under the 32 KiB (8192 dwords) DXIL limit
+            // whenever the shader's own LDS allows it, allowing up to HOST_LDS_DWORDS
+            // (48 KiB on Ampere) only when the shader already approaches 32 KiB.
+            let limit = if s.lds_dwords > 7500 {
+                HOST_LDS_DWORDS
+            } else {
+                8192
+            };
+            let spare = limit.saturating_sub(s.lds_dwords).saturating_sub(3);
             let per = waves;
             let cap = spare.checked_div(per).unwrap_or(0);
             let base = s.lds_dwords;
@@ -4031,8 +4037,12 @@ impl<'a> Lower<'a> {
                         (at, b)
                     };
                     xy = self.exchange_halves(xat, xb, xy.0)?;
+                    if xat == at {
+                        self.ballots.insert(lo, xy);
+                    }
+                } else {
+                    self.ballots.insert(lo, xy);
                 }
-                self.ballots.insert(lo, xy);
                 xy
             }
         };
@@ -4731,11 +4741,11 @@ impl<'a> Lower<'a> {
         let index = self.s.m.bin(block, Bin::Add, at_wave, wave);
         // One dword per wave, both halves in it: half 0 in bits 0..15, half 1 in bits 16..31.
         let one = self.s.m.i32(1);
-        let sixteen = self.s.m.i32(16);
-        let half_shift = self.s.m.bin(block, Bin::Shl, half, sixteen);
+        let four = self.s.m.i32(4);
+        let half_shift = self.s.m.bin(block, Bin::Shl, half, four);
         let mine_val = self.s.m.bin(block, Bin::Shl, one, half_shift);
         let flipped = self.s.m.bin(block, Bin::Xor, half, one);
-        let other_shift = self.s.m.bin(block, Bin::Shl, flipped, sixteen);
+        let other_shift = self.s.m.bin(block, Bin::Shl, flipped, four);
         let thirty1 = self.s.m.i32(31);
         let lane_in_half = self.s.m.bin(block, Bin::And, in_wave, thirty1);
         let zero = self.s.m.i32(0);
@@ -4748,7 +4758,10 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(block, Term::CondBr(first, yes, no));
         let lds = self.s.lds();
         let mine = self.s.m.element(yes, lds, index);
-        let old_yes = self.s.m.atomic(yes, Rmw::Add, mine, mine_val);
+        let old_raw = self.s.m.atomic(yes, Rmw::Add, mine, mine_val);
+        let mask16 = self.s.m.i32(0xffff);
+        let old_shifted = self.s.m.bin(yes, Bin::LShr, old_raw, half_shift);
+        let old_yes = self.s.m.bin(yes, Bin::And, old_shifted, mask16);
         self.s.m.terminate(yes, Term::Br(join));
         self.s.m.terminate(no, Term::Br(join));
         let i32t = self.s.t.i32;
@@ -4764,7 +4777,6 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(wait, Term::CondBr(first, lyes, lno));
         let theirs = self.s.m.element(lyes, lds, index);
         let seen_raw = self.s.m.load_volatile(lyes, theirs);
-        let mask16 = self.s.m.i32(0xffff);
         let seen_field = self.s.m.bin(lyes, Bin::LShr, seen_raw, other_shift);
         let seen_yes = self.s.m.bin(lyes, Bin::And, seen_field, mask16);
         self.s.m.terminate(lyes, Term::Br(ljoin));
@@ -4842,7 +4854,7 @@ impl<'a> Lower<'a> {
         if self.meet_cap == 0 {
             return;
         }
-        let n = self.meet_cap * 2 * self.meet_waves.max(1) + 3;
+        let n = self.meet_cap * self.meet_waves.max(1) + 3;
         let entry = self.s.entry;
         let (head, done) = (self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(entry, Term::Br(head));
