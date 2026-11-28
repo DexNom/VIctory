@@ -34,6 +34,7 @@ mod threads;
 mod thunks;
 #[cfg(windows)]
 mod tls;
+pub mod watchdog;
 #[cfg(windows)]
 mod windows;
 

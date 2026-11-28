@@ -7632,6 +7632,10 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// Puts the title's interface plane over its scene plane (two-plane presents).
+    composer: Option<crate::compose::Composer>,
+    /// The composer could not be made: two-plane presents show the base plane.
+    composer_failed: bool,
 }
 
 /// The process's CPU time in microseconds, kernel and user.
@@ -8068,14 +8072,52 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
+    #[allow(dead_code)]
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.present_planes(texture, state, None, frame)
+    }
+
+    /// Shows `texture`, with a second `overlay` plane (the title's interface)
+    /// alpha-composited over it if given, and leaves both in their states.
+    /// Ported from VIctory-NVIDIA's `present_planes` (trustno1-coder).
+    pub(crate) fn present_planes(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
-            tracing::warn!(format = desc.Format.0, "cannot present this format");
-            return None;
+        let planes = overlay.and_then(|(over, over_state)| {
+            // SAFETY: a live overlay resource.
+            let over_desc = unsafe { over.GetDesc() };
+            Some((
+                over,
+                D3D12_RESOURCE_STATES(over_state as i32),
+                crate::compose::view(&desc)?,
+                crate::compose::view(&over_desc)?,
+            ))
+        });
+        let format = if planes.is_some() {
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        } else {
+            let Some(format) = swap_format(desc.Format) else {
+                tracing::warn!(format = desc.Format.0, "cannot present this format");
+                return None;
+            };
+            format
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        // Two planes: the output takes the larger plane's size (the
+        // interface's), so its text stays sharp; the scene is scaled up.
+        let (width, height) = match planes {
+            Some((over, ..)) => {
+                // SAFETY: a live overlay resource.
+                let o = unsafe { over.GetDesc() };
+                ((desc.Width as u32).max(o.Width as u32), desc.Height.max(o.Height))
+            }
+            None => (desc.Width as u32, desc.Height),
+        };
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -8097,6 +8139,9 @@ impl Host {
             };
             match resized {
                 Ok(()) => {
+                    if p.format != format {
+                        p.composer = None;
+                    }
                     (p.width, p.height, p.format) = (width, height, format);
                     tracing::info!(
                         width,
@@ -8113,8 +8158,18 @@ impl Host {
                 }
             }
         }
+        if planes.is_some() && p.composer.is_none() && !p.composer_failed {
+            match crate::compose::Composer::new(self, format) {
+                Ok(c) => p.composer = Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "two-plane composer not made; showing the base plane only");
+                    p.composer_failed = true;
+                }
+            }
+        }
+        let planes = planes.filter(|_| p.composer.is_some());
         let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        // SAFETY: our swap chain, list and live source texture(s).
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
@@ -8144,31 +8199,118 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
+            let mut composed = false;
+            if let Some((over, over_state, base_fmt, over_fmt)) = planes
+                && let Some(composer) = p.composer.as_mut()
+            {
+                copy.keep(texture);
+                copy.keep(over);
+                let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                let mut pre = Vec::with_capacity(3);
+                if state != read {
+                    pre.push(transition(texture, state, read));
+                }
+                if over_state != read {
+                    pre.push(transition(over, over_state, read));
+                }
+                pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
+                list.ResourceBarrier(&pre);
+                let recorded = composer.record(
+                    self,
+                    slot.map_or(0, |i| i + 1),
+                    list,
+                    [(texture, base_fmt), (over, over_fmt)],
                     &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+                    (width, height),
+                );
+                let mut post = Vec::with_capacity(3);
+                if state != read {
+                    post.push(transition(texture, read, state));
+                }
+                if over_state != read {
+                    post.push(transition(over, read, over_state));
+                }
+                post.push(transition(&back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST));
+                list.ResourceBarrier(&post);
+                match recorded {
+                    Ok(()) => {
+                        composed = true;
+                        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !ONCE.swap(true, Ordering::Relaxed) {
+                            tracing::info!(
+                                frame,
+                                width,
+                                height,
+                                base_format = base_fmt.0,
+                                overlay_format = over_fmt.0,
+                                "display output: compositing two planes (interface over scene)"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "could not record the two-plane composite; showing the base plane");
+                    }
+                }
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                list.CopyResource(&back, texture);
+            }
+            // (A failed composite leaves the back buffer as COPY_DEST, like a
+            // copy: it is presented as it is.)
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| {
+                    if composed {
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        )]);
+                        let res = crate::capture::read_back(&self.device, list, &back);
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )]);
+                        res
+                    } else if planes.is_none() {
+                        crate::capture::read_back(&self.device, list, texture)
+                    } else {
+                        None
+                    }
+                })
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() || planes.is_some() {
+                None
+            } else {
+                crate::capture::probe(&self.device, list, texture)
+            };
             #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            let _ = (frame, composed);
+            if planes.is_some() {
+                list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                )]);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            }
             copy.close();
             match slot {
                 Some(i) => {
@@ -8233,6 +8375,8 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                composer: None,
+                composer_failed: false,
             })
         }
     }
