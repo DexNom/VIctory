@@ -420,6 +420,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
+    DEEP_HERE.set(wave_deep_known(container));
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -450,9 +451,31 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
 thread_local! {
     /// The hash-scoped wave policy for this thread's current translation.
     static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this thread's current container is one whose programs need the
+    /// "without skips" form ([`wave_deep_known`]).
+    static DEEP_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The hash of the shader this thread translates ([`with_shader`]), named by the
     /// `VICTORY_WAVE_WHY` lines: translations on several threads interleave them.
     static SHADER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Programs whose exact form is the one that leaves out the skips the code after them
+/// cannot see (`VICTORY_WAVE_DEEP_SKIPS`'s form): their wave reductions sit under
+/// branches the wide form cannot take — a thread group of several console waves, where a
+/// barrier inside a branch would wait for threads that never come — and the plain exact
+/// form stops at the first of them. Named, not hashed: a program's name survives the new
+/// container hashes of a game build, and these are the four computes of the tiled shadow
+/// renderer (measured: they translate with the wide form on and this form too, and only
+/// with this one) and the heap's free-request defrag.
+pub fn wave_deep_known(container: &[u8]) -> bool {
+    const NAMES: &[&[u8]] = &[
+        b"CS_ShadowRenderTiledMisc_",
+        b"CS_ShadowRenderTiledMiscCB_",
+        b"CS_ShadowRenderTiledMiscAlpha_",
+        b"CS_ShadowRenderTiledMiscHair_",
+        b"CS_DefragHeap_ProcessFreeRequests_",
+    ];
+    NAMES.iter().any(|n| container.windows(n.len()).any(|w| w == *n))
 }
 
 /// `eprintln!` for the `VICTORY_WAVE_WHY` lines, with the shader's hash in front.
@@ -723,7 +746,8 @@ fn emit_forms(
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=1` opts in.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_some_and(|v| v == "1");
+                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_some_and(|v| v == "1")
+                    || DEEP_HERE.with(std::cell::Cell::get);
                 let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);

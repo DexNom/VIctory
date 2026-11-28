@@ -139,6 +139,22 @@ $settings = @{
     # Janela sem borda do tamanho do monitor. Alt+Enter ou F11 alternam dentro
     # do jogo (a swap chain mantem o tamanho e estica; nenhum modo muda).
     VICTORY_FULLSCREEN = '0'
+    # ---- onda larga, so nos programas que provaram traduzir ------------------
+    # Um programa compute de wave64 que reduz a onda dentro de um trecho
+    # divergente (SSR, decalque projetado, MinMax da exposicao, nuvem, agua,
+    # sombra por tile) e recusado pelo lowering exato: as duas metades da onda
+    # nao se encontram. A forma larga toma o branch pela onda inteira, com duas
+    # barreiras de grupo, e traduz. Ligada so nestes 27 hashes (medido com
+    # `victory translate --warm` nesta build do jogo: 27 de 38): o formulario
+    # global (`VICTORY_WAVE_WIDE=1`) derrubou a placa em ptfx_CS_lightAtlas
+    # nas runs 121-124. Nao e' hash de outro jogo: e' a build 1.0.2.1.
+    VICTORY_WAVE_WIDE_ONLY = '0a5ecfee6b79e13b,11276d0c8bbe180a,136986812880cead,' +
+        '1f1fbd86759b3da2,21f7ad7863620328,240cb516c1af0bc3,2cfa4a6ad9ef005a,' +
+        '2e92491c2ae5472b,31d703207b51549a,3e28ebd6128bd351,65de113e23fa4fdd,' +
+        '7168dd781ca7efb9,71883e40620a567a,73ac67482f6b6a5d,7c9a6a83826cdfac,' +
+        '804b342cb4b9d1e9,8b9483919d8d5e99,8bb272e763f76148,9809b8d965b04935,' +
+        'a2f1004f8d6d7aad,b96880482a17f632,bdf438d5731d36cc,cbf9b65f2249ba96,' +
+        'cc7b23cc0b6a8eba,d2b169b82f67ec5b,f1eff11f31566a6e,ff8fe948b132510f'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 return $settings

@@ -911,3 +911,46 @@ Medido nesta build:
 - **Merge do origin/main**: lane-split (#80), mascara de lane (#66), resgate
   em pilha de 4 GiB (#39), o lowering wave32 de defrag e de seis computes de
   uma onda, e o resto. cargo test -p victory-gpu --lib: 408 passam.
+
+## A onda larga: 27 programas que o titulo pedia e nao recebia (27/11, noite)
+
+O log da run de 900 s mostrou 38 programas compute recusados com
+`does not translate; its pipelines' draws are dropped`. Todos da mesma
+familia: um compute de wave64 que reduz a onda (soma, contagem, OR) dentro de
+um trecho onde nem toda lane roda. O lowering exato para ai: as duas metades
+da onda nao podem se encontrar sem uma barreira que a outra metade talvez
+nunca alcance.
+
+A forma larga (`VICTORY_WAVE_WIDE`, `emit::widen`) toma o branch pela onda
+inteira, com duas barreiras de grupo, e traduz. Medido com
+`victory translate --warm` nesta build do jogo (1.0.2.1):
+
+- 38 hashes recusados testados; **27 traduzem** com a forma larga.
+- O que volta: `CS_RayPrePass_Opaque_SSR`, `_Alpha` e `_Water_SSR` (reflexo),
+  `CS_ProjDecalCut` e `CS_ProjDecalReduceClassification` (decalque),
+  `CS_MinMax_Float/Int_*` (exposicao automatica),
+  `CS_CloudMultiScatteringCache` (nuvem), `CS_GenerateWaterPatchWritingJobs` e
+  `CS_CullWaterPatchesUsingCalmingInfo` (agua), `CS_Tree_BatchCull_ValidateInst*`,
+  `CS_HorizonVehicleLightCulling`, `CS_GpuSorting_Sort`, `CS_EntityFireResolve`,
+  `CS_ApplyAeroWakesToWindField`, `CS_GatherDensityAreaForReadBack`,
+  `CS_TemporalResolve2_Opaque_FrameStatistics`, `CS_GenerateShadowMasks_HairOnly`
+  e quatro `CS_ShadowRenderTiledMisc*` (a sombra por tile).
+- **11 continuam recusados**: todas as variantes `*PPPC` (por pixel) e o
+  `CS_CollectTriangles_Meshlets`. O meshlet tem grupo de 1024 threads e a forma
+  larga so vale para grupo de uma onda de console (64): com varias ondas no
+  grupo, uma barreira dentro do branch esperaria threads que nao vem. O meshlet
+  precisa do lowering por onda local, que hoje so aceita o idioma de alocacao
+  (`emit::lower::wave_local`).
+- **So nos 27**, via `VICTORY_WAVE_WIDE_ONLY`: o interruptor global derrubou a
+  placa em `ptfx_CS_lightAtlas` nas runs 121-124.
+- Quatro dos `CS_ShadowRenderTiledMisc*` e o `CS_DefragHeap_ProcessFreeRequests`
+  precisam tambem da forma "sem skips". Ela entrou por **nome de programa**
+  (`emit::wave_deep_known`), nao por hash: o nome sobrevive a uma build nova do
+  jogo, o hash nao. `VICTORY_WAVE_DEEP_SKIPS=1` continua ligando para todos.
+- **Nao sobe o fps.** Esses programas passam a rodar na placa; antes o dispatch
+  era descartado. O quadro segue preso na CPU: ~6.000 draws preparados num
+  thread, 37 ms de copias de memoria do titulo e ~50 ms de preparo por draw.
+  O ganho e' de imagem: reflexo, decalque, exposicao, nuvem, agua e sombra.
+- Custo: a lista entra na chave do cache de shaders (`shader_cache::build`),
+  entao a primeira run depois da troca traduz tudo de novo (10-20 min) e as
+  seguintes acham no disco.

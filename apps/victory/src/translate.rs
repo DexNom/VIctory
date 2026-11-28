@@ -152,6 +152,27 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// The name the title gave a container's program: the identifier just before
+/// the `_Wrapped` export every console entry point ends with. Empty when the
+/// container names none. Same reading as `victory_gpu::pipeline`'s, for the
+/// warm-up's per-hash lines.
+fn program_name(container: &[u8]) -> &str {
+    const END: &[u8] = b"_Wrapped";
+    let Some((at, _)) = container
+        .windows(END.len())
+        .enumerate()
+        .find(|(_, w)| *w == END)
+    else {
+        return "";
+    };
+    let before = &container[at.saturating_sub(100)..at];
+    let name = before
+        .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+        .next()
+        .unwrap_or_default();
+    std::str::from_utf8(name).unwrap_or("")
+}
+
 /// `translate --warm <file>`: the containers whose hash the file names are
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
@@ -203,7 +224,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                                 counts[3].fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
-                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
+                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash.clone()) {
                                 continue;
                             }
                             let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
@@ -215,6 +236,13 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                                 Ok(false) => 1,
                                 Err(_) => 2,
                             };
+                            if !all {
+                                let name = program_name(&bytes);
+                                println!(
+                                    "warm-up      {hash} {} {name}",
+                                    ["translated", "in the cache", "does not translate"][which]
+                                );
+                            }
                             counts[which].fetch_add(1, Ordering::Relaxed);
                         }
                     });
