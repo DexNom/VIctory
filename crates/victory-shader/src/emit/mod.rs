@@ -478,6 +478,27 @@ pub fn wave_deep_known(container: &[u8]) -> bool {
     NAMES.iter().any(|n| container.windows(n.len()).any(|w| w == *n))
 }
 
+/// Whether the container names a program that `name` begins: the identifier
+/// before the `_Wrapped` export every console entry point ends with. Named,
+/// not hashed, for the same reason as [`wave_deep_known`]: the name survives
+/// the new container hashes of a game build.
+fn named(c: &Container, name: &[u8]) -> bool {
+    const END: &[u8] = b"_Wrapped";
+    c.parts.iter().any(|part| {
+        let data = part.data;
+        (0..data.len().saturating_sub(END.len())).any(|at| {
+            data[at..at + END.len()] == *END && {
+                let before = &data[at.saturating_sub(100)..at];
+                let ident = before
+                    .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                    .next()
+                    .unwrap_or_default();
+                ident.starts_with(name)
+            }
+        })
+    })
+}
+
 /// `eprintln!` for the `VICTORY_WAVE_WHY` lines, with the shader's hash in front.
 macro_rules! wave_why {
     ($($arg:tt)*) => {
@@ -723,12 +744,29 @@ fn emit_forms(
         // `VICTORY_DEFRAG=0` leaves this compute untranslated, so its dispatches
         // are dropped and a run can be compared with one where it executes.
         let defrag_off = std::env::var_os("VICTORY_DEFRAG").is_some_and(|v| v == "0");
+        // Groups of sixteen console waves, where a group barrier inside a branch
+        // would wait for waves that took another branch: each wave meets its own
+        // halves instead (`with_half_meets`). Both are wave64 programs whose
+        // cross-half exchanges sit under per-lane branches, so no exact form of
+        // theirs lowers at all. `CS_CollectTriangles_Meshlets` builds the meshlets
+        // the geometry stages draw; `CS_Emit_Static_Model` emits the static
+        // models' triangles. Named, not hashed: a program's name survives the new
+        // container hashes of a game build. (The scan is only paid by computes of
+        // more than two console waves.)
+        let many_waves = matches!(
+            native.io,
+            crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 128
+        );
         let defrag = !defrag_off
-            && c.digest
+            && (c.digest
                 == [
                     0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a,
                     0xa1, 0x23, 0xc6,
-                ];
+                ]
+                || (many_waves && named(c, b"CS_CollectTriangles_Meshlets"))
+                || named(c, b"CS_Emit_Static_Model")
+                || named(c, b"CS_ShadowRenderTiled")
+                || named(c, b"CS_ShadowTileBalanceRTCost"));
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -870,9 +908,9 @@ fn emit_forms(
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
-/// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// it translates or a branch cannot be widened. A thread group of one console wave, or of
+/// several where each wave meets its own halves in its own LDS dwords
+/// (`lower::with_half_meets`, no group barrier to wait on a thread that never comes).
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -887,10 +925,14 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
-        // One program only: two console waves, and a meet per wave instead of a group barrier.
+        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() <= 64 => {}
+        // A group of several console waves, each wave meeting its own two halves in
+        // its own LDS dwords (`with_half_meets`): no group barrier, so the waves of
+        // the group need not wait for one another. Every thread of a group is
+        // resident on the host (D3D12 runs a thread group whole), so the meet
+        // cannot wait for a thread that never comes.
         crate::native::StageIo::Cs(cs)
-            if lower::half_meets() && cs.threads.iter().product::<u32>() == 128 => {}
+            if lower::half_meets() && (cs.threads.iter().product::<u32>() % 64 == 0 || cs.threads.iter().product::<u32>() <= 64) => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 wave_why!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);

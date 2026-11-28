@@ -154,7 +154,10 @@ $settings = @{
         '7168dd781ca7efb9,71883e40620a567a,73ac67482f6b6a5d,7c9a6a83826cdfac,' +
         '804b342cb4b9d1e9,8b9483919d8d5e99,8bb272e763f76148,9809b8d965b04935,' +
         'a2f1004f8d6d7aad,b96880482a17f632,bdf438d5731d36cc,cbf9b65f2249ba96,' +
-        'cc7b23cc0b6a8eba,d2b169b82f67ec5b,f1eff11f31566a6e,ff8fe948b132510f'
+        'cc7b23cc0b6a8eba,d2b169b82f67ec5b,f1eff11f31566a6e,ff8fe948b132510f,' +
+        '20b78ee12ecdb57d,466ec41d3f9d24c0,56f3bf2d9388e5a7,6b82bc7d22016cb5,' +
+        '7b2c3c1db2298f44,9662515112a3f961,abd7a22106898c66,b4b0427232707598,' +
+        'ce79e9eba7ae0348,d7db57731ada919b,f133e35efed2a48a,fa0bd10a35bfef3c'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 return $settings

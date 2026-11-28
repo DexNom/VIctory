@@ -1394,8 +1394,8 @@ thread_local! {
     static HALF_MEETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The host's group-shared memory, in dwords (32 KiB).
-const HOST_LDS_DWORDS: u32 = 8192;
+/// The host's group-shared memory, in dwords (32 KiB default, 48 KiB on SM6.0+).
+const HOST_LDS_DWORDS: u32 = 12288;
 
 /// Runs `f` while a group of two console waves orders its halves with a per-wave meet
 /// instead of a group barrier, where not every thread of the group arrives.
@@ -1924,9 +1924,11 @@ impl<'a> Lower<'a> {
         let (meet_base, meet_cap, meet_waves, meet_tally, wave_all, group_all) = if half_meet {
             let group = s.threads.map(|t| t.into_iter().product::<u32>()).unwrap_or(0);
             let waves = group.div_ceil(64).max(1);
-            // Three dwords past the table count meetings, wait polls and wait atomics.
+            // One dword per console wave per meet: both halves share it, each in its own
+            // 16-bit half of the dword. A site that does not fit is refused rather than
+            // declared past the host's 32 KiB.
             let spare = HOST_LDS_DWORDS.saturating_sub(s.lds_dwords).saturating_sub(3);
-            let per = 2 * waves;
+            let per = waves;
             let cap = spare.checked_div(per).unwrap_or(0);
             let base = s.lds_dwords;
             s.lds_dwords += cap * per;
@@ -4018,12 +4020,17 @@ impl<'a> Lower<'a> {
                         if !self.local_ok && !self.local_any {
                             return Err("a lane mask read as data in a half-wave");
                         }
-                    } else if !self.exchange.as_ref().is_some_and(|e| e.1) && !b.is_none_or(|b| self.all_lanes(b)) {
+                    } else if !self.exchange.as_ref().is_some_and(|e| e.1) && !b.is_none_or(|b| self.lane_ok(b)) {
                         // (a group of 32 or fewer has no other half to exchange with)
                         need(b.unwrap_or(0));
                         return Err(DIVERGENT_MASK_EXCHANGE);
                     }
-                    xy = self.exchange_halves(at, b, xy.0)?;
+                    let (xat, xb) = if self.half_meet && at != self.cur {
+                        (self.cur, Some(self.cur_ir))
+                    } else {
+                        (at, b)
+                    };
+                    xy = self.exchange_halves(xat, xb, xy.0)?;
                 }
                 self.ballots.insert(lo, xy);
                 xy
@@ -4640,6 +4647,16 @@ impl<'a> Lower<'a> {
         self.group_all.get(self.cur_ir).copied().unwrap_or(false)
     }
 
+    /// Whether this block has all required lanes: with `half_meet`, both halves of each
+    /// console wave; otherwise, all lanes of the group.
+    fn lane_ok(&self, block: usize) -> bool {
+        if self.half_meet {
+            self.both_halves(block)
+        } else {
+            self.all_lanes(block)
+        }
+    }
+
     /// Both halves of each console wave run `block` (a wave-wide branch counts; the other
     /// console wave of the group need not).
     fn both_halves(&self, block: usize) -> bool {
@@ -4706,30 +4723,32 @@ impl<'a> Lower<'a> {
         let half = self.s.m.bin(block, Bin::LShr, in_wave, five);
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(block, Bin::LShr, thread, six);
-        let per = self.s.m.i32(2 * self.meet_waves);
+        let per = self.s.m.i32(self.meet_waves);
         let site_v = self.s.m.i32(site);
         let wave_pair = self.s.m.bin(block, Bin::Mul, site_v, per);
-        let two = self.s.m.i32(2);
         let base = self.s.m.i32(self.meet_base);
         let at_wave = self.s.m.bin(block, Bin::Add, base, wave_pair);
-        let wave_off = self.s.m.bin(block, Bin::Mul, wave, two);
-        let at_wave = self.s.m.bin(block, Bin::Add, at_wave, wave_off);
-        let index = self.s.m.bin(block, Bin::Add, at_wave, half);
+        let index = self.s.m.bin(block, Bin::Add, at_wave, wave);
+        // One dword per wave, both halves in it: half 0 in bits 0..15, half 1 in bits 16..31.
         let one = self.s.m.i32(1);
+        let sixteen = self.s.m.i32(16);
+        let half_shift = self.s.m.bin(block, Bin::Shl, half, sixteen);
+        let mine_val = self.s.m.bin(block, Bin::Shl, one, half_shift);
         let flipped = self.s.m.bin(block, Bin::Xor, half, one);
-        let other = self.s.m.bin(block, Bin::Add, at_wave, flipped);
+        let other_shift = self.s.m.bin(block, Bin::Shl, flipped, sixteen);
         let thirty1 = self.s.m.i32(31);
         let lane_in_half = self.s.m.bin(block, Bin::And, in_wave, thirty1);
         let zero = self.s.m.i32(0);
         let first = self.s.m.cmp(block, pred::EQ, lane_in_half, zero);
-        // Publish on this half's dword, then wait on the other half's. One lane of the
-        // half does each: the other lanes take that lane's value. A plain load waits,
-        // so the publisher is the only writer of its dword.
+        // Publish in this half's 16-bit field of the shared dword, then wait on the
+        // other half's field of the same dword. One lane of the half does each: the
+        // other lanes take that lane's value. A plain load waits, so the publisher is
+        // the only writer of its field.
         let (yes, no, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(block, Term::CondBr(first, yes, no));
         let lds = self.s.lds();
         let mine = self.s.m.element(yes, lds, index);
-        let old_yes = self.s.m.atomic(yes, Rmw::Add, mine, one);
+        let old_yes = self.s.m.atomic(yes, Rmw::Add, mine, mine_val);
         self.s.m.terminate(yes, Term::Br(join));
         self.s.m.terminate(no, Term::Br(join));
         let i32t = self.s.t.i32;
@@ -4743,8 +4762,11 @@ impl<'a> Lower<'a> {
         let polls = self.s.m.phi(wait, i32t);
         let (lyes, lno, ljoin) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(wait, Term::CondBr(first, lyes, lno));
-        let theirs = self.s.m.element(lyes, lds, other);
-        let seen_yes = self.s.m.load_volatile(lyes, theirs);
+        let theirs = self.s.m.element(lyes, lds, index);
+        let seen_raw = self.s.m.load_volatile(lyes, theirs);
+        let mask16 = self.s.m.i32(0xffff);
+        let seen_field = self.s.m.bin(lyes, Bin::LShr, seen_raw, other_shift);
+        let seen_yes = self.s.m.bin(lyes, Bin::And, seen_field, mask16);
         self.s.m.terminate(lyes, Term::Br(ljoin));
         self.s.m.terminate(lno, Term::Br(ljoin));
         let seen_lane = self.s.m.phi(ljoin, i32t);
@@ -4869,7 +4891,7 @@ impl<'a> Lower<'a> {
             return Ok((lo, hi));
         }
         if let Some(b) = barrier_block
-            && !self.all_lanes(b)
+            && !self.lane_ok(b)
         {
             need(b);
             return Err(GROUP_BARRIER_DIVERGENT);
@@ -4943,12 +4965,17 @@ impl<'a> Lower<'a> {
         if !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Ok(some);
         }
-        if !made.is_none_or(|b| self.all_lanes(b)) {
+        if !made.is_none_or(|b| self.lane_ok(b)) {
             need(made.unwrap_or(0));
             return Err(DIVERGENT_MASK_EXCHANGE);
         }
         let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
-        let (lo, hi) = self.exchange_halves(at, made, some)?;
+        let (xat, xb) = if self.half_meet && at != self.cur {
+            (self.cur, Some(self.cur_ir))
+        } else {
+            (at, made)
+        };
+        let (lo, hi) = self.exchange_halves(xat, xb, some)?;
         let at = self.sync_block;
         let both = self.s.m.bin(at, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
@@ -4972,7 +4999,7 @@ impl<'a> Lower<'a> {
         if self.local || !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Err(WHY);
         }
-        if !self.all_lanes(b) {
+        if !self.lane_ok(b) {
             need(b);
             return Err(WHY);
         }
@@ -9651,7 +9678,7 @@ impl<'a> Lower<'a> {
                 };
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
-                    if !self.all_lanes(self.cur_ir) {
+                    if !self.lane_ok(self.cur_ir) {
                         // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
                         // first lane, exact when the value is the same in every lane of
                         // the console wave (the ray-tracing builder's scans read a sum of
