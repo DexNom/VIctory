@@ -19,7 +19,8 @@ struct LaunchOptions {
     console: &'static str,
     local_gpu_memory: bool,
     native_1440p: bool,
-    render_1080p: bool,
+    /// Scene height for the 1440p output: 1440, 1080 or 720.
+    render_height: u32,
     fsr: Option<FsrPreset>,
     sparse_textures: bool,
     upload_ahead: Option<bool>,
@@ -39,7 +40,7 @@ fn launcher_options(
         console: "series-x",
         local_gpu_memory: false,
         native_1440p: false,
-        render_1080p: false,
+        render_height: 1440,
         fsr: None,
         sparse_textures: false,
         upload_ahead: None,
@@ -59,9 +60,20 @@ fn launcher_options(
             options.static_bvh = true;
         } else if option == "--local-gpu-memory" {
             options.local_gpu_memory = true;
-        } else if option == "--native-1440p" || option == "--1080p-to-1440p" {
+        } else if let Some(height) = match option.to_str() {
+            Some("--native-1440p") => Some(1440),
+            Some("--1080p-to-1440p") => Some(1080),
+            Some("--720p-to-1440p") => Some(720),
+            _ => None,
+        } {
+            // `--native-1440p` names the output; a lower scene height wins.
+            if height != 1440 {
+                if ![1440, height].contains(&options.render_height) {
+                    bail!("Choose one 1440p scene height");
+                }
+                options.render_height = height;
+            }
             options.native_1440p = true;
-            options.render_1080p |= option == "--1080p-to-1440p";
         } else if let Some(preset) = option.to_str().and_then(|option| {
             if option == "--fsr-1440p-to-4k" {
                 Some(FsrPreset::Quality)
@@ -118,7 +130,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let runtime = folder.join("victory.exe");
     let mut args = std::env::args_os().skip(1).peekable();
     let LaunchOptions {
-        warp, ray_tracing, static_bvh, console, local_gpu_memory, native_1440p, render_1080p, fsr,
+        warp, ray_tracing, static_bvh, console, local_gpu_memory, native_1440p, render_height, fsr,
         sparse_textures, upload_ahead, capture_readbacks, rt_write_stats, rt_store_trace, lighting_trace,
     } = launcher_options(&mut args)?;
     let game = match args.next() {
@@ -132,7 +144,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     };
     if args.next().is_some() {
         bail!(
-            "Usage\n{} [--rt | --no-rt | --rt-static-bvh] [--warp] [--console series-x|series-s] [--local-gpu-memory] [--native-1440p | --1080p-to-1440p | --fsr-quality | --fsr-balanced | --fsr-performance] [--sparse-textures] [--upload-ahead | --no-upload-ahead] [--capture-readbacks] [--rt-write-stats] [--rt-store-trace] [--lighting-trace] [game executable]",
+            "Usage\n{} [--rt | --no-rt | --rt-static-bvh] [--warp] [--console series-x|series-s] [--local-gpu-memory] [--native-1440p | --1080p-to-1440p | --720p-to-1440p | --fsr-quality | --fsr-balanced | --fsr-performance | --fsr-ultra-performance] [--sparse-textures] [--upload-ahead | --no-upload-ahead] [--capture-readbacks] [--rt-write-stats] [--rt-store-trace] [--lighting-trace] [game executable]",
             launcher.display()
         );
     }
@@ -196,10 +208,11 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     if native_1440p {
         child
             .env("VICTORY_NATIVE_1440P", "1")
-            .env("VICTORY_RENDER_1080P", if render_1080p { "1" } else { "0" })
+            .env("VICTORY_RENDER_HEIGHT", render_height.to_string())
+            .env("VICTORY_RENDER_1080P", "0")
             .env("VICTORY_FSR_4K", "0");
-        let expected_render = if render_1080p { "1920x1080" } else { "2560x1440" };
-        writeln!(log, "Expected scene rendering {expected_render}, output 2560x1440")?;
+        let width = render_height * 16 / 9;
+        writeln!(log, "Expected scene rendering {width}x{render_height}, output 2560x1440")?;
     }
     if let Some(preset) = fsr {
         child.env("VICTORY_FSR_4K", preset.name());
@@ -420,10 +433,13 @@ mod tests {
     #[test]
     fn scene_upscale_uses_1440p_output_and_preserves_the_game_path() {
         for (switches, expected) in [
-            (vec!["--native-1440p"], false),
-            (vec!["--1080p-to-1440p"], true),
-            (vec!["--native-1440p", "--1080p-to-1440p"], true),
-            (vec!["--1080p-to-1440p", "--native-1440p"], true),
+            (vec!["--native-1440p"], 1440),
+            (vec!["--1080p-to-1440p"], 1080),
+            (vec!["--native-1440p", "--1080p-to-1440p"], 1080),
+            (vec!["--1080p-to-1440p", "--native-1440p"], 1080),
+            (vec!["--720p-to-1440p"], 720),
+            (vec!["--native-1440p", "--720p-to-1440p"], 720),
+            (vec!["--720p-to-1440p", "--native-1440p"], 720),
         ] {
             let mut args = switches
                 .into_iter()
@@ -432,7 +448,7 @@ mod tests {
                 .peekable();
             let options = launcher_options(&mut args).unwrap();
             assert!(options.native_1440p);
-            assert_eq!(options.render_1080p, expected);
+            assert_eq!(options.render_height, expected);
             assert_eq!(args.next().as_deref(), Some(std::ffi::OsStr::new("game path.exe")));
         }
     }
@@ -446,6 +462,7 @@ mod tests {
             ("--fsr-balanced", FsrPreset::Balanced, "--upload-ahead", true),
             ("--fsr-performance", FsrPreset::Performance, "--upload-ahead", true),
             ("--fsr-performance", FsrPreset::Performance, "--no-upload-ahead", false),
+            ("--fsr-ultra-performance", FsrPreset::UltraPerformance, "--upload-ahead", true),
         ] {
             let mut args = [switch, "--rt", queue, "--rt-store-trace", "game path.exe"]
                 .into_iter()
@@ -455,7 +472,7 @@ mod tests {
             assert_eq!(options.fsr, Some(preset));
             assert_eq!(options.upload_ahead, Some(enabled));
             assert!(options.rt_store_trace);
-            assert!(!options.native_1440p && !options.render_1080p);
+            assert!(!options.native_1440p && options.render_height == 1440);
             assert_eq!(options.console, "series-x");
             assert_eq!(options.ray_tracing, Some(true));
             assert_eq!(args.next().as_deref(), Some(std::ffi::OsStr::new("game path.exe")));
@@ -464,6 +481,9 @@ mod tests {
         for switches in [
             &["--fsr-1440p-to-4k", "--native-1440p"][..],
             &["--1080p-to-1440p", "--fsr-1440p-to-4k"],
+            &["--720p-to-1440p", "--fsr-ultra-performance"],
+            &["--1080p-to-1440p", "--720p-to-1440p"],
+            &["--720p-to-1440p", "--1080p-to-1440p"],
             &["--console", "series-s", "--fsr-1440p-to-4k"],
             &["--fsr-performance", "--fsr-balanced"],
             &["--upload-ahead", "--no-upload-ahead"],

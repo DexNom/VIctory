@@ -11,7 +11,18 @@ const HEIGHT: u32 = 1440;
 const SDR_MODE: u32 = 0x0615_c100;
 const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 0, 0];
 
-pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<()> {
+/// Scene heights the 1440p output can render at. The game's temporal
+/// scaler upsamples the scene to 2560×1440.
+pub(super) const RENDER_HEIGHTS: [u32; 3] = [1440, 1080, 720];
+
+/// The 16:9 scene size for a supported render height.
+pub(super) fn render_size(height: u32) -> Option<[u32; 2]> {
+    RENDER_HEIGHTS.contains(&height).then(|| [height * 16 / 9, height])
+}
+
+pub(super) fn prepare(image: &mut PreparedImage, render_height: u32) -> Result<()> {
+    let [render_width, render_height] =
+        render_size(render_height).context("Unsupported 1440p scene render height")?;
     ensure!(
         image.original_hash.to_hex().as_str() == RETAIL_BUILD,
         "Native 1440p is unavailable for this retail game build"
@@ -52,11 +63,6 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
         *scale == (2.0f32 / 3.0).to_le_bytes(),
         "Unexpected Series X temporal scene scale"
     );
-    let (render_width, render_height) = if render_1080p {
-        (1920, 1080)
-    } else {
-        (WIDTH, HEIGHT)
-    };
     *scale = (render_width as f32 / WIDTH as f32).to_le_bytes();
 
     // Settings uses a separate viewport setter to lay out its preview
@@ -156,6 +162,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scene_heights_keep_the_16_by_9_output_ratio() {
+        assert_eq!(render_size(1440), Some([2560, 1440]));
+        assert_eq!(render_size(1080), Some([1920, 1080]));
+        assert_eq!(render_size(720), Some([1280, 720]));
+        assert_eq!(render_size(360), None);
+    }
+
+    #[test]
     fn fsr_presets_leave_the_stock_scanout_and_settings_viewport() {
         let Some(path) = std::env::var_os("VICTORY_DISPLAY_PROFILE_TEST_IMAGE") else {
             return;
@@ -165,6 +179,7 @@ mod tests {
             (FsrPreset::Quality, [2560, 1440]),
             (FsrPreset::Balanced, [2258, 1270]),
             (FsrPreset::Performance, [1920, 1080]),
+            (FsrPreset::UltraPerformance, [1280, 720]),
         ] {
             let mut image = victory_loader::prepare(&bytes).unwrap();
             let scanout = *field::<5>(&mut image, 0x0247_ad4a).unwrap();

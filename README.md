@@ -47,13 +47,26 @@ For a manual launch, use the same flags as the Quality shortcut.
 & "$env:LOCALAPPDATA\DexNom Runtime\victory-play.exe" --rt --console series-x --local-gpu-memory --fsr-quality --sparse-textures --no-upload-ahead --capture-readbacks --rt-write-stats
 ```
 
+### Lower scene resolutions
+
+These options render the scene at a lower resolution and leave the output resolution unchanged. They are experimental and untested in gameplay. Compare them against the Quality baseline in the same scene before reporting results.
+
+| Option | Scene | Output | Upscaler |
+| --- | --- | --- | --- |
+| `--fsr-performance` | 1920×1080 | 3840×2160 | FSR 4.1.2 |
+| `--fsr-ultra-performance` | 1280×720 | 3840×2160 | FSR 4.1.2 Ultra Performance |
+| `--1080p-to-1440p` | 1920×1080 | 2560×1440 | Game's temporal scaler |
+| `--720p-to-1440p` | 1280×720 | 2560×1440 | Game's temporal scaler |
+
+Pass one option in place of `--fsr-quality`. The 1440p options require Series X mode and leave the FSR provider out. Image quality drops noticeably at 720p. Frame time may not improve much while the main cost is CPU readback and pipeline work, so record dedicated GPU memory too.
+
 The **DexNom RayTime (Experimental RT)** shortcut enables ray tracing with the game's display path. The shortcuts share your local saves.
 
 Chapter 1 City produced in-range ray and triangle intersections on an RX 7900 XTX. The game builds and traverses its acceleration structures through translated Direct3D 12 compute shaders. Frame times can still reach several seconds. Interior lighting, shadows and performance vary by scene. [Ray-tracing implementation](docs/fork-ray-tracing.md) · [City testing](BENCHMARK.md)
 
 ## Experimental NVIDIA
 
-NVIDIA gameplay is untested. Start with ray tracing off and the game's display path. Replace `--rt` with `--no-rt` and leave out `--fsr-quality`, `--fsr-balanced`, and `--fsr-performance`. After setup, run the following in PowerShell.
+NVIDIA gameplay is untested. Start with ray tracing off and the game's display path. Replace `--rt` with `--no-rt` and leave out `--fsr-quality`, `--fsr-balanced`, `--fsr-performance`, and `--fsr-ultra-performance`. After setup, run the following in PowerShell.
 
 ```powershell
 $env:VICTORY_FSR_4K = '0'
