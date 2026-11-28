@@ -734,9 +734,10 @@ fn emit_forms(
                     // CS_CollisionRaytraced
                     | [0xd3, 0x2c, 0xbc, 0xbf, 0xff, 0x6a, 0x0c, 0x04, 0x80, 0xb5, 0x06, 0xd8, 0xf7, 0xd6, 0x58, 0xf9]
             );
-        let wide_on = wide_option
-            .as_ref()
-            .map_or_else(|| scene_kernel || WIDE_HERE.get(), |v| v == "1");
+        let wide_on = wide_option.as_ref().map_or_else(
+            || scene_kernel || WIDE_HERE.get() || named(c, b"CS_TransmissionVolumetrics"),
+            |v| v == "1",
+        );
         // CS_DefragHeap_ComputeRelocations: a group of two console waves. Its
         // divergent LDS is read and written in one region, so it only lowers
         // once that region is taken by both halves of a wave. The other wave
@@ -764,6 +765,7 @@ fn emit_forms(
                     0xa1, 0x23, 0xc6,
                 ]
                 || (many_waves && named(c, b"CS_CollectTriangles_Meshlets"))
+                || (many_waves && named(c, b"CS_ComputeHitDetectionSkinnedResults"))
                 || named(c, b"CS_Emit_Static_Model")
                 || named(c, b"CS_ShadowRenderTiled")
                 || named(c, b"CS_ShadowTileBalanceRTCost"));

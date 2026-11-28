@@ -1029,14 +1029,13 @@ fn a_mask_ballot_in_a_uniform_predecessor_keeps_its_branch() {
 }
 
 #[test]
-fn a_deferred_ballot_in_a_wave_only_predecessor_is_refused() {
-    let Err(ShaderError::Unsupported { what, .. }) = deferred_ballot(true) else {
-        panic!("a closed predecessor reached by only part of the group needs a per-wave meet");
-    };
-    assert_eq!(
-        what,
-        "a deferred exchange needs a per-wave meet in a closed block"
-    );
+fn a_deferred_ballot_in_a_wave_only_predecessor_lowers_with_half_meets() {
+    let mut shader = deferred_ballot(true)
+        .expect("per-wave meet handles deferred ballot in wave-only predecessor");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil)
+            .expect("valid DXIL for deferred ballot with outer branch");
+    }
 }
 
 #[test]

@@ -489,9 +489,9 @@ static class GTA6
 
     static readonly Mode[] Modes = new Mode[]
     {
-        new Mode("recomendado", "Recomendado", "720p reconstruido a 1080p", "0.6667",
+        new Mode("recomendado", "Recomendado", "720p nativo para RTX 3060 Ti (1:1)", "1.0",
             768, 768, 128, 96, 90, 4, 0, 0,
-            "Medido nesta maquina: 90,1 ms de quadro a 6.191 draws, GPU em 10% de uso. A CPU e a parede."),
+            "RTX 3060 Ti fica folgada em 720p nativo enquanto o gargalo esta na CPU; imagem 1:1 nitida."),
         new Mode("nitido", "Nitido", "720p nativo, sem upscaler", "1.0",
             768, 768, 128, 96, 90, 4, 0, 0,
             "Medido nesta maquina: 99,2 ms de quadro. A imagem e 1:1, sem reconstrucao."),
@@ -694,13 +694,10 @@ static class GTA6
     static void ProfilePicture(ProcessStartInfo start, bool high)
     {
         start.EnvironmentVariables["VICTORY_SHOW_AFTER"] = "1";
-        start.EnvironmentVariables["VICTORY_AMBIENT"] = "1.6";
-        // O teto da nevoa de ar: 4 (o padrao calibrado) lava a imagem em
-        // interior e a deixa com cara de massinha. 2 e o valor da Julia.
-        start.EnvironmentVariables["VICTORY_AMBIENT_MOST"] = "2";
-        // A nevoa marrom de interior que a luz do ceu dos probes poe: 1.5 e o
-        // valor que o proprio fork usa no perfil pareto-residency.
-        start.EnvironmentVariables["VICTORY_AMBIENT_AIR"] = "1.5";
+        start.EnvironmentVariables["VICTORY_AMBIENT"] = "1.0";
+        start.EnvironmentVariables["VICTORY_AMBIENT_MOST"] = "1.4";
+        start.EnvironmentVariables["VICTORY_AMBIENT_AIR"] = "1.0";
+        start.EnvironmentVariables["VICTORY_AMBIENT_MARCH"] = "1.0";
         // O titulo acredita que a TV e 4K e desenha 2560x1440 dentro de uma
         // janela 1080p: 4x os alvos, 4x as copias. VICTORY_OUTPUT e o modo que
         // ele reporta; a escala decide o tamanho real do desenho.
@@ -758,7 +755,7 @@ static class GTA6
     // 64 MiB por quadro e solta staging parado, sem knob.
     static void ProfileMemory(ProcessStartInfo start)
     {
-        start.EnvironmentVariables["VICTORY_UPLOAD_AHEAD"] = "1";
+        start.EnvironmentVariables["VICTORY_UPLOAD_AHEAD"] = "0";
         // 16 GB: o que da para encolher sem tirar nada do jogo.
         // O snapshot dos buffers que os shaders escrevem era refeito inteiro
         // (339 MB) por quadro para achar os ~11 MB que mudaram: 55 ms de um
@@ -874,13 +871,14 @@ static class GTA6
         "frameRateLimit=0", "vSync=0", "desiredFPS=120",
         "uiResolution.width=1280", "uiResolution.height=720",
         "resolutionFullscreen.width=1280", "resolutionFullscreen.height=720",
-        "anisotropicFiltering=0", "graphicsQualityPreset=0.000000",
+        "anisotropicFiltering=8", "graphicsQualityPreset=1.000000",
+        "directionalScreenSpaceShadowQuality=1.000000", "worldHeightShadowQuality=1.000000",
         "motionBlur=false", "rtDynamicShadows=false", "shadowParticleShadows=false",
-        "ssroSampleCount=1", "waterReflectionSSR=false",
-        "waterReflectionResX=384", "waterReflectionResY=192",
-        "grassLod=0.400000", "lodScale=0.800000", "smallCullThreshold=1.500000",
-        "decorationResolutionShift=1", "maxTexUpgradesPerFrame=5",
-        "manualMipBias=-1.500000", "sharpenEnabled=true", "fsrSharpen=0.200000",
+        "ssroSampleCount=4", "waterReflectionSSR=true",
+        "waterReflectionResX=640", "waterReflectionResY=360",
+        "grassLod=0.700000", "lodScale=1.000000", "smallCullThreshold=1.000000",
+        "decorationResolutionShift=0", "maxTexUpgradesPerFrame=32",
+        "manualMipBias=0.000000", "sharpenEnabled=false", "fsrSharpen=0.100000",
         "texLodScale_Global=1.000000", "texLodScale_Buildings=1.000000",
         "texLodScale_Objects=1.000000", "texLodScale_HD=1.000000",
     };

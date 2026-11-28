@@ -149,10 +149,16 @@ fn hair_asked(value: Option<&std::ffi::OsStr>) -> bool {
 }
 
 /// Whether a container's program is one of those that animate and draw hair
-/// strands, by its name. They run unless `VICTORY_HAIR` says off ([`hair_asked`]).
+/// strands, by its name, and should be skipped because `VICTORY_HAIR` is off.
+/// Hair strands run by default unless `VICTORY_HAIR` says off ([`hair_asked`]).
 #[cfg(windows)]
 fn hair_strands(container: &[u8]) -> bool {
     static RUN: OnceLock<bool> = OnceLock::new();
+    let run = *RUN.get_or_init(|| hair_asked(std::env::var_os("VICTORY_HAIR").as_deref()));
+    hair_skipped_name(run, program_name(container))
+}
+
+fn hair_skipped_name(hair_on: bool, name: &str) -> bool {
     const NAMES: [&[u8]; 18] = [
         b"InterpolateStrand",
         b"HairStrand",
@@ -173,10 +179,9 @@ fn hair_strands(container: &[u8]) -> bool {
         b"CS_CullMaskPass",
         b"CS_LodBlend",
     ];
-    if !*RUN.get_or_init(|| hair_asked(std::env::var_os("VICTORY_HAIR").as_deref())) {
+    if hair_on {
         return false;
     }
-    let name = program_name(container);
     NAMES.iter().any(|n| name.as_bytes().windows(n.len()).any(|w| w == *n))
 }
 
@@ -934,6 +939,9 @@ mod tests {
         for on in ["1", "yes", "on", "true", "2"] {
             assert!(super::hair_asked(Some(OsStr::new(on))), "{on:?}");
         }
+        assert!(!super::hair_skipped_name(true, "CS_InterpolateStrands_1234"));
+        assert!(super::hair_skipped_name(false, "CS_InterpolateStrands_1234"));
+        assert!(!super::hair_skipped_name(false, "PS_WallStandard_1234"));
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]
