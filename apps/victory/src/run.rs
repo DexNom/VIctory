@@ -45,7 +45,21 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
+    // `VICTORY_RENDER_HEIGHT` picks the scene height for the 1440p output;
+    // `VICTORY_RENDER_1080P=1` is the older spelling of 1080.
+    let render_height = match std::env::var("VICTORY_RENDER_HEIGHT") {
+        Ok(value) => Some(
+            value
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|&h| native_1440p::render_size(h).is_some())
+                .with_context(|| {
+                    format!("VICTORY_RENDER_HEIGHT must be one of {:?}", native_1440p::RENDER_HEIGHTS)
+                })?,
+        ),
+        Err(_) => (std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1")).then_some(1080),
+    };
     let image = if let Some(preset) = fsr {
         anyhow::ensure!(matches!(console, Console::SeriesX), "FSR at 4K requires Series X mode");
         native_1440p::prepare_fsr_4k(&mut prepared, preset)?;
@@ -55,6 +69,7 @@ pub fn run(
             std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160");
             std::env::set_var("VICTORY_NATIVE_1440P", "0");
             std::env::set_var("VICTORY_RENDER_1080P", "0");
+            std::env::remove_var("VICTORY_RENDER_HEIGHT");
         }
         victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
         anyhow::ensure!(
@@ -63,21 +78,24 @@ pub fn run(
         );
         let cache = format!("images/fsr-{}-4k-sdr", preset.name());
         victory_loader::load(&prepared, &cfg.cache_subdir(&cache)?)?
-    } else if render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1") {
+    } else if render_height.is_some()
+        || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1")
+    {
         anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output requires Series X mode");
-        native_1440p::prepare(&mut prepared, render_1080p)?;
+        let render_height = render_height.unwrap_or(1440);
+        native_1440p::prepare(&mut prepared, render_height)?;
         // SAFETY: Windows supports setting the environment across threads.
         // The title and DXGI emulation have not started querying display modes.
         unsafe {
             std::env::set_var("VICTORY_DISPLAY_MODE", "2560x1440");
             std::env::set_var("VICTORY_NATIVE_1440P", "1");
         }
-        let image_cache = if render_1080p {
-            "images/1080p-to-1440p-sdr"
+        let image_cache = if render_height == 1440 {
+            "images/native-1440p-sdr".to_owned()
         } else {
-            "images/native-1440p-sdr"
+            format!("images/{render_height}p-to-1440p-sdr")
         };
-        victory_loader::load(&prepared, &cfg.cache_subdir(image_cache)?)?
+        victory_loader::load(&prepared, &cfg.cache_subdir(&image_cache)?)?
     } else {
         victory_loader::load(&prepared, &images)?
     };
