@@ -192,9 +192,15 @@ pipeline inclui os ajustes do host).
 
 **Launcher `GTA6.exe`.** `tools\pack\build.ps1` monta um executável único com o
 runtime, o Agility SDK e os docs embutidos. Ele acha o dump, escreve o
-`game-path.txt`, e abre uma janela com **Jogar 720p**, **Jogar 1080p**,
-**Jogar com painel** e **Preparar (compilar)**. Sem interface:
-`GTA6.exe --play`, `GTA6.exe --prepare`, `GTA6.exe --book`, `GTA6.exe --install`.
+`game-path.txt`, e abre uma janela com quatro páginas: **Jogar** (o herói com o
+estado dos quatro passos, o caminho do jogo, a saída 720p/1080p, os sete modos e
+as opções de arranque), **Desempenho** (o código do perfil e as tabelas
+medidas), **Preparar** (os quatro passos, a barra e o log) e **Ajuda**. O visual
+é uma cópia do launcher da Julia — mesma paleta, mesmo herói com órbitas,
+mesmos cartões, mesma barra de estado —, com o nosso perfil dentro; o
+`reference/` guarda o binário e os fontes dela só para conferência. Sem
+interface: `GTA6.exe --play`, `GTA6.exe --prepare`, `GTA6.exe --book`,
+`GTA6.exe --install`, `GTA6.exe --code`.
 
 **O que muda nesta máquina**
 

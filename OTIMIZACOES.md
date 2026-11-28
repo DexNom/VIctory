@@ -860,3 +860,27 @@ regressao: `pipeline/host.rs` esta byte-identico ao commit anterior, e o binario
 de teste roda sem o `D3D12Core.dll` do Agility SDK ao lado, entao cai no
 `d3d12.dll` do Windows 10, que recusa os flags de acesso direto a heap. O teste
 que depende de dispositivo real continua vermelho aqui; os outros 372 passam.
+
+### A copia visual do launcher da Julia
+
+O `GTA6.cs` foi redesenhado com o desenho dela: a paleta do `Theme.cs`
+(`Back 36,12,32`, `Side 28,9,25`, `Card 46,17,41`, acento `255,244,163`,
+`HotPink 255,79,184`), o `Hero` de 362 px com as duas orbitas, os aneis, o
+arco, o blob e as quatro pastilhas de estado, a barra de titulo de 52 px, a
+lateral de 216 px com os `NavButton`, o rodape de 64 px com o `FootMeta` e o
+`Play`, os `ModeCard`, os `OptionCard` com interruptor, o `Dropdown` pintado
+por nos, o `StatusStrip` e a barra de progresso com brilho.
+
+Nada dos fontes dela entra no build: o desenho foi reimplementado em cima do
+nosso perfil, e o `reference/` guarda o binario e os 45 arquivos
+descompilados so para conferencia. As nove chaves do perfil continuam as
+mesmas; nenhuma chave nova foi inventada.
+
+Medido nesta build:
+
+- `--code` devolve `s=0.6667;b=768;t=768;m=128;w=96;p=90;r=4;g=0;c=0`.
+- `--code` com valor fora da faixa sai com 2 e imprime `invalido`.
+- `--install` sai com 0 e nao toca nos arquivos do jogo.
+- As quatro paginas abrem sem excecao; o dialogo do codigo abre e fecha.
+- Partida real de 220 s: mundo carregado em ~120 s, 4.618 a 6.128 draws,
+  89 a 98 ms por quadro (~11 fps), sem fechamento espontaneo nesta run.
