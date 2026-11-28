@@ -884,3 +884,30 @@ Medido nesta build:
 - As quatro paginas abrem sem excecao; o dialogo do codigo abre e fecha.
 - Partida real de 220 s: mundo carregado em ~120 s, 4.618 a 6.128 draws,
   89 a 98 ms por quadro (~11 fps), sem fechamento espontaneo nesta run.
+## O que mudou na build de 27/11 (noite)
+
+- **Cabelo ligado por padrao.** Os 18 programas de cabelo eram pulados de
+  proposito (hair_strands), uma gambiarra de quando o tradutor nao dava
+  conta. O upstream nunca teve essa exclusao. Agora eles rodam;
+  VICTORY_HAIR=0 desliga. Toda linha de shader traduzido ou recusado
+  carrega program= com o nome do programa, para o diagnostico.
+- **Blocos de staging zerados** antes de um bloco reciclado entregar bytes
+  de outra textura (VICTORY_STAGING_ZERO=0 desliga). Era a causa das caras
+  e roupas arco-iris.
+- **Suspend/resume da command queue** implementados (o slot 0xb8 devolvia
+  E_NOTIMPL). Provado no log: 	he title suspended its command queue.
+- **VICTORY_AMBIENT_MOST** (default 4) e **VICTORY_AMBIENT_MARCH**: o teto
+  da nevoa de ar. O perfil usa 2 (o valor do launcher da Julia); 4 lava a
+  imagem em interior e da a cara de massinha. Um froxel NaN ou infinito e
+  zerado no air clamp.
+- **Descricoes de view colocada sem as palavras de enchimento.** O titulo
+  deixa as palavras 1 e 13 da descricao de 56 bytes sem escrever, e a palavra
+  3/9 da descricao da view idem: a mesma view virava uma forma nova a cada
+  vez. As 2^22 formas enchiam em meia hora e cada view colocada virava uma
+  entrada de tabela guardada ate o fim da run (34,9 milhoes, 16,7 GB depois
+  de 70 minutos). Era o "confetti nas caras" e o frame de 1,6 s.
+- **VICTORY_OWNERLESS_VIEWS** (default 1.048.576; 0 guarda tudo): teto para
+  as entradas de views sem recurso, as mais antigas liberadas.
+- **Merge do origin/main**: lane-split (#80), mascara de lane (#66), resgate
+  em pilha de 4 GiB (#39), o lowering wave32 de defrag e de seis computes de
+  uma onda, e o resto. cargo test -p victory-gpu --lib: 408 passam.
