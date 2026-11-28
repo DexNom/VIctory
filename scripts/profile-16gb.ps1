@@ -23,7 +23,10 @@ $settings = @{
     # ABOVE_NORMAL. The queue waiting "for their memory" fell from 22,096 to
     # about 1,000 with no cost in frame time.
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '1'; VICTORY_CARD_AWAKE = '1'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '1.6'; VICTORY_D3D12_DRED = 'light'
+    # O teto da nevoa de ar: 4 (o padrao calibrado) lava a imagem em interior e
+    # a deixa com cara de massinha. 2 e o valor que o launcher da Julia usa.
+    VICTORY_AMBIENT_MOST = '2'
     # A nevoa marrom de interior que a luz do ceu dos probes poe: 1.5 e o valor
     # que o proprio fork usa no perfil pareto-residency.
     VICTORY_AMBIENT_AIR = '1.5'

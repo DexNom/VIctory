@@ -1221,10 +1221,27 @@ extern "system" fn desc(this: This, out: *mut QueueDesc) {
     }
 }
 
+/// The console's queue suspend: the title asks the queue to stop taking work.
+/// A submission here is done when `execute` returns, so there is nothing to
+/// hold; the title is told it was. (It called this one and, on `E_NOTIMPL`,
+/// left the world and closed its window: see the run of 2026-11-28.)
+extern "system" fn suspend(_: This) -> HRESULT {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::info!("the title suspended its command queue"));
+    S_OK
+}
+
+/// The console's queue resume, the pair of [`suspend`]: nothing was held.
+extern "system" fn resume(_: This) -> HRESULT {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::info!("the title resumed its command queue"));
+    S_OK
+}
+
 /// The queue methods by their slot in older titles' queues (the 2020-era
 /// layout): IUnknown 3, object 4, device child 1, queue 26 (12 as on PC,
 /// then console ones).
-const METHODS: [(usize, *const ()); 15] = [
+const METHODS: [(usize, *const ()); 17] = [
     (0, query as *const ()),
     (2, release as *const ()),
     (7, object::parent_device as *const ()), // 0x38
@@ -1235,6 +1252,8 @@ const METHODS: [(usize, *const ()); 15] = [
     (14, signal as *const ()),               // 0x70
     (15, wait as *const ()),                 // 0x78
     (16, timestamp_frequency as *const ()),  // 0x80
+    (21, suspend as *const ()),              // 0xa8; 0xb8 on newer layouts
+    (22, resume as *const ()),               // 0xb0; 0xc0 on newer layouts
     (26, desc as *const ()),                 // 0xd0
     (29, copy_page_mappings as *const ()),   // 0xe8 page mapping batch
     (30, present as *const ()),              // 0xf0
@@ -1337,6 +1356,16 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    #[test]
+    fn newer_queues_answer_the_console_suspend_and_resume() {
+        let (old, new) = (queue_table(false), queue_table(true));
+        assert_eq!(old[21], suspend as *const ()); // 0xa8
+        assert_eq!(old[22], resume as *const ()); // 0xb0
+        assert_eq!(new[23], suspend as *const ()); // 0xb8
+        assert_eq!(new[24], resume as *const ()); // 0xc0
+        assert_eq!(new[28], desc as *const ()); // 0xe0
     }
 
     #[test]

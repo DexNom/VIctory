@@ -116,10 +116,32 @@ fn idle_without_rays(container: &[u8]) -> bool {
     !victory_shader::emit::rays() && container.windows(NAME.len()).any(|w| w == NAME)
 }
 
+/// The name the title gave a container's program: the identifier just before
+/// the `_Wrapped` export every console entry point ends with. Empty when the
+/// container names none.
+#[cfg(windows)]
+pub(crate) fn program_name(container: &[u8]) -> &str {
+    const END: &[u8] = b"_Wrapped";
+    let Some((at, _)) = container
+        .windows(END.len())
+        .enumerate()
+        .find(|(_, w)| *w == END)
+    else {
+        return "";
+    };
+    let before = &container[at.saturating_sub(100)..at];
+    let name = before
+        .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+        .next()
+        .unwrap_or_default();
+    std::str::from_utf8(name).unwrap_or("")
+}
+
 /// Whether a container's program is one of those that animate and draw hair
-/// strands, by its name. `VICTORY_HAIR` has them run.
-/// shortcut: left out, as some of them do not translate (an address from a
-/// phi) and the others draw lines all over the screen without them.
+/// strands, by its name. They run: a frame without them is a character with
+/// no hair at all, which is what every measured run showed. `VICTORY_HAIR=0`
+/// leaves them out again (some of them did not translate, and the others drew
+/// lines all over the screen without them).
 #[cfg(windows)]
 fn hair_strands(container: &[u8]) -> bool {
     static RUN: OnceLock<bool> = OnceLock::new();
@@ -143,22 +165,11 @@ fn hair_strands(container: &[u8]) -> bool {
         b"CS_CullMaskPass",
         b"CS_LodBlend",
     ];
-    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some()) {
+    if !*RUN.get_or_init(|| std::env::var("VICTORY_HAIR").map_or(true, |v| v != "0")) {
         return false;
     }
-    const END: &[u8] = b"_Wrapped";
-    container
-        .windows(END.len())
-        .enumerate()
-        .filter(|(_, w)| *w == END)
-        .any(|(at, _)| {
-            let before = &container[at.saturating_sub(100)..at];
-            let name = before
-                .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
-                .next()
-                .unwrap_or_default();
-            NAMES.iter().any(|n| name.windows(n.len()).any(|w| w == *n))
-        })
+    let name = program_name(container);
+    NAMES.iter().any(|n| name.as_bytes().windows(n.len()).any(|w| w == *n))
 }
 
 /// The shared container for `bytes`.
@@ -231,6 +242,7 @@ impl Shader {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
+                        program = program_name(&self.container),
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         "shader translated"
@@ -238,6 +250,7 @@ impl Shader {
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
+                        program = program_name(&self.container),
                         error = %e,
                         "shader does not translate; its pipelines' draws are dropped"
                     ),

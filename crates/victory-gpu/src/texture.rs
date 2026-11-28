@@ -376,6 +376,13 @@ fn no_wait() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
+/// Whether a staging buffer cut from a pooled block is zeroed before use
+/// (on unless `VICTORY_STAGING_ZERO=0`; see where staging buffers are made).
+fn staging_zero() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_ZERO").is_none_or(|v| v != "0"))
+}
+
 /// Whether a refresh that does not wait ([`no_wait`]) and finds a page
 /// missing fills a staging buffer that was never filled from the pages that
 /// are there (`VICTORY_TEXTURE_FILL=0`: it was left as it was made).
@@ -1980,6 +1987,18 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             (None, buffer, 0, data)
         }
     };
+    // A piece of a pooled block held another texture's staging two seconds ago.
+    // Any upload recorded before this one is first filled (a refresh put off,
+    // a read that failed while the runtime remapped) copied those bytes to the
+    // card, which showed them as this texture: the "rainbow" faces, clothes and
+    // walls players reported, most on PCs whose pools turn over fastest (8 GB
+    // cards, 16 GB of RAM). Zeros instead (a fresh upload buffer is zeroed by
+    // Windows): a few milliseconds a frame while the world streams in, against
+    // frames of 40-170 ms. `VICTORY_STAGING_ZERO=0` skips it.
+    if piece.is_some() && staging_zero() {
+        // SAFETY: the piece's mapped memory, `total` bytes from `data`.
+        unsafe { std::ptr::write_bytes(data, 0, total as usize) };
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);

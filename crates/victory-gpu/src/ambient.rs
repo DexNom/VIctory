@@ -32,7 +32,8 @@
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
-//! bounds what the air scatters by a multiple of the light around.
+//! bounds what the air scatters by a multiple of the light around, and
+//! `VICTORY_AMBIENT_MOST` caps it (unset: 4; the veil goes at about 2).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -115,6 +116,18 @@ fn air() -> f32 {
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+    })
+}
+
+/// The most the air scatters, as a multiple of the light around
+/// (`VICTORY_AMBIENT_MOST=<multiple>`; unset: 4, the calibrated default).
+/// Above about 2 the air of a room holds the sky's light and the picture
+/// goes veiled, which reads as a flat, waxy surface.
+fn most() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(4.0)
     })
 }
 
@@ -251,6 +264,9 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    // A NaN or infinity in the air is summed along every view ray through
+    // it: black or white patches floating in the room (tested as in `keep`).
+    if (any((asuint(c) & 0x7f800000u) == 0x7f800000u)) { scattered[at] = float3(0.0, 0.0, 0.0); return; }
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
 }
@@ -479,7 +495,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most().to_bits();
     words[10] = air().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's

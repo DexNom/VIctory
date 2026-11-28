@@ -668,7 +668,10 @@ static class GTA6
     static void ProfilePicture(ProcessStartInfo start, bool high)
     {
         start.EnvironmentVariables["VICTORY_SHOW_AFTER"] = "1";
-        start.EnvironmentVariables["VICTORY_AMBIENT"] = "0.8";
+        start.EnvironmentVariables["VICTORY_AMBIENT"] = "1.6";
+        // O teto da nevoa de ar: 4 (o padrao calibrado) lava a imagem em
+        // interior e a deixa com cara de massinha. 2 e o valor da Julia.
+        start.EnvironmentVariables["VICTORY_AMBIENT_MOST"] = "2";
         // A nevoa marrom de interior que a luz do ceu dos probes poe: 1.5 e o
         // valor que o proprio fork usa no perfil pareto-residency.
         start.EnvironmentVariables["VICTORY_AMBIENT_AIR"] = "1.5";
