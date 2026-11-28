@@ -12,7 +12,15 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| {
+            let folder = PathBuf::from(std::env::var_os("VICTORY_CAPTURE")?);
+            // Made here if it is not there yet: before, every frame was "not
+            // saved" (os error 3) and no `frame-N-ops.txt` was written.
+            if let Err(e) = std::fs::create_dir_all(&folder) {
+                tracing::warn!(error = %e, folder = %folder.display(), "capture folder not made");
+            }
+            Some(folder)
+        })
         .as_ref()
 }
 
